@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"confighub.local/internal/database"
 )
@@ -294,6 +295,127 @@ func TestSyncUsersCanceledAfterMutationRollsBack(t *testing.T) {
 	var users int
 	if err := store.DB().QueryRow(`SELECT count(*) FROM users`).Scan(&users); err != nil || users != 1 {
 		t.Fatalf("unexpected users after rollback: count=%d err=%v", users, err)
+	}
+}
+
+func TestSyncUsersPrecomputesCredentialsWithoutWriterLock(t *testing.T) {
+	store := testStore(t)
+	syncer := NewUserSyncer(store)
+	seedAdminWithSession(t, store, syncer)
+	enteredPasswordWork := make(chan struct{})
+	releasePasswordWork := make(chan struct{})
+	syncer.verifyPassword = func(encoded, password string) bool {
+		close(enteredPasswordWork)
+		<-releasePasswordWork
+		return VerifyPassword(encoded, password)
+	}
+
+	type syncOutcome struct{ err error }
+	done := make(chan syncOutcome, 1)
+	go func() {
+		_, err := syncer.Sync(context.Background(), UserFile{Users: []UserSpec{{Username: "admin", DisplayName: "Admin", Password: "second", Role: "admin", Enabled: true}}})
+		done <- syncOutcome{err: err}
+	}()
+	<-enteredPasswordWork
+	writerCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := store.DB().ExecContext(writerCtx, `INSERT INTO machine_identities (id, name, description, enabled, created_at, updated_at) VALUES ('writer', 'writer', '', 1, 1, 1)`); err != nil {
+		close(releasePasswordWork)
+		t.Fatalf("writer was blocked during password work: %v", err)
+	}
+	close(releasePasswordWork)
+	if outcome := <-done; outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+}
+
+func TestSyncUsersRetriesWhenPrecomputeSnapshotChanges(t *testing.T) {
+	store := testStore(t)
+	syncer := NewUserSyncer(store)
+	seedAdminWithSession(t, store, syncer)
+	verifyCalls := 0
+	syncer.verifyPassword = func(encoded, password string) bool {
+		verifyCalls++
+		if verifyCalls == 1 {
+			if _, err := store.DB().Exec(`UPDATE users SET display_name = 'External' WHERE username = 'admin'`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return VerifyPassword(encoded, password)
+	}
+	result, err := syncer.Sync(context.Background(), UserFile{Users: []UserSpec{{Username: "admin", DisplayName: "Configured", Password: "first", Role: "admin", Enabled: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifyCalls != 2 || result.Updated != 1 || loadUserByUsername(t, store, "admin").DisplayName != "Configured" {
+		t.Fatalf("verifyCalls=%d result=%+v", verifyCalls, result)
+	}
+}
+
+func TestSyncUsersRetriesWhenPrecomputeSnapshotTimestampChanges(t *testing.T) {
+	store := testStore(t)
+	syncer := NewUserSyncer(store)
+	seedAdminWithSession(t, store, syncer)
+	verifyCalls := 0
+	syncer.verifyPassword = func(encoded, password string) bool {
+		verifyCalls++
+		if verifyCalls == 1 {
+			if _, err := store.DB().Exec(`UPDATE users SET updated_at = updated_at + 1 WHERE username = 'admin'`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return VerifyPassword(encoded, password)
+	}
+	result, err := syncer.Sync(context.Background(), UserFile{Users: []UserSpec{{Username: "admin", DisplayName: "Admin", Password: "first", Role: "admin", Enabled: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifyCalls != 2 || result.Updated != 0 {
+		t.Fatalf("verifyCalls=%d result=%+v", verifyCalls, result)
+	}
+}
+
+func TestSyncUsersStopsPrecomputeAfterContextCancellation(t *testing.T) {
+	store := testStore(t)
+	syncer := NewUserSyncer(store)
+	initial := UserFile{Users: []UserSpec{
+		{Username: "admin", DisplayName: "Admin", Password: "first", Role: "admin", Enabled: true},
+		{Username: "member", DisplayName: "Member", Password: "first", Role: "member", Enabled: true},
+	}}
+	if _, err := syncer.Sync(context.Background(), initial); err != nil {
+		t.Fatal(err)
+	}
+	admin := loadUserByUsername(t, store, "admin")
+	member := loadUserByUsername(t, store, "member")
+	insertSessionFixture(t, store, admin.ID)
+	insertSessionFixture(t, store, member.ID)
+	ctx, cancel := context.WithCancel(context.Background())
+	verifyCalls := 0
+	syncer.verifyPassword = func(encoded, password string) bool {
+		verifyCalls++
+		cancel()
+		return VerifyPassword(encoded, password)
+	}
+	_, err := syncer.Sync(ctx, initial)
+	if !errors.Is(err, context.Canceled) || verifyCalls != 1 {
+		t.Fatalf("err=%v verifyCalls=%d", err, verifyCalls)
+	}
+	assertAdminSessionUnchanged(t, store, admin)
+	if got := loadUserByUsername(t, store, "member"); got.PasswordHash != member.PasswordHash || got.DisplayName != member.DisplayName || got.Enabled != member.Enabled || countSessions(t, store, member.ID) != 1 {
+		t.Fatalf("member changed after cancellation: %+v", got.User)
+	}
+}
+
+func TestSyncUsersNeverRunsPasswordWorkInsideTransaction(t *testing.T) {
+	store := testStore(t)
+	syncer := NewUserSyncer(store)
+	seedAdminWithSession(t, store, syncer)
+	syncer.afterMutation = func() {
+		syncer.hashPassword = func(string) (string, error) { panic("hash inside transaction") }
+		syncer.verifyPassword = func(string, string) bool { panic("verify inside transaction") }
+	}
+	if _, err := syncer.Sync(context.Background(), UserFile{Users: []UserSpec{{Username: "admin", DisplayName: "Changed", Password: "second", Role: "admin", Enabled: true}}}); err != nil {
+		t.Fatal(err)
 	}
 }
 
