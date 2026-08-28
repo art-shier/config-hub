@@ -58,13 +58,14 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	}
 	handlers := &authHandlers{credentials: deps.Credentials, sessions: deps.Sessions, publicOrigin: origin}
 	mux := http.NewServeMux()
+	projectsEnabled := deps.Projects != nil
 	mux.HandleFunc("POST /api/v1/auth/login", handlers.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", handlers.logout)
 	mux.HandleFunc("GET /api/v1/auth/session", handlers.session)
 	mux.HandleFunc("GET /api/v1/health/live", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	if deps.Projects != nil {
+	if projectsEnabled {
 		projectAPI := &projectHandlers{service: deps.Projects, auth: handlers}
 		mux.HandleFunc("GET /api/v1/projects", projectAPI.list)
 		mux.HandleFunc("POST /api/v1/projects", projectAPI.create)
@@ -89,10 +90,12 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 			return
 		}
-		if allowed, known := projectRouteMethods(r.URL.Path); known {
-			w.Header().Set("Allow", allowed)
-			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
-			return
+		if projectsEnabled {
+			if allowed, known := projectRouteMethods(r.URL.Path); known {
+				w.Header().Set("Allow", allowed)
+				writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+				return
+			}
 		}
 		writeError(w, r, http.StatusNotFound, "not_found", "API route not found")
 	})

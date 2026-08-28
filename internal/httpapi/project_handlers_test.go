@@ -67,6 +67,45 @@ func TestProjectRoutesRequireCookieSessionsAndProtectWrites(t *testing.T) {
 	}
 }
 
+func TestOptionalProjectRoutesAreNotAdvertisedWithoutProjectDependency(t *testing.T) {
+	handler, _, _ := testRouter(t, nil)
+	for _, test := range []struct {
+		method, path string
+	}{
+		{method: http.MethodGet, path: "/api/v1/projects"},
+		{method: http.MethodPost, path: "/api/v1/projects"},
+		{method: http.MethodGet, path: "/api/v1/projects/app"},
+		{method: http.MethodPost, path: "/api/v1/projects/app"},
+	} {
+		request := httptest.NewRequest(test.method, test.path, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		assertProjectHTTPError(t, response, http.StatusNotFound, "not_found")
+		if allowed := response.Header().Get("Allow"); allowed != "" {
+			t.Fatalf("%s %s advertised Allow=%q", test.method, test.path, allowed)
+		}
+	}
+}
+
+func TestEnabledProjectRoutesReturnPreciseMethodNotAllowed(t *testing.T) {
+	fixture := newProjectHTTPFixture(t)
+	for _, test := range []struct {
+		method, path, allowed string
+	}{
+		{method: http.MethodPut, path: "/api/v1/projects", allowed: "GET, POST"},
+		{method: http.MethodPost, path: "/api/v1/projects/app", allowed: http.MethodGet},
+		{method: http.MethodGet, path: "/api/v1/projects/app/environments", allowed: http.MethodPost},
+		{method: http.MethodPatch, path: "/api/v1/projects/app/members/member", allowed: "DELETE, PUT"},
+	} {
+		request := httptest.NewRequest(test.method, test.path, nil)
+		response := fixture.serve(t, request)
+		assertProjectHTTPError(t, response, http.StatusMethodNotAllowed, "method_not_allowed")
+		if allowed := response.Header().Get("Allow"); allowed != test.allowed {
+			t.Fatalf("%s %s Allow=%q want=%q", test.method, test.path, allowed, test.allowed)
+		}
+	}
+}
+
 func TestProjectHTTPRoleIsolationAndResourceDisclosure(t *testing.T) {
 	fixture := newProjectHTTPFixture(t)
 	createProjectHTTP(t, fixture, "admin", "visible", "Visible")
