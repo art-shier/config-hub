@@ -138,6 +138,27 @@ BEGIN
     SELECT RAISE(ABORT, 'cannot delete current revision');
 END;
 
+CREATE TRIGGER revisions_prevent_current_pointer_update
+BEFORE UPDATE OF id, environment_id ON revisions
+WHEN EXISTS (
+    SELECT 1 FROM environments WHERE current_revision_id = OLD.id
+)
+ AND (NEW.id <> OLD.id OR NEW.environment_id <> OLD.environment_id)
+BEGIN
+    SELECT RAISE(ABORT, 'cannot update current revision pointer');
+END;
+
+CREATE TRIGGER revisions_prevent_replace
+BEFORE INSERT ON revisions
+WHEN EXISTS (
+    SELECT 1 FROM revisions
+    WHERE id = NEW.id
+       OR (environment_id = NEW.environment_id AND version = NEW.version)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'revisions are immutable');
+END;
+
 CREATE TRIGGER machine_grants_project_environment_insert
 BEFORE INSERT ON machine_grants
 WHEN NOT EXISTS (
@@ -156,4 +177,14 @@ WHEN NOT EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'machine grant environment must belong to project');
+END;
+
+CREATE TRIGGER environments_prevent_grant_project_mismatch
+BEFORE UPDATE OF project_id ON environments
+WHEN EXISTS (
+    SELECT 1 FROM machine_grants
+    WHERE environment_id = OLD.id AND project_id <> NEW.project_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'environment project must match machine grants');
 END;
