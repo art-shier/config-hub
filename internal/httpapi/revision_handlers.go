@@ -25,8 +25,9 @@ type RevisionService interface {
 }
 
 type revisionHandlers struct {
-	service RevisionService
-	auth    *authHandlers
+	service  RevisionService
+	machines MachineAccessService
+	auth     *authHandlers
 }
 
 type replaceRevisionRequest struct {
@@ -40,6 +41,24 @@ type rollbackRevisionRequest struct {
 }
 
 func (h *revisionHandlers) current(w http.ResponseWriter, r *http.Request) {
+	if len(r.Header.Values("Authorization")) > 0 {
+		token, ok := strictBearerToken(r)
+		if !ok || h.machines == nil {
+			writeError(w, r, http.StatusUnauthorized, "invalid_token", "Invalid or expired machine token")
+			return
+		}
+		service, ok := revisionServiceQuery(w, r)
+		if !ok {
+			return
+		}
+		config, err := h.machines.ReadCurrentForProject(r.Context(), token, r.PathValue("project"), r.PathValue("environment"), service)
+		if err != nil {
+			writeMachineServiceError(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, config)
+		return
+	}
 	actor, _, ok := h.authenticate(w, r)
 	if !ok {
 		return

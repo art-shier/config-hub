@@ -89,6 +89,41 @@ func securityMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func authorizationSurfaceMiddleware(machineReadEnabled bool, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.Header.Values("Authorization")) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !machineReadEnabled || r.Method != http.MethodGet || !isCurrentConfigPath(r.URL.Path) {
+			writeError(w, r, http.StatusUnauthorized, "invalid_token", "Machine tokens are not accepted on this route")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func strictBearerToken(r *http.Request) (string, bool) {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		return "", false
+	}
+	value := values[0]
+	if !strings.HasPrefix(value, "Bearer ") {
+		return "", false
+	}
+	token := strings.TrimPrefix(value, "Bearer ")
+	if token == "" || strings.ContainsAny(token, " \t\r\n,") {
+		return "", false
+	}
+	return token, true
+}
+
+func isCurrentConfigPath(path string) bool {
+	parts := strings.Split(strings.TrimPrefix(path, "/api/v1/projects/"), "/")
+	return len(parts) == 4 && parts[0] != "" && parts[1] == "environments" && parts[2] != "" && parts[3] == "config"
+}
+
 type responseCapture struct {
 	http.ResponseWriter
 	status int

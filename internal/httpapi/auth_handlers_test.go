@@ -156,7 +156,6 @@ func TestPanicRecoverySecurityHeadersAndRedactedLogs(t *testing.T) {
 	})
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/test/panic?password="+secret, nil)
 	request.RemoteAddr = "198.51.100.7:4321"
-	request.Header.Set("Authorization", "Bearer "+secret)
 	request.Header.Set("Cookie", "confighub_session="+secret)
 	request.Header.Set(CSRFHeaderName, secret)
 	response := httptest.NewRecorder()

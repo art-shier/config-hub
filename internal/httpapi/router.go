@@ -26,6 +26,7 @@ type Dependencies struct {
 	Sessions    *auth.SessionManager
 	Projects    ProjectService
 	Revisions   RevisionService
+	Machines    MachineAccessService
 }
 
 type RateLimitOptions struct {
@@ -61,6 +62,7 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	mux := http.NewServeMux()
 	projectsEnabled := deps.Projects != nil
 	revisionsEnabled := deps.Revisions != nil
+	machinesEnabled := deps.Machines != nil
 	mux.HandleFunc("POST /api/v1/auth/login", handlers.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", handlers.logout)
 	mux.HandleFunc("GET /api/v1/auth/session", handlers.session)
@@ -78,13 +80,23 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 		mux.HandleFunc("DELETE /api/v1/projects/{project}/members/{username}", projectAPI.removeMember)
 	}
 	if revisionsEnabled {
-		revisionAPI := &revisionHandlers{service: deps.Revisions, auth: handlers}
+		revisionAPI := &revisionHandlers{service: deps.Revisions, machines: deps.Machines, auth: handlers}
 		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/config", revisionAPI.current)
 		mux.HandleFunc("PUT /api/v1/projects/{project}/environments/{environment}/config", revisionAPI.replace)
 		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/revisions", revisionAPI.list)
 		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/revisions/{version}", revisionAPI.detail)
 		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/revisions/{version}/diff", revisionAPI.diff)
 		mux.HandleFunc("POST /api/v1/projects/{project}/environments/{environment}/revisions/{version}/rollback", revisionAPI.rollback)
+	}
+	if machinesEnabled {
+		machineAPI := &machineHandlers{service: deps.Machines, auth: handlers}
+		mux.HandleFunc("GET /api/v1/machine-identities", machineAPI.list)
+		mux.HandleFunc("POST /api/v1/machine-identities", machineAPI.create)
+		mux.HandleFunc("GET /api/v1/machine-identities/{identity}", machineAPI.detail)
+		mux.HandleFunc("PUT /api/v1/machine-identities/{identity}", machineAPI.update)
+		mux.HandleFunc("PUT /api/v1/machine-identities/{identity}/grants", machineAPI.replaceGrants)
+		mux.HandleFunc("POST /api/v1/machine-identities/{identity}/tokens", machineAPI.issueToken)
+		mux.HandleFunc("DELETE /api/v1/machine-identities/{identity}/tokens/{token}", machineAPI.revokeToken)
 	}
 	if options.Register != nil {
 		options.Register(mux)
@@ -115,6 +127,13 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 				return
 			}
 		}
+		if machinesEnabled {
+			if allowed, known := machineRouteMethods(r.URL.Path); known {
+				w.Header().Set("Allow", allowed)
+				writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+				return
+			}
+		}
 		writeError(w, r, http.StatusNotFound, "not_found", "API route not found")
 	})
 	sourceIP, err := newSourceIPResolver(options.TrustedProxyCIDRs)
@@ -127,7 +146,8 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	}
 	handlers.sourceIP = sourceIP
 	handlers.limiter = limiter
-	handler := securityMiddleware(mux)
+	var handler http.Handler = authorizationSurfaceMiddleware(machinesEnabled && revisionsEnabled, mux)
+	handler = securityMiddleware(handler)
 	handler = recoveryMiddleware(logger, handler)
 	handler = accessLogMiddleware(logger, sourceIP, handler)
 	handler = requestIDMiddleware(handler)
