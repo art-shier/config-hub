@@ -143,12 +143,11 @@ func applyDefaultsAndValidate(cfg *Config, configDir string) error {
 }
 
 func validateListen(listen string) error {
-	_, port, err := net.SplitHostPort(listen)
-	if err != nil || port == "" {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil || !isValidListenHost(host) {
 		return fmt.Errorf("%w: server.listen must be a host:port", ErrConfigValidation)
 	}
-	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 1 || portNumber > 65535 {
+	if _, ok := parsePort(port); !ok {
 		return fmt.Errorf("%w: server.listen must contain a port from 1 through 65535", ErrConfigValidation)
 	}
 	return nil
@@ -156,10 +155,77 @@ func validateListen(listen string) error {
 
 func validatePublicURL(value string) error {
 	parsed, err := url.Parse(value)
-	if err != nil || !parsed.IsAbs() || parsed.Scheme != "https" || parsed.Host == "" {
+	if err != nil || !parsed.IsAbs() || parsed.Scheme != "https" || parsed.Hostname() == "" {
 		return fmt.Errorf("%w: server.public_url must be an absolute HTTPS URL", ErrConfigValidation)
 	}
+	if port, explicit := urlPort(parsed.Host); explicit {
+		if _, ok := parsePort(port); !ok {
+			return fmt.Errorf("%w: server.public_url must contain a port from 1 through 65535", ErrConfigValidation)
+		}
+	}
 	return nil
+}
+
+func isValidListenHost(host string) bool {
+	if host == "" || strings.TrimSpace(host) != host {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if strings.HasSuffix(host, ".") {
+		host = strings.TrimSuffix(host, ".")
+	}
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || !isASCIIAlphaNumeric(label[0]) || !isASCIIAlphaNumeric(label[len(label)-1]) {
+			return false
+		}
+		for i := 1; i < len(label)-1; i++ {
+			if !isASCIIAlphaNumeric(label[i]) && label[i] != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isASCIIAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
+func parsePort(port string) (int, bool) {
+	if port == "" {
+		return 0, false
+	}
+	for i := 0; i < len(port); i++ {
+		if port[i] < '0' || port[i] > '9' {
+			return 0, false
+		}
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return 0, false
+	}
+	return portNumber, true
+}
+
+func urlPort(host string) (string, bool) {
+	if strings.HasPrefix(host, "[") {
+		if closeBracket := strings.LastIndex(host, "]"); closeBracket >= 0 {
+			rest := host[closeBracket+1:]
+			if strings.HasPrefix(rest, ":") {
+				return rest[1:], true
+			}
+		}
+		return "", false
+	}
+	if colon := strings.LastIndexByte(host, ':'); colon >= 0 {
+		return host[colon+1:], true
+	}
+	return "", false
 }
 
 func resolveRequiredPath(base, field, value string) (string, error) {
