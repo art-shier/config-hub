@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -59,13 +60,12 @@ func NewUserSyncer(store *database.Store) *UserSyncer {
 // LoadAndSync decodes one strict YAML account document and reconciles it with
 // the database.
 func (s *UserSyncer) LoadAndSync(ctx context.Context, path string) (SyncResult, error) {
-	file, err := os.Open(path)
+	contents, err := os.ReadFile(path)
 	if err != nil {
-		return SyncResult{}, fmt.Errorf("%w: open users file: %v", ErrUserFileRead, err)
+		return SyncResult{}, errors.Join(ErrUserFileRead, fmt.Errorf("read users file: %w", err))
 	}
-	defer file.Close()
 
-	decoder := yaml.NewDecoder(file)
+	decoder := yaml.NewDecoder(bytes.NewReader(contents))
 	decoder.KnownFields(true)
 	var users UserFile
 	if err := decoder.Decode(&users); err != nil {

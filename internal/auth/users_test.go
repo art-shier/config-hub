@@ -2,10 +2,12 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"confighub.local/internal/database"
@@ -201,6 +203,7 @@ func TestLoadAndSyncRejectsUnsafeYAML(t *testing.T) {
 	admin := loadUserByUsername(t, store, "admin")
 	insertSessionFixture(t, store, admin.ID)
 	for _, contents := range []string{
+		"",
 		"users:\n  - username: admin\n    display_name: Admin\n    password: secret\n    role: admin\n    enabled: true\n    extra: no\n",
 		"users: [\n",
 		"users:\n  - username: admin\n    display_name: Admin\n    password: secret\n    role: admin\n    enabled: true\n---\nusers: []\n",
@@ -220,6 +223,45 @@ func TestLoadAndSyncRejectsUnsafeYAML(t *testing.T) {
 			t.Fatal("invalid YAML changed existing database state")
 		}
 	}
+}
+
+func TestLoadAndSyncReadErrorsPreserveErrorChainAndDatabaseState(t *testing.T) {
+	store := testStore(t)
+	syncer := NewUserSyncer(store)
+	admin := seedAdminWithSession(t, store, syncer)
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.yaml")
+
+	for _, test := range []struct {
+		name string
+		path string
+		want error
+	}{
+		{name: "missing", path: missing, want: os.ErrNotExist},
+		{name: "directory", path: dir, want: syscall.EISDIR},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := syncer.LoadAndSync(context.Background(), test.path)
+			if !errors.Is(err, ErrUserFileRead) || !errors.Is(err, test.want) {
+				t.Fatalf("error=%v; want user read and %v", err, test.want)
+			}
+			assertAdminSessionUnchanged(t, store, admin)
+		})
+	}
+}
+
+func TestSyncUsersCanceledContextLeavesDatabaseUnchanged(t *testing.T) {
+	store := testStore(t)
+	syncer := NewUserSyncer(store)
+	admin := seedAdminWithSession(t, store, syncer)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	changed := UserFile{Users: []UserSpec{{Username: "admin", DisplayName: "Changed", Password: "second", Role: "admin", Enabled: true}}}
+	_, err := syncer.Sync(ctx, changed)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v; want context canceled", err)
+	}
+	assertAdminSessionUnchanged(t, store, admin)
 }
 
 func testStore(t *testing.T) *database.Store {
@@ -261,6 +303,25 @@ func countSessions(t *testing.T, store *database.Store, userID string) int {
 	return count
 }
 
+func seedAdminWithSession(t *testing.T, store *database.Store, syncer *UserSyncer) storedUser {
+	t.Helper()
+	file := UserFile{Users: []UserSpec{{Username: "admin", DisplayName: "Admin", Password: "first", Role: "admin", Enabled: true}}}
+	if _, err := syncer.Sync(context.Background(), file); err != nil {
+		t.Fatal(err)
+	}
+	admin := loadUserByUsername(t, store, "admin")
+	insertSessionFixture(t, store, admin.ID)
+	return admin
+}
+
+func assertAdminSessionUnchanged(t *testing.T, store *database.Store, want storedUser) {
+	t.Helper()
+	got := loadUserByUsername(t, store, "admin")
+	if got.PasswordHash != want.PasswordHash || got.Enabled != want.Enabled || got.DisplayName != want.DisplayName || got.Role != want.Role || countSessions(t, store, want.ID) != 1 {
+		t.Fatalf("database state changed: got=%+v", got.User)
+	}
+}
+
 func TestPasswordFormatAndMalformedHashes(t *testing.T) {
 	first, err := HashPassword("correct horse battery staple")
 	if err != nil {
@@ -270,19 +331,44 @@ func TestPasswordFormatAndMalformedHashes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(first, "$argon2id$v=19$m=65536,t=3,p=2$") || first == second {
-		t.Fatalf("unexpected hashes: %q and %q", first, second)
+	parts := strings.Split(first, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" || parts[3] != "m=65536,t=3,p=2" {
+		t.Fatalf("unexpected PHC fields: %q", first)
+	}
+	if len(parts[4]) != 22 || len(parts[5]) != 43 {
+		t.Fatalf("unexpected PHC base64 lengths: salt=%d hash=%d", len(parts[4]), len(parts[5]))
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil || len(salt) != 16 {
+		t.Fatalf("salt decode: len=%d err=%v", len(salt), err)
+	}
+	hash, err := base64.RawStdEncoding.DecodeString(parts[5])
+	if err != nil || len(hash) != 32 {
+		t.Fatalf("hash decode: len=%d err=%v", len(hash), err)
+	}
+	secondParts := strings.Split(second, "$")
+	secondSalt, err := base64.RawStdEncoding.DecodeString(secondParts[4])
+	if err != nil || string(salt) == string(secondSalt) {
+		t.Fatalf("salts must differ: err=%v", err)
 	}
 	for _, malformed := range []string{
-		"", "argon2id$v=19$m=65536,t=3,p=2$abc$def", "$argon2id$v=18$m=65536,t=3,p=2$abc$def",
-		"$argon2id$v=19$m=1,t=999999,p=99$abc$def", "$argon2id$v=19$m=65536,t=3,p=2$%%%$def",
-		"$argon2id$v=19$m=65536,t=3,p=2$AA$AA", first + "$extra",
+		"", "argon2id$v=19$m=65536,t=3,p=2$abc$def", first + "$extra", "$argon2id$v=19$m=65536,t=3,p=2$abc",
+		"$argon2i$v=19$m=65536,t=3,p=2$" + parts[4] + "$" + parts[5],
+		"$argon2id$v=18$m=65536,t=3,p=2$" + parts[4] + "$" + parts[5],
+		"$argon2id$v=19$m=1,t=3,p=2$" + parts[4] + "$" + parts[5],
+		"$argon2id$v=19$m=65536,t=4,p=2$" + parts[4] + "$" + parts[5],
+		"$argon2id$v=19$m=65536,t=3,p=1$" + parts[4] + "$" + parts[5],
+		"$argon2id$v=19$m=65536,t=3,p=2$%%%$" + parts[5],
+		"$argon2id$v=19$m=65536,t=3,p=2$" + parts[4] + "$%%%",
+		"$argon2id$v=19$m=65536,t=3,p=2$A" + parts[4] + "$" + parts[5],
+		"$argon2id$v=19$m=65536,t=3,p=2$" + parts[4] + "$A" + parts[5],
+		"$argon2id$v=19$m=65536,t=3,p=2$" + strings.Repeat("A", 1<<20) + "$" + parts[5],
+		strings.Repeat("$", 1<<20),
 	} {
 		if VerifyPassword(malformed, "correct horse battery staple") {
 			t.Fatalf("malformed hash verified: %q", malformed)
 		}
 	}
-	parts := strings.Split(first, "$")
 	withNewline := append([]string(nil), parts...)
 	withNewline[4] += "\n"
 	if VerifyPassword(strings.Join(withNewline, "$"), "correct horse battery staple") {
@@ -295,7 +381,26 @@ func TestPasswordFormatAndMalformedHashes(t *testing.T) {
 	if VerifyPassword(strings.Join(withNonCanonicalSalt, "$"), "correct horse battery staple") {
 		t.Fatal("hash with non-canonical base64 salt verified")
 	}
+	withNonCanonicalHash := append([]string(nil), parts...)
+	last = withNonCanonicalHash[5][len(withNonCanonicalHash[5])-1]
+	withNonCanonicalHash[5] = withNonCanonicalHash[5][:len(withNonCanonicalHash[5])-1] + string(base64Alphabet[strings.IndexByte(base64Alphabet, last)+1])
+	if VerifyPassword(strings.Join(withNonCanonicalHash, "$"), "correct horse battery staple") {
+		t.Fatal("hash with non-canonical base64 hash verified")
+	}
 	if _, err := HashPassword(""); err == nil || VerifyPassword(first, "") {
 		t.Fatal("empty passwords must be rejected")
+	}
+}
+
+func TestParsePasswordHashRejectsOversizedInputWithoutAllocation(t *testing.T) {
+	overlong := "$argon2id$v=19$m=65536,t=3,p=2$" + strings.Repeat("A", 1<<20) + "$" + strings.Repeat("A", 43)
+	for _, encoded := range []string{overlong, strings.Repeat("$", 1<<20)} {
+		if allocations := testing.AllocsPerRun(5, func() {
+			if _, _, ok := parsePasswordHash(encoded); ok {
+				t.Fatal("oversized hash parsed")
+			}
+		}); allocations != 0 {
+			t.Fatalf("oversized parse allocated %.0f times", allocations)
+		}
 	}
 }

@@ -12,13 +12,17 @@ import (
 )
 
 const (
-	argon2Version = 19
-	argon2Memory  = 64 * 1024
-	argon2Time    = 3
-	argon2Threads = 2
-	saltLength    = 16
-	hashLength    = 32
+	argon2Version     = 19
+	argon2Memory      = 64 * 1024
+	argon2Time        = 3
+	argon2Threads     = 2
+	saltLength        = 16
+	hashLength        = 32
+	encodedSaltLength = 22
+	encodedHashLength = 43
 )
+
+const passwordHashPrefix = "$argon2id$v=19$m=65536,t=3,p=2$"
 
 var errEmptyPassword = errors.New("password must not be empty")
 
@@ -52,15 +56,18 @@ func VerifyPassword(encoded, password string) bool {
 }
 
 func parsePasswordHash(encoded string) ([]byte, []byte, bool) {
-	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" || parts[3] != "m=65536,t=3,p=2" {
+	if len(encoded) != len(passwordHashPrefix)+encodedSaltLength+1+encodedHashLength || !strings.HasPrefix(encoded, passwordHashPrefix) {
 		return nil, nil, false
 	}
-	salt, err := decodeCanonicalRawBase64(parts[4])
+	saltEncoded, hashEncoded, found := strings.Cut(encoded[len(passwordHashPrefix):], "$")
+	if !found || len(saltEncoded) != encodedSaltLength || len(hashEncoded) != encodedHashLength || strings.Contains(hashEncoded, "$") {
+		return nil, nil, false
+	}
+	salt, err := decodeCanonicalRawBase64(saltEncoded)
 	if err != nil || len(salt) != saltLength {
 		return nil, nil, false
 	}
-	hash, err := decodeCanonicalRawBase64(parts[5])
+	hash, err := decodeCanonicalRawBase64(hashEncoded)
 	if err != nil || len(hash) != hashLength {
 		return nil, nil, false
 	}
