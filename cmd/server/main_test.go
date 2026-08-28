@@ -3,13 +3,90 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+func TestNewHTTPServerAppliesTimeouts(t *testing.T) {
+	httpServer := newHTTPServer("127.0.0.1:8080", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), io.Discard)
+
+	if httpServer.ReadHeaderTimeout != 5*time.Second {
+		t.Errorf("ReadHeaderTimeout=%s, want 5s", httpServer.ReadHeaderTimeout)
+	}
+	if httpServer.ReadTimeout != 15*time.Second {
+		t.Errorf("ReadTimeout=%s, want 15s", httpServer.ReadTimeout)
+	}
+	if httpServer.WriteTimeout != 30*time.Second {
+		t.Errorf("WriteTimeout=%s, want 30s", httpServer.WriteTimeout)
+	}
+	if httpServer.IdleTimeout != time.Minute {
+		t.Errorf("IdleTimeout=%s, want 1m", httpServer.IdleTimeout)
+	}
+}
+
+func TestRunJoinAndCloseWaitsForLifecycleAndReloadLoop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		releaseRun := make(chan struct{})
+		joined := make(chan struct{})
+		stopCalled := make(chan struct{})
+		closeCalled := make(chan struct{})
+		wantRunErr := errors.New("run failed")
+		wantCloseErr := errors.New("close failed")
+		results := make(chan [2]error, 1)
+		done := make(chan struct{})
+		go func() {
+			runErr, closeErr := runJoinAndClose(
+				func() error {
+					<-releaseRun
+					return wantRunErr
+				},
+				func() { close(stopCalled) },
+				joined,
+				func() error {
+					close(closeCalled)
+					return wantCloseErr
+				},
+			)
+			results <- [2]error{runErr, closeErr}
+			close(done)
+		}()
+		synctest.Wait()
+		closedBeforeRun := channelIsClosed(closeCalled)
+
+		close(releaseRun)
+		synctest.Wait()
+		stoppedAfterRun := channelIsClosed(stopCalled)
+		closedBeforeJoin := channelIsClosed(closeCalled)
+		returnedBeforeJoin := channelIsClosed(done)
+
+		close(joined)
+		<-done
+		got := <-results
+		if closedBeforeRun {
+			t.Error("resource closed before lifecycle Run returned")
+		}
+		if !stoppedAfterRun {
+			t.Error("reload stop callback was not invoked after lifecycle Run returned")
+		}
+		if closedBeforeJoin || returnedBeforeJoin {
+			t.Error("resource closed or helper returned before reload loop joined")
+		}
+		if !channelIsClosed(closeCalled) {
+			t.Error("resource was not closed after lifecycle and reload loop completed")
+		}
+		if !errors.Is(got[0], wantRunErr) || !errors.Is(got[1], wantCloseErr) {
+			t.Errorf("errors=(%v, %v), want (%v, %v)", got[0], got[1], wantRunErr, wantCloseErr)
+		}
+	})
+}
 
 func TestRunCommandMapsUsageConfigAndUnavailableBackupExitCodes(t *testing.T) {
 	if code := runCommand(context.Background(), nil, new(bytes.Buffer)); code != 2 {
@@ -98,6 +175,15 @@ func TestReloadSignalLoopCanBeJoinedBeforeResourceCleanup(t *testing.T) {
 
 func writeCommandConfig(t *testing.T, users string) string {
 	return writeCommandConfigWithPublicURL(t, users, "https://config.example.com")
+}
+
+func channelIsClosed(channel <-chan struct{}) bool {
+	select {
+	case <-channel:
+		return true
+	default:
+		return false
+	}
 }
 
 func writeCommandConfigWithPublicURL(t *testing.T, users, publicURL string) string {

@@ -13,11 +13,11 @@ type systemHandlers struct {
 }
 
 func (h *systemHandlers) live(w http.ResponseWriter, _ *http.Request) {
-	h.writeHealth(w, h.status == nil || h.status.Live())
+	h.writeHealth(w, h.status != nil && h.status.Live())
 }
 
 func (h *systemHandlers) ready(w http.ResponseWriter, _ *http.Request) {
-	h.writeHealth(w, h.status == nil || h.status.Ready())
+	h.writeHealth(w, h.status != nil && h.status.Ready())
 }
 
 func (*systemHandlers) writeHealth(w http.ResponseWriter, healthy bool) {

@@ -33,6 +33,13 @@ func TestSystemHealthReflectsLiveAndReadyState(t *testing.T) {
 	}
 }
 
+func TestSystemHealthFailsClosedWithoutStatus(t *testing.T) {
+	handler := systemTestRouter(t, nil, nil)
+
+	assertSystemStatus(t, handler, "/api/v1/health/live", http.StatusServiceUnavailable)
+	assertSystemStatus(t, handler, "/api/v1/health/ready", http.StatusServiceUnavailable)
+}
+
 func TestRouterSendsOnlyNonAPIPathsToWebUI(t *testing.T) {
 	web := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(299) })
 	handler := systemTestRouter(t, healthyTestSystemStatus(), web)

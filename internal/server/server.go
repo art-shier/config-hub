@@ -23,17 +23,23 @@ var (
 	ErrAlreadyRunning  = errors.New("server is already running")
 )
 
-// HTTPServer is the net/http lifecycle surface used by Server. A successful
-// Shutdown must initiate listener termination; Run waits for ListenAndServe to
-// return before completing the shutdown.
+// HTTPServer is the net/http lifecycle surface used by Server. Shutdown starts
+// a graceful stop, while Close force-stops the listener when graceful shutdown
+// fails. Run always collects ListenAndServe before returning.
 type HTTPServer interface {
 	ListenAndServe() error
 	Shutdown(context.Context) error
+	Close() error
 }
 
 // UserReloader atomically reconciles the configured users with durable state.
 type UserReloader interface {
 	Reload(context.Context) error
+}
+
+type handlerDrainer interface {
+	BeginDrain()
+	Wait()
 }
 
 // UserReloadFunc adapts a function to UserReloader.
@@ -74,19 +80,24 @@ func WithState(state *State) Option {
 	}
 }
 
+func WithHandlerDrainer(drainer handlerDrainer) Option {
+	return func(server *Server) { server.handlerDrainer = drainer }
+}
+
 // Server coordinates initial user synchronization, listening, reload, and
 // graceful shutdown. It deliberately never logs dependency errors because a
 // users file error can contain sensitive deployment material.
 type Server struct {
-	httpServer  HTTPServer
-	reloader    UserReloader
-	logger      *slog.Logger
-	state       *State
-	reloadMu    sync.Mutex
-	lifecycleMu sync.Mutex
-	generation  uint64
-	terminal    bool
-	running     atomic.Bool
+	httpServer     HTTPServer
+	reloader       UserReloader
+	logger         *slog.Logger
+	state          *State
+	handlerDrainer handlerDrainer
+	reloadSlot     chan struct{}
+	lifecycleMu    sync.Mutex
+	generation     uint64
+	terminal       bool
+	running        atomic.Bool
 }
 
 func New(httpServer HTTPServer, options ...Option) *Server {
@@ -94,7 +105,9 @@ func New(httpServer HTTPServer, options ...Option) *Server {
 		httpServer: httpServer,
 		logger:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		state:      NewState(),
+		reloadSlot: make(chan struct{}, 1),
 	}
+	server.reloadSlot <- struct{}{}
 	for _, option := range options {
 		if option != nil {
 			option(server)
@@ -149,17 +162,42 @@ func (s *Server) publishReady(generation uint64) {
 	}
 }
 
+func (s *Server) beginHandlerDrain() {
+	if s.handlerDrainer != nil {
+		s.handlerDrainer.BeginDrain()
+	}
+}
+
+func (s *Server) waitForHandlers() {
+	if s.handlerDrainer != nil {
+		s.handlerDrainer.Wait()
+	}
+}
+
 // Reload reconciles users. A failure retains both the last valid database
 // snapshot and its readiness state.
 func (s *Server) Reload(ctx context.Context) error {
 	if s == nil || s.reloader == nil {
 		return ErrUserReload
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	generation := s.currentGeneration()
-	s.reloadMu.Lock()
-	defer s.reloadMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.reloadSlot:
+	}
+	defer func() { s.reloadSlot <- struct{}{} }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := s.reloader.Reload(ctx); err != nil {
-		if ctx != nil && ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if s.Ready() {
@@ -173,8 +211,9 @@ func (s *Server) Reload(ctx context.Context) error {
 	return nil
 }
 
-// Run synchronizes users before listening and drains active HTTP requests for
-// up to ten seconds when the context is canceled.
+// Run synchronizes users before listening. Cancellation allows up to ten
+// seconds for graceful shutdown, then force-closes on failure and waits for
+// already-admitted handlers to exit.
 func (s *Server) Run(ctx context.Context) error {
 	if s == nil || s.httpServer == nil || s.reloader == nil || s.state == nil {
 		return ErrInvalidServer
@@ -203,15 +242,25 @@ func (s *Server) Run(ctx context.Context) error {
 
 	select {
 	case <-serveResult:
+		s.markTerminal(generation)
+		s.beginHandlerDrain()
+		_ = s.httpServer.Close()
+		s.waitForHandlers()
 		return ErrHTTPServe
 	case <-ctx.Done():
 		s.markTerminal(generation)
+		s.beginHandlerDrain()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 		defer cancel()
-		if err := s.httpServer.Shutdown(shutdownContext); err != nil {
-			return ErrHTTPShutdown
+		shutdownErr := s.httpServer.Shutdown(shutdownContext)
+		if shutdownErr != nil {
+			_ = s.httpServer.Close()
 		}
 		err := <-serveResult
+		s.waitForHandlers()
+		if shutdownErr != nil {
+			return ErrHTTPShutdown
+		}
 		if !errors.Is(err, http.ErrServerClosed) {
 			return ErrHTTPServe
 		}

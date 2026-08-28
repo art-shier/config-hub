@@ -33,6 +33,13 @@ var (
 	errBackupUnavailable = errors.New("backup is not available in this build")
 )
 
+const (
+	httpReadHeaderTimeout = 5 * time.Second
+	httpReadTimeout       = 15 * time.Second
+	httpWriteTimeout      = 30 * time.Second
+	httpIdleTimeout       = time.Minute
+)
+
 type backupOperation func(context.Context, config.Config, string) error
 
 var runBackup backupOperation = func(context.Context, config.Config, string) error {
@@ -154,16 +161,11 @@ func serve(parent context.Context, configPath string, stderr io.Writer) error {
 		_ = store.Close()
 		return errConfiguration
 	}
-	httpServer := &http.Server{
-		Addr:              cfg.Server.Listen,
-		Handler:           router,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       time.Minute,
-		MaxHeaderBytes:    1 << 20,
-		ErrorLog:          log.New(stderr, "http: ", 0),
-	}
+	handlerTracker := server.NewHandlerTracker(router)
+	httpServer := newHTTPServer(cfg.Server.Listen, handlerTracker, stderr)
 	nativeServer := server.New(httpServer,
 		server.WithState(state),
+		server.WithHandlerDrainer(handlerTracker),
 		server.WithLogger(logger),
 		server.WithUserReloader(server.UserReloadFunc(func(ctx context.Context) error {
 			_, err := syncer.LoadAndSync(ctx, cfg.Auth.UsersFile)
@@ -172,25 +174,47 @@ func serve(parent context.Context, configPath string, stderr io.Writer) error {
 	)
 
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	reloads := make(chan os.Signal, 1)
 	signal.Notify(reloads, syscall.SIGHUP)
-	defer signal.Stop(reloads)
 	reloadDone := make(chan struct{})
 	go func() {
 		reloadOnSignals(ctx, reloads, nativeServer.Reload)
 		close(reloadDone)
 	}()
 
-	runErr := nativeServer.Run(ctx)
-	stop()
-	signal.Stop(reloads)
-	<-reloadDone
-	closeErr := store.Close()
+	runErr, closeErr := runJoinAndClose(
+		func() error { return nativeServer.Run(ctx) },
+		func() {
+			stop()
+			signal.Stop(reloads)
+		},
+		reloadDone,
+		store.Close,
+	)
 	if runErr != nil || closeErr != nil {
 		return errRuntime
 	}
 	return nil
+}
+
+func newHTTPServer(address string, handler http.Handler, errorOutput io.Writer) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+		MaxHeaderBytes:    1 << 20,
+		ErrorLog:          log.New(errorOutput, "http: ", 0),
+	}
+}
+
+func runJoinAndClose(run func() error, stop func(), joined <-chan struct{}, closeResource func() error) (error, error) {
+	runErr := run()
+	stop()
+	<-joined
+	return runErr, closeResource()
 }
 
 func reloadOnSignals(ctx context.Context, signals <-chan os.Signal, reload func(context.Context) error) {

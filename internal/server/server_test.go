@@ -8,8 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -192,6 +194,157 @@ func TestShutdownClassifiesListenerResult(t *testing.T) {
 	}
 }
 
+func TestShutdownFailureForcesCloseCollectsServeAndWaitsForHandlers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		httpServer := newLifecycleHTTPServer(
+			errors.New("accept failed while closing"),
+			errors.New("graceful shutdown failed"),
+			errors.New("force close failed"),
+		)
+		handlerEntered := make(chan struct{})
+		releaseHandler := make(chan struct{})
+		var handlerCalls atomic.Int32
+		tracker := NewHandlerTracker(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			if handlerCalls.Add(1) == 1 {
+				close(handlerEntered)
+				<-releaseHandler
+			}
+		}))
+		server := New(httpServer,
+			WithUserReloader(&fakeReloader{}),
+			WithHandlerDrainer(tracker),
+			WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		)
+		ctx, cancel := context.WithCancel(context.Background())
+		runResult := make(chan error, 1)
+		runReturned := make(chan struct{})
+		go func() {
+			runResult <- server.Run(ctx)
+			close(runReturned)
+		}()
+		<-httpServer.started
+
+		requestDone := make(chan struct{})
+		go func() {
+			tracker.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/active", nil))
+			close(requestDone)
+		}()
+		<-handlerEntered
+		cancel()
+		synctest.Wait()
+
+		closeCalled := channelClosed(httpServer.closeCalled)
+		returnedBeforeServe := channelClosed(runReturned)
+		response := httptest.NewRecorder()
+		tracker.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rejected", nil))
+		callsAfterRejectedRequest := handlerCalls.Load()
+
+		close(httpServer.releaseServe)
+		synctest.Wait()
+		returnedBeforeHandler := channelClosed(runReturned)
+		close(releaseHandler)
+		<-requestDone
+		<-runReturned
+		err := <-runResult
+
+		if !closeCalled {
+			t.Error("Shutdown failure did not call Close")
+		}
+		if returnedBeforeServe {
+			t.Error("Run returned before ListenAndServe completed")
+		}
+		if response.Code != http.StatusServiceUnavailable || callsAfterRejectedRequest != 1 {
+			t.Errorf("request after drain: status=%d handler calls=%d, want status=%d calls=1", response.Code, callsAfterRejectedRequest, http.StatusServiceUnavailable)
+		}
+		if returnedBeforeHandler {
+			t.Error("Run returned before the admitted handler completed")
+		}
+		if !errors.Is(err, ErrHTTPShutdown) {
+			t.Errorf("Run error=%v, want ErrHTTPShutdown", err)
+		}
+	})
+}
+
+func TestShutdownDeadlineForcesCloseAndReturnsShutdownError(t *testing.T) {
+	httpServer := newLifecycleHTTPServer(http.ErrServerClosed, context.DeadlineExceeded, errors.New("force close failed"))
+	server := New(httpServer,
+		WithUserReloader(&fakeReloader{}),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run(ctx) }()
+	<-httpServer.started
+	cancel()
+	<-httpServer.shutdownCalled
+	<-httpServer.closeCalled
+	close(httpServer.releaseServe)
+
+	if err := <-runDone; !errors.Is(err, ErrHTTPShutdown) {
+		t.Fatalf("Run error=%v, want ErrHTTPShutdown", err)
+	}
+}
+
+func TestUnexpectedListenerExitForcesCloseAndWaitsForHandlers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		httpServer := newLifecycleHTTPServer(errors.New("listener failed"), nil, errors.New("force close failed"))
+		handlerEntered := make(chan struct{})
+		releaseHandler := make(chan struct{})
+		var handlerCalls atomic.Int32
+		tracker := NewHandlerTracker(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			if handlerCalls.Add(1) == 1 {
+				close(handlerEntered)
+				<-releaseHandler
+			}
+		}))
+		server := New(httpServer,
+			WithUserReloader(&fakeReloader{}),
+			WithHandlerDrainer(tracker),
+			WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		)
+		runResult := make(chan error, 1)
+		runReturned := make(chan struct{})
+		go func() {
+			runResult <- server.Run(context.Background())
+			close(runReturned)
+		}()
+		<-httpServer.started
+
+		requestDone := make(chan struct{})
+		go func() {
+			tracker.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/active", nil))
+			close(requestDone)
+		}()
+		<-handlerEntered
+		close(httpServer.releaseServe)
+		synctest.Wait()
+
+		closeCalled := channelClosed(httpServer.closeCalled)
+		returnedBeforeHandler := channelClosed(runReturned)
+		response := httptest.NewRecorder()
+		tracker.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rejected", nil))
+		callsAfterRejectedRequest := handlerCalls.Load()
+
+		close(releaseHandler)
+		<-requestDone
+		<-runReturned
+		err := <-runResult
+
+		if !closeCalled {
+			t.Error("listener exit did not call Close")
+		}
+		if response.Code != http.StatusServiceUnavailable || callsAfterRejectedRequest != 1 {
+			t.Errorf("request after listener exit: status=%d handler calls=%d, want status=%d calls=1", response.Code, callsAfterRejectedRequest, http.StatusServiceUnavailable)
+		}
+		if returnedBeforeHandler {
+			t.Error("Run returned before the admitted handler completed")
+		}
+		if !errors.Is(err, ErrHTTPServe) {
+			t.Errorf("Run error=%v, want ErrHTTPServe", err)
+		}
+	})
+}
+
 func TestCancellationPreventsInFlightReloadFromRestoringReadinessBeforeShutdownReturns(t *testing.T) {
 	httpServer := newBlockingShutdownHTTPServer()
 	reloader := &terminalRaceReloader{reloadStarted: make(chan struct{}), releaseReload: make(chan struct{})}
@@ -295,6 +448,35 @@ func TestReloadKeepsLastValidUsers(t *testing.T) {
 }
 
 func TestReloadSerializesInitialAndSignalReconciliation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reloader := &serializedReloader{
+			firstStarted:  make(chan struct{}),
+			secondStarted: make(chan struct{}),
+			releaseFirst:  make(chan struct{}),
+		}
+		server := New(newFakeHTTPServer(), WithUserReloader(reloader), WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+		firstDone := make(chan error, 1)
+		secondDone := make(chan error, 1)
+		go func() { firstDone <- server.Reload(context.Background()) }()
+		<-reloader.firstStarted
+		go func() { secondDone <- server.Reload(context.Background()) }()
+		synctest.Wait()
+
+		overlapped := channelClosed(reloader.secondStarted)
+		close(reloader.releaseFirst)
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-secondDone; err != nil {
+			t.Fatal(err)
+		}
+		if overlapped {
+			t.Fatal("second reload entered reconciliation before the initial reload completed")
+		}
+	})
+}
+
+func TestReloadCancellationWhileQueuedSkipsReconciliation(t *testing.T) {
 	reloader := &serializedReloader{
 		firstStarted:  make(chan struct{}),
 		secondStarted: make(chan struct{}),
@@ -302,26 +484,40 @@ func TestReloadSerializesInitialAndSignalReconciliation(t *testing.T) {
 	}
 	server := New(newFakeHTTPServer(), WithUserReloader(reloader), WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	firstDone := make(chan error, 1)
-	secondDone := make(chan error, 1)
 	go func() { firstDone <- server.Reload(context.Background()) }()
 	<-reloader.firstStarted
-	go func() { secondDone <- server.Reload(context.Background()) }()
 
-	overlapped := false
-	select {
-	case <-reloader.secondStarted:
-		overlapped = true
-	case <-time.After(50 * time.Millisecond):
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- server.Reload(ctx) }()
+	cancel()
 	close(reloader.releaseFirst)
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)
 	}
-	if err := <-secondDone; err != nil {
+	if err := <-secondDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued Reload error=%v, want context.Canceled", err)
+	}
+	if channelClosed(reloader.secondStarted) {
+		t.Fatal("canceled queued reload entered reconciliation")
+	}
+}
+
+func TestReloadNormalizesNilContext(t *testing.T) {
+	var receivedNil atomic.Bool
+	server := New(newFakeHTTPServer(),
+		WithUserReloader(UserReloadFunc(func(ctx context.Context) error {
+			receivedNil.Store(ctx == nil)
+			return nil
+		})),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+
+	if err := server.Reload(nil); err != nil {
 		t.Fatal(err)
 	}
-	if overlapped {
-		t.Fatal("second reload entered reconciliation before the initial reload completed")
+	if receivedNil.Load() {
+		t.Fatal("Reload passed a nil context to the reloader")
 	}
 }
 
@@ -443,8 +639,21 @@ type shutdownResultHTTPServer struct {
 	serveErr error
 }
 
+type lifecycleHTTPServer struct {
+	started        chan struct{}
+	releaseServe   chan struct{}
+	shutdownCalled chan struct{}
+	closeCalled    chan struct{}
+	shutdownOnce   sync.Once
+	closeOnce      sync.Once
+	serveErr       error
+	shutdownErr    error
+	closeErr       error
+}
+
 func (s immediateHTTPServer) ListenAndServe() error        { return s.err }
 func (immediateHTTPServer) Shutdown(context.Context) error { return nil }
+func (immediateHTTPServer) Close() error                   { return nil }
 
 func newControlledHTTPServer(serveErr error) *controlledHTTPServer {
 	return &controlledHTTPServer{
@@ -469,6 +678,8 @@ func (s *controlledHTTPServer) Shutdown(context.Context) error {
 	return nil
 }
 
+func (s *controlledHTTPServer) Close() error { return nil }
+
 func newBlockingShutdownHTTPServer() *blockingShutdownHTTPServer {
 	return &blockingShutdownHTTPServer{
 		started:         make(chan struct{}),
@@ -491,11 +702,50 @@ func (s *blockingShutdownHTTPServer) Shutdown(context.Context) error {
 	return nil
 }
 
+func (s *blockingShutdownHTTPServer) Close() error { return nil }
+
 func newShutdownResultHTTPServer(serveErr error) *shutdownResultHTTPServer {
 	return &shutdownResultHTTPServer{
 		started:  make(chan struct{}),
 		stop:     make(chan struct{}),
 		serveErr: serveErr,
+	}
+}
+
+func newLifecycleHTTPServer(serveErr, shutdownErr, closeErr error) *lifecycleHTTPServer {
+	return &lifecycleHTTPServer{
+		started:        make(chan struct{}),
+		releaseServe:   make(chan struct{}),
+		shutdownCalled: make(chan struct{}),
+		closeCalled:    make(chan struct{}),
+		serveErr:       serveErr,
+		shutdownErr:    shutdownErr,
+		closeErr:       closeErr,
+	}
+}
+
+func (s *lifecycleHTTPServer) ListenAndServe() error {
+	close(s.started)
+	<-s.releaseServe
+	return s.serveErr
+}
+
+func (s *lifecycleHTTPServer) Shutdown(context.Context) error {
+	s.shutdownOnce.Do(func() { close(s.shutdownCalled) })
+	return s.shutdownErr
+}
+
+func (s *lifecycleHTTPServer) Close() error {
+	s.closeOnce.Do(func() { close(s.closeCalled) })
+	return s.closeErr
+}
+
+func channelClosed(channel <-chan struct{}) bool {
+	select {
+	case <-channel:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -506,6 +756,11 @@ func (s *shutdownResultHTTPServer) ListenAndServe() error {
 }
 
 func (s *shutdownResultHTTPServer) Shutdown(context.Context) error {
+	s.stopOnce.Do(func() { close(s.stop) })
+	return nil
+}
+
+func (s *shutdownResultHTTPServer) Close() error {
 	s.stopOnce.Do(func() { close(s.stop) })
 	return nil
 }
@@ -527,6 +782,11 @@ func (s *fakeHTTPServer) Shutdown(ctx context.Context) error {
 		s.timeout = time.Until(deadline)
 	}
 	s.mu.Unlock()
+	s.once.Do(func() { close(s.stopped) })
+	return nil
+}
+
+func (s *fakeHTTPServer) Close() error {
 	s.once.Do(func() { close(s.stopped) })
 	return nil
 }
