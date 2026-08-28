@@ -3,6 +3,8 @@ package revisions
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -67,6 +69,90 @@ func TestCurrentReturnsEmptySnapshotBeforeFirstSave(t *testing.T) {
 	}
 }
 
+func TestCurrentFailsClosedWhenPointerIsMissingOrBelongsToAnotherEnvironment(t *testing.T) {
+	tests := []struct {
+		name       string
+		pointer    func(*testing.T, *revisionFixture) string
+		secretText string
+	}{
+		{
+			name: "cross-environment pointer",
+			pointer: func(t *testing.T, fixture *revisionFixture) string {
+				t.Helper()
+				revision, err := fixture.service.Replace(context.Background(), fixture.admin, fixture.hiddenEnvironmentID, ReplaceInput{
+					Entries: []Entry{{Key: "HIDDEN_SECRET", Value: "cross-project-secret"}},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return revision.ID
+			},
+			secretText: "cross-project-secret",
+		},
+		{name: "missing pointer", pointer: func(*testing.T, *revisionFixture) string { return "missing-revision-id" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRevisionFixture(t)
+			pointer := test.pointer(t, fixture)
+			if _, err := fixture.store.DB().Exec(`DROP TRIGGER environments_current_revision_update`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.store.DB().Exec(`UPDATE environments SET current_revision_id = ? WHERE id = ?`, pointer, fixture.environmentID); err != nil {
+				t.Fatal(err)
+			}
+			revision, err := fixture.service.Current(context.Background(), fixture.viewer, fixture.environmentID, "")
+			if !errors.Is(err, ErrDataIntegrity) {
+				t.Fatalf("revision=%+v error=%v", revision, err)
+			}
+			if test.secretText != "" && strings.Contains(err.Error(), test.secretText) {
+				t.Fatalf("data integrity error leaked secret: %v", err)
+			}
+		})
+	}
+}
+
+func TestCurrentAndReplaceFailClosedWhenCurrentVersionIsNotPositive(t *testing.T) {
+	for _, version := range []int64{0, -1} {
+		t.Run(fmt.Sprintf("version %d", version), func(t *testing.T) {
+			fixture := newRevisionFixture(t)
+			if _, err := fixture.store.DB().Exec(`INSERT INTO revisions
+				(id, environment_id, version, message, created_by, created_at)
+				VALUES ('invalid-version', ?, ?, '', ?, 1)`, fixture.environmentID, version, fixture.editor.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value)
+				VALUES ('invalid-version', 'VALUE', 'original')`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.store.DB().Exec(`UPDATE environments SET current_revision_id = 'invalid-version' WHERE id = ?`, fixture.environmentID); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := fixture.service.Current(context.Background(), fixture.viewer, fixture.environmentID, ""); !errors.Is(err, ErrDataIntegrity) {
+				t.Fatalf("current error=%v", err)
+			}
+			_, err := fixture.service.Replace(context.Background(), fixture.editor, fixture.environmentID, ReplaceInput{
+				BaseRevision: 0,
+				Entries:      []Entry{{Key: "VALUE", Value: "must not save"}},
+			})
+			if !errors.Is(err, ErrDataIntegrity) {
+				t.Fatalf("replace error=%v", err)
+			}
+			var revisions int
+			var currentID string
+			if err := fixture.store.DB().QueryRow(`SELECT COUNT(r.id), e.current_revision_id
+				FROM environments e JOIN revisions r ON r.environment_id = e.id
+				WHERE e.id = ? GROUP BY e.id`, fixture.environmentID).Scan(&revisions, &currentID); err != nil {
+				t.Fatal(err)
+			}
+			if revisions != 1 || currentID != "invalid-version" {
+				t.Fatalf("revisions=%d current=%q", revisions, currentID)
+			}
+		})
+	}
+}
+
 func TestReplaceRejectsInvalidDuplicateAndOversizedEntries(t *testing.T) {
 	fixture := newRevisionFixture(t)
 	invalidUTF8 := string([]byte{0xff})
@@ -102,6 +188,84 @@ func TestReplaceRejectsInvalidDuplicateAndOversizedEntries(t *testing.T) {
 	var validation *ValidationError
 	if !errors.As(err, &validation) || validation.Fields["entries"] == "" {
 		t.Fatalf("entry count error=%v", err)
+	}
+}
+
+func TestSnapshotBudgetRejectsIntegerSizedComponentWithoutOverflow(t *testing.T) {
+	remaining := int64(MaxSnapshotBytes)
+	after, ok := consumeSnapshotBudget(remaining, math.MaxInt)
+	if ok || after != remaining {
+		t.Fatalf("remaining=%d ok=%v", after, ok)
+	}
+}
+
+func TestReplaceFailsClosedWhenCurrentVersionCannotIncrement(t *testing.T) {
+	fixture := newRevisionFixture(t)
+	if _, err := fixture.store.DB().Exec(`INSERT INTO revisions
+		(id, environment_id, version, message, created_by, created_at)
+		VALUES ('max-revision', ?, ?, '', ?, 1)`, fixture.environmentID, int64(math.MaxInt64), fixture.editor.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value) VALUES ('max-revision', 'VALUE', 'original')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`UPDATE environments SET current_revision_id = 'max-revision' WHERE id = ?`, fixture.environmentID); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := fixture.service.Replace(context.Background(), fixture.editor, fixture.environmentID, ReplaceInput{
+		BaseRevision: math.MaxInt64,
+		Entries:      []Entry{{Key: "VALUE", Value: "must not save"}},
+	})
+	if !errors.Is(err, ErrDataIntegrity) {
+		t.Fatalf("replace error=%v", err)
+	}
+	current, err := fixture.service.Current(context.Background(), fixture.viewer, fixture.environmentID, "")
+	if err != nil || current.ID != "max-revision" || current.Version != math.MaxInt64 || len(current.Entries) != 1 || current.Entries[0].Value != "original" {
+		t.Fatalf("current=%+v error=%v", current, err)
+	}
+	var revisions, negativeVersions int
+	if err := fixture.store.DB().QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN version < 0 THEN 1 ELSE 0 END), 0)
+		FROM revisions WHERE environment_id = ?`, fixture.environmentID).Scan(&revisions, &negativeVersions); err != nil {
+		t.Fatal(err)
+	}
+	if revisions != 1 || negativeVersions != 0 {
+		t.Fatalf("revisions=%d negative=%d", revisions, negativeVersions)
+	}
+}
+
+func TestRollbackFailsClosedWhenCurrentVersionCannotIncrement(t *testing.T) {
+	fixture := newRevisionFixture(t)
+	if _, err := fixture.store.DB().Exec(`INSERT INTO revisions
+		(id, environment_id, version, message, created_by, created_at)
+		VALUES ('target-revision', ?, 1, '', ?, 1),
+		       ('max-revision', ?, ?, '', ?, 2)`,
+		fixture.environmentID, fixture.editor.ID,
+		fixture.environmentID, int64(math.MaxInt64), fixture.editor.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value)
+		VALUES ('target-revision', 'VALUE', 'target'), ('max-revision', 'VALUE', 'original')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`UPDATE environments SET current_revision_id = 'max-revision' WHERE id = ?`, fixture.environmentID); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := fixture.service.Rollback(context.Background(), fixture.editor, fixture.environmentID, 1, "rollback")
+	if !errors.Is(err, ErrDataIntegrity) {
+		t.Fatalf("rollback error=%v", err)
+	}
+	var revisions, negativeVersions int
+	var currentID string
+	if err := fixture.store.DB().QueryRow(`SELECT COUNT(r.id),
+			COALESCE(SUM(CASE WHEN r.version < 0 THEN 1 ELSE 0 END), 0), e.current_revision_id
+		FROM environments e JOIN revisions r ON r.environment_id = e.id
+		WHERE e.id = ? GROUP BY e.id`, fixture.environmentID).Scan(&revisions, &negativeVersions, &currentID); err != nil {
+		t.Fatal(err)
+	}
+	if revisions != 2 || negativeVersions != 0 || currentID != "max-revision" {
+		t.Fatalf("revisions=%d negative=%d current=%q", revisions, negativeVersions, currentID)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -32,6 +33,7 @@ var (
 	ErrNotFound         = errors.New("revision resource not found")
 	ErrRevisionConflict = errors.New("revision conflict")
 	ErrInvalid          = errors.New("invalid revision input")
+	ErrDataIntegrity    = errors.New("revision data integrity failure")
 
 	keyPattern  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
@@ -295,6 +297,10 @@ func (s *Service) rollback(ctx context.Context, actor auth.User, locator environ
 }
 
 func (s *Service) createSnapshotTx(ctx context.Context, tx *sql.Tx, actor auth.User, environment environmentRecord, current Revision, message string, entries []Entry) (Revision, error) {
+	if (current.ID == "" && current.Version != 0) ||
+		(current.ID != "" && (current.Version <= 0 || current.Version == math.MaxInt64)) {
+		return Revision{}, ErrDataIntegrity
+	}
 	now := s.now().UTC().Truncate(time.Second)
 	revision := Revision{
 		ID: uuid.NewString(), EnvironmentID: environment.ID, Version: current.Version + 1,
@@ -391,7 +397,7 @@ func validateReplaceInput(input ReplaceInput) (ReplaceInput, error) {
 	}
 	entries := make([]Entry, 0, len(input.Entries))
 	seen := make(map[string]struct{}, len(input.Entries))
-	aggregateBytes := 0
+	remainingBytes := int64(MaxSnapshotBytes)
 	for index, inputEntry := range input.Entries {
 		entry := Entry{Key: strings.TrimSpace(inputEntry.Key), Value: inputEntry.Value, Service: strings.TrimSpace(inputEntry.Service)}
 		keyField := fmt.Sprintf("entries[%d].key", index)
@@ -410,17 +416,28 @@ func validateReplaceInput(input ReplaceInput) (ReplaceInput, error) {
 		if !utf8.ValidString(entry.Service) || len(entry.Service) > MaxServiceBytes {
 			fields[serviceField] = fmt.Sprintf("must be valid UTF-8 and at most %d bytes", MaxServiceBytes)
 		}
-		aggregateBytes += len(entry.Key) + len(entry.Value) + len(entry.Service)
+		for _, byteCount := range []int{len(entry.Key), len(entry.Value), len(entry.Service)} {
+			var ok bool
+			remainingBytes, ok = consumeSnapshotBudget(remainingBytes, byteCount)
+			if !ok {
+				fields["entries"] = fmt.Sprintf("combined entry content must be at most %d bytes", MaxSnapshotBytes)
+				break
+			}
+		}
 		entries = append(entries, entry)
-	}
-	if aggregateBytes > MaxSnapshotBytes {
-		fields["entries"] = fmt.Sprintf("combined entry content must be at most %d bytes", MaxSnapshotBytes)
 	}
 	if len(fields) > 0 {
 		return ReplaceInput{}, &ValidationError{Fields: fields}
 	}
 	sort.Slice(entries, func(left, right int) bool { return entries[left].Key < entries[right].Key })
 	return ReplaceInput{BaseRevision: input.BaseRevision, Message: message, Entries: entries}, nil
+}
+
+func consumeSnapshotBudget(remaining int64, byteCount int) (int64, bool) {
+	if byteCount < 0 || int64(byteCount) > remaining {
+		return remaining, false
+	}
+	return remaining - int64(byteCount), true
 }
 
 func validateMessage(message string) (string, error) {

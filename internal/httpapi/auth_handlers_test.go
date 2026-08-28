@@ -96,6 +96,30 @@ func TestStrictJSONBodyLimitAndStableErrors(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsInvalidUnicodeAndDuplicateKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "raw invalid UTF-8", body: append([]byte(`{"username":"`), append([]byte{0xff}, []byte(`","password":"secret"}`)...)...)},
+		{name: "lone surrogate", body: []byte(`{"username":"\ud800","password":"secret"}`)},
+		{name: "duplicate key", body: []byte(`{"username":"admin","username":"admin","password":"secret"}`)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, _, _ := testRouter(t, nil)
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Origin", testOrigin)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || responseErrorCode(t, response) != "malformed_request" {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestDeclaredOversizedBodyIsRejectedBeforeRouteChecks(t *testing.T) {
 	handler, _, _ := testRouter(t, nil)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader("{}"))

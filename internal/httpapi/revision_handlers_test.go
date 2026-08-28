@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -129,6 +128,59 @@ func TestRevisionHTTPConfigLifecycleValidationAndServiceFilter(t *testing.T) {
 	}
 	response = fixture.serve(t, fixture.request(t, "editor", http.MethodPut, revisionConfigPath, `{"base_revision":1,"entries":[],"unknown":true}`))
 	assertRevisionHTTPError(t, response, http.StatusBadRequest, "malformed_request")
+}
+
+func TestRevisionHTTPRejectsInvalidUnicodeAndDuplicateKeysWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "raw invalid UTF-8", body: append([]byte(`{"base_revision":0,"entries":[{"key":"VALUE","value":"`), append([]byte{0xff}, []byte(`"}]}`)...)...)},
+		{name: "lone high surrogate", body: []byte(`{"base_revision":0,"entries":[{"key":"VALUE","value":"\ud800"}]}`)},
+		{name: "lone low surrogate", body: []byte(`{"base_revision":0,"entries":[{"key":"VALUE","value":"\udc00"}]}`)},
+		{name: "invalid surrogate pair", body: []byte(`{"base_revision":0,"entries":[{"key":"VALUE","value":"\ud800\u0041"}]}`)},
+		{name: "duplicate top-level key", body: []byte(`{"base_revision":0,"entries":[],"entries":[{"key":"VALUE","value":"value-secret"}]}`)},
+		{name: "case-folded field alias", body: []byte(`{"base_revision":0,"entries":[],"Entries":[{"key":"VALUE","value":"value-secret"}]}`)},
+		{name: "duplicate nested key", body: []byte(`{"base_revision":0,"entries":[{"key":"VALUE","value":"first","value":"value-secret"}]}`)},
+		{name: "Unicode case-folded field alias", body: []byte(`{"base_revision":0,"entries":[{"key":"SAFE","Key":"OVERRIDE","value":"value-secret"}]}`)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRevisionHTTPFixture(t)
+			request := fixture.request(t, "editor", http.MethodPut, revisionConfigPath, string(test.body))
+			response := fixture.serve(t, request)
+			assertRevisionHTTPError(t, response, http.StatusBadRequest, "malformed_request")
+			if strings.Contains(response.Body.String(), "value-secret") || strings.Contains(response.Body.String(), "replacement") {
+				t.Fatalf("invalid JSON content leaked: %s", response.Body.String())
+			}
+			var revisionCount int
+			var currentID sql.NullString
+			if err := fixture.store.DB().QueryRow(`SELECT COUNT(r.id), e.current_revision_id
+				FROM environments e LEFT JOIN revisions r ON r.environment_id = e.id
+				WHERE e.id = 'visible-environment' GROUP BY e.id`).Scan(&revisionCount, &currentID); err != nil {
+				t.Fatal(err)
+			}
+			if revisionCount != 0 || currentID.Valid {
+				t.Fatalf("invalid JSON mutated revisions=%d current=%v", revisionCount, currentID)
+			}
+		})
+	}
+}
+
+func TestRevisionHTTPPreservesValidSurrogatePair(t *testing.T) {
+	fixture := newRevisionHTTPFixture(t)
+	response := fixture.serve(t, fixture.request(t, "editor", http.MethodPut, revisionConfigPath,
+		`{"base_revision":0,"entries":[{"key":"EMOJI","value":"\ud83d\ude00"}]}`))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Revision revisions.Revision `json:"revision"`
+	}
+	decodeResponse(t, response, &result)
+	if len(result.Revision.Entries) != 1 || result.Revision.Entries[0].Value != "😀" {
+		t.Fatalf("revision=%+v", result.Revision)
+	}
 }
 
 func TestRevisionHTTPListDetailDiffAndRollback(t *testing.T) {
@@ -284,6 +336,47 @@ func TestRevisionHTTPSlugAuthorizationIsolationAndDisabledSessions(t *testing.T)
 	assertRevisionHTTPError(t, response, http.StatusUnauthorized, "invalid_session")
 }
 
+func TestRevisionHTTPCorruptCurrentPointerReturnsSafeInternalError(t *testing.T) {
+	tests := []struct {
+		name    string
+		pointer func(*testing.T, *revisionHTTPFixture) string
+		secret  string
+	}{
+		{
+			name: "cross-environment pointer",
+			pointer: func(t *testing.T, fixture *revisionHTTPFixture) string {
+				t.Helper()
+				revision, err := revisions.NewService(fixture.store).Replace(context.Background(), fixture.users["admin"], "hidden-environment", revisions.ReplaceInput{
+					Entries: []revisions.Entry{{Key: "HIDDEN_SECRET", Value: "cross-project-secret"}},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return revision.ID
+			},
+			secret: "cross-project-secret",
+		},
+		{name: "missing pointer", pointer: func(*testing.T, *revisionHTTPFixture) string { return "missing-revision-id" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRevisionHTTPFixture(t)
+			pointer := test.pointer(t, fixture)
+			if _, err := fixture.store.DB().Exec(`DROP TRIGGER environments_current_revision_update`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.store.DB().Exec(`UPDATE environments SET current_revision_id = ? WHERE id = 'visible-environment'`, pointer); err != nil {
+				t.Fatal(err)
+			}
+			response := fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, revisionConfigPath, ""))
+			assertRevisionHTTPError(t, response, http.StatusInternalServerError, "internal_error")
+			if test.secret != "" && (strings.Contains(response.Body.String(), test.secret) || strings.Contains(fixture.logs.String(), test.secret)) {
+				t.Fatalf("corrupt pointer leaked secret: body=%s logs=%s", response.Body.String(), fixture.logs.String())
+			}
+		})
+	}
+}
+
 func TestRevisionHTTPBusyIsServiceUnavailableAndDoesNotLeakValues(t *testing.T) {
 	fixture := newRevisionHTTPFixture(t)
 	fixture.store.DB().SetMaxOpenConns(1)
@@ -350,6 +443,7 @@ type revisionHTTPFixture struct {
 	users   map[string]auth.User
 	cookies map[string]*http.Cookie
 	csrf    map[string]string
+	logs    *bytes.Buffer
 }
 
 func newRevisionHTTPFixture(t *testing.T) *revisionHTTPFixture {
@@ -385,7 +479,7 @@ func newRevisionHTTPFixture(t *testing.T) *revisionHTTPFixture {
 		t.Fatal(err)
 	}
 	sessions := auth.NewSessionManager(store, []byte("01234567890123456789012345678901"), time.Hour)
-	fixture := &revisionHTTPFixture{store: store, path: path, users: users, cookies: make(map[string]*http.Cookie), csrf: make(map[string]string)}
+	fixture := &revisionHTTPFixture{store: store, path: path, users: users, cookies: make(map[string]*http.Cookie), csrf: make(map[string]string), logs: new(bytes.Buffer)}
 	for username, user := range users {
 		issued, err := sessions.Create(context.Background(), user)
 		if err != nil {
@@ -399,7 +493,7 @@ func newRevisionHTTPFixture(t *testing.T) *revisionHTTPFixture {
 		Sessions:    sessions,
 		Projects:    projects.NewService(store),
 		Revisions:   revisions.NewService(store),
-	}, Options{PublicOrigin: testOrigin, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	}, Options{PublicOrigin: testOrigin, Logger: slog.New(slog.NewTextHandler(fixture.logs, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}

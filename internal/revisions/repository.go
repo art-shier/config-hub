@@ -87,9 +87,15 @@ func (r *repository) currentRevision(ctx context.Context, q queryer, environment
 	if !currentID.Valid {
 		return Revision{EnvironmentID: environmentID, Entries: []Entry{}}, nil
 	}
-	revision, err = r.revisionByID(ctx, q, currentID.String, service)
+	revision, err = r.revisionByID(ctx, q, currentID.String, environmentID, service)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return Revision{}, ErrDataIntegrity
+		}
 		return Revision{}, err
+	}
+	if revision.Version <= 0 {
+		return Revision{}, ErrDataIntegrity
 	}
 	return revision, nil
 }
@@ -103,14 +109,18 @@ func (r *repository) revisionByVersion(ctx context.Context, q queryer, environme
 	if err != nil {
 		return Revision{}, database.ClassifyError(fmt.Errorf("load revision version: %w", err))
 	}
-	return r.revisionByID(ctx, q, revisionID, "")
+	revision, err := r.revisionByID(ctx, q, revisionID, environmentID, "")
+	if errors.Is(err, ErrNotFound) {
+		return Revision{}, ErrDataIntegrity
+	}
+	return revision, err
 }
 
-func (r *repository) revisionByID(ctx context.Context, q queryer, revisionID, service string) (Revision, error) {
+func (r *repository) revisionByID(ctx context.Context, q queryer, revisionID, environmentID, service string) (Revision, error) {
 	var revision Revision
 	var createdAt int64
 	err := q.QueryRowContext(ctx, `SELECT id, environment_id, version, message, created_by, created_at
-		FROM revisions WHERE id = ?`, revisionID).
+		FROM revisions WHERE id = ? AND environment_id = ?`, revisionID, environmentID).
 		Scan(&revision.ID, &revision.EnvironmentID, &revision.Version, &revision.Message, &revision.CreatedBy, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Revision{}, ErrNotFound
@@ -119,7 +129,7 @@ func (r *repository) revisionByID(ctx context.Context, q queryer, revisionID, se
 		return Revision{}, database.ClassifyError(fmt.Errorf("load revision metadata: %w", err))
 	}
 	revision.CreatedAt = time.Unix(createdAt, 0).UTC()
-	entries, err := r.entries(ctx, q, revision.ID, service)
+	entries, err := r.entries(ctx, q, revision.ID, environmentID, service)
 	if err != nil {
 		return Revision{}, err
 	}
@@ -127,14 +137,16 @@ func (r *repository) revisionByID(ctx context.Context, q queryer, revisionID, se
 	return revision, nil
 }
 
-func (r *repository) entries(ctx context.Context, q queryer, revisionID, service string) ([]Entry, error) {
-	query := `SELECT key, value, COALESCE(service, '') FROM revision_entries WHERE revision_id = ?`
-	args := []any{revisionID}
+func (r *repository) entries(ctx context.Context, q queryer, revisionID, environmentID, service string) ([]Entry, error) {
+	query := `SELECT re.key, re.value, COALESCE(re.service, '') FROM revision_entries re
+		JOIN revisions r ON r.id = re.revision_id
+		WHERE re.revision_id = ? AND r.environment_id = ?`
+	args := []any{revisionID, environmentID}
 	if service != "" {
-		query += ` AND service = ?`
+		query += ` AND re.service = ?`
 		args = append(args, service)
 	}
-	query += ` ORDER BY key`
+	query += ` ORDER BY re.key`
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, database.ClassifyError(fmt.Errorf("load revision entries: %w", err))

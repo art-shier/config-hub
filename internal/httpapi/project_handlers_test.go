@@ -235,6 +235,21 @@ func TestProjectHTTPMemberGrantLifecycleAndStrictBodies(t *testing.T) {
 	}
 }
 
+func TestProjectHTTPRejectsDuplicateJSONKeysWithoutMutation(t *testing.T) {
+	fixture := newProjectHTTPFixture(t)
+	response := fixture.serve(t, fixture.request(t, "admin", http.MethodPost, "/api/v1/projects", `{
+		"slug":"duplicate-json","name":"First","name":"Second"
+	}`))
+	assertProjectHTTPError(t, response, http.StatusBadRequest, "malformed_request")
+	var projectCount int
+	if err := fixture.store.DB().QueryRow(`SELECT COUNT(*) FROM projects`).Scan(&projectCount); err != nil {
+		t.Fatal(err)
+	}
+	if projectCount != 0 {
+		t.Fatalf("duplicate JSON created projects=%d", projectCount)
+	}
+}
+
 func TestProjectHTTPDisabledSessionAndSQLiteBusy(t *testing.T) {
 	fixture := newProjectHTTPFixture(t)
 	issued := fixture.cookies["member"]

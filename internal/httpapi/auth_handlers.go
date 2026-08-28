@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -169,7 +170,14 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, destination any) error {
 	if err != nil || mediaType != "application/json" {
 		return errors.New("invalid content type")
 	}
-	decoder := json.NewDecoder(r.Body)
+	body, err := readStrictJSONBody(r.Body)
+	if err != nil {
+		return err
+	}
+	if err := validateStrictJSON(body); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return err
