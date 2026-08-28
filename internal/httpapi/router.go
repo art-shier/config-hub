@@ -24,6 +24,7 @@ type CredentialAuthenticator interface {
 type Dependencies struct {
 	Credentials CredentialAuthenticator
 	Sessions    *auth.SessionManager
+	Projects    ProjectService
 }
 
 type RateLimitOptions struct {
@@ -63,6 +64,16 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	mux.HandleFunc("GET /api/v1/health/live", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	if deps.Projects != nil {
+		projectAPI := &projectHandlers{service: deps.Projects, auth: handlers}
+		mux.HandleFunc("GET /api/v1/projects", projectAPI.list)
+		mux.HandleFunc("POST /api/v1/projects", projectAPI.create)
+		mux.HandleFunc("GET /api/v1/projects/{project}", projectAPI.detail)
+		mux.HandleFunc("POST /api/v1/projects/{project}/environments", projectAPI.createEnvironment)
+		mux.HandleFunc("GET /api/v1/projects/{project}/members", projectAPI.listMembers)
+		mux.HandleFunc("PUT /api/v1/projects/{project}/members/{username}", projectAPI.setMember)
+		mux.HandleFunc("DELETE /api/v1/projects/{project}/members/{username}", projectAPI.removeMember)
+	}
 	if options.Register != nil {
 		options.Register(mux)
 	}
@@ -74,6 +85,11 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	}
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		if allowed, known := allowedMethods[r.URL.Path]; known {
+			w.Header().Set("Allow", allowed)
+			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+			return
+		}
+		if allowed, known := projectRouteMethods(r.URL.Path); known {
 			w.Header().Set("Allow", allowed)
 			writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 			return
