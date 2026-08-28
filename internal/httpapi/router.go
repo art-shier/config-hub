@@ -25,6 +25,7 @@ type Dependencies struct {
 	Credentials CredentialAuthenticator
 	Sessions    *auth.SessionManager
 	Projects    ProjectService
+	Revisions   RevisionService
 }
 
 type RateLimitOptions struct {
@@ -59,6 +60,7 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	handlers := &authHandlers{credentials: deps.Credentials, sessions: deps.Sessions, publicOrigin: origin}
 	mux := http.NewServeMux()
 	projectsEnabled := deps.Projects != nil
+	revisionsEnabled := deps.Revisions != nil
 	mux.HandleFunc("POST /api/v1/auth/login", handlers.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", handlers.logout)
 	mux.HandleFunc("GET /api/v1/auth/session", handlers.session)
@@ -74,6 +76,15 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 		mux.HandleFunc("GET /api/v1/projects/{project}/members", projectAPI.listMembers)
 		mux.HandleFunc("PUT /api/v1/projects/{project}/members/{username}", projectAPI.setMember)
 		mux.HandleFunc("DELETE /api/v1/projects/{project}/members/{username}", projectAPI.removeMember)
+	}
+	if revisionsEnabled {
+		revisionAPI := &revisionHandlers{service: deps.Revisions, auth: handlers}
+		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/config", revisionAPI.current)
+		mux.HandleFunc("PUT /api/v1/projects/{project}/environments/{environment}/config", revisionAPI.replace)
+		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/revisions", revisionAPI.list)
+		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/revisions/{version}", revisionAPI.detail)
+		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/revisions/{version}/diff", revisionAPI.diff)
+		mux.HandleFunc("POST /api/v1/projects/{project}/environments/{environment}/revisions/{version}/rollback", revisionAPI.rollback)
 	}
 	if options.Register != nil {
 		options.Register(mux)
@@ -92,6 +103,13 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 		}
 		if projectsEnabled {
 			if allowed, known := projectRouteMethods(r.URL.Path); known {
+				w.Header().Set("Allow", allowed)
+				writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+				return
+			}
+		}
+		if revisionsEnabled {
+			if allowed, known := revisionRouteMethods(r.URL.Path); known {
 				w.Header().Set("Allow", allowed)
 				writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 				return
