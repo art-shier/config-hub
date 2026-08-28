@@ -89,17 +89,20 @@ func securityMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func authorizationSurfaceMiddleware(machineReadEnabled bool, next http.Handler) http.Handler {
+const currentConfigRoutePattern = "GET /api/v1/projects/{project}/environments/{environment}/config"
+
+func authorizationSurfaceMiddleware(machineReadEnabled bool, mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(r.Header.Values("Authorization")) == 0 {
-			next.ServeHTTP(w, r)
+			mux.ServeHTTP(w, r)
 			return
 		}
-		if !machineReadEnabled || r.Method != http.MethodGet || !isCurrentConfigPath(r.URL.Path) {
+		_, pattern := mux.Handler(r)
+		if !machineReadEnabled || r.Method != http.MethodGet || pattern != currentConfigRoutePattern {
 			writeError(w, r, http.StatusUnauthorized, "invalid_token", "Machine tokens are not accepted on this route")
 			return
 		}
-		next.ServeHTTP(w, r)
+		mux.ServeHTTP(w, r)
 	})
 }
 
@@ -109,19 +112,14 @@ func strictBearerToken(r *http.Request) (string, bool) {
 		return "", false
 	}
 	value := values[0]
-	if !strings.HasPrefix(value, "Bearer ") {
+	if len(value) <= len("Bearer ") || !strings.EqualFold(value[:len("Bearer")], "Bearer") || value[len("Bearer")] != ' ' {
 		return "", false
 	}
-	token := strings.TrimPrefix(value, "Bearer ")
+	token := value[len("Bearer "):]
 	if token == "" || strings.ContainsAny(token, " \t\r\n,") {
 		return "", false
 	}
 	return token, true
-}
-
-func isCurrentConfigPath(path string) bool {
-	parts := strings.Split(strings.TrimPrefix(path, "/api/v1/projects/"), "/")
-	return len(parts) == 4 && parts[0] != "" && parts[1] == "environments" && parts[2] != "" && parts[3] == "config"
 }
 
 type responseCapture struct {

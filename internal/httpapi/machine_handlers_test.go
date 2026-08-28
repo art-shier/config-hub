@@ -39,6 +39,34 @@ type machineHTTPFixture struct {
 	token    machineaccess.IssuedToken
 }
 
+type blockingHTTPMachineRead struct {
+	*machineaccess.Service
+	store   *database.Store
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingHTTPMachineRead) ReadCurrentForProject(ctx context.Context, plaintext, project, environment, service string) (machineaccess.CurrentConfig, error) {
+	config, err := s.Service.ReadCurrentForProject(ctx, plaintext, project, environment, service)
+	if err != nil {
+		return machineaccess.CurrentConfig{}, err
+	}
+	err = s.store.InReadTx(ctx, func(tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM revisions`).Scan(&count); err != nil {
+			return err
+		}
+		close(s.started)
+		select {
+		case <-s.release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	return config, err
+}
+
 func TestMachineAdminLifecycleRequiresAdminSessionAndProtectsWrites(t *testing.T) {
 	fixture := newMachineHTTPFixture(t)
 
@@ -207,7 +235,16 @@ func TestCurrentConfigSupportsCookieOrStrictBearerWithoutFallback(t *testing.T) 
 	response = fixture.serve(t, request)
 	assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
 
-	for _, authorization := range []string{"", "Basic abc", "Bearer", "Bearer  " + fixture.token.Plaintext, "bearer " + fixture.token.Plaintext, "Bearer " + fixture.token.Plaintext + " extra"} {
+	for _, scheme := range []string{"bearer", "BEARER", "BeArEr"} {
+		request = httptest.NewRequest(http.MethodGet, machineConfigPath, nil)
+		request.Header.Set("Authorization", scheme+" "+fixture.token.Plaintext)
+		response = fixture.serve(t, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("scheme=%q status=%d body=%s", scheme, response.Code, response.Body.String())
+		}
+	}
+
+	for _, authorization := range []string{"", "Basic abc", "Bearer", "Bearer\t" + fixture.token.Plaintext, "Bearer  " + fixture.token.Plaintext, "Bearer " + fixture.token.Plaintext + " extra"} {
 		request = fixture.request(t, "member", http.MethodGet, machineConfigPath, "")
 		request.Header["Authorization"] = []string{authorization}
 		response = fixture.serve(t, request)
@@ -219,6 +256,111 @@ func TestCurrentConfigSupportsCookieOrStrictBearerWithoutFallback(t *testing.T) 
 	request.Header.Add("Authorization", "Bearer "+fixture.token.Plaintext)
 	response = fixture.serve(t, request)
 	assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
+}
+
+func TestAuthorizationGuardUsesActualServeMuxPattern(t *testing.T) {
+	fixture := newMachineHTTPFixture(t)
+	for _, path := range []string{
+		"/api/v1/projects/shop%2Fenvironments/production/config",
+		"/api/v1/projects/shop/environments/production%2Fconfig",
+	} {
+		request := fixture.request(t, "admin", http.MethodGet, path, "")
+		request.Header.Set("Authorization", "Bearer "+fixture.token.Plaintext)
+		response := fixture.serve(t, request)
+		assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
+	}
+
+	request := fixture.request(t, "member", http.MethodGet, machineConfigPath, "")
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Plaintext)
+	response := fixture.serve(t, request)
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), `"revision":{`) {
+		t.Fatalf("cookie plus bearer did not use machine auth: status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	request = fixture.request(t, "admin", http.MethodPost, machineConfigPath, "")
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Plaintext)
+	response = fixture.serve(t, request)
+	assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
+
+	sessions := auth.NewSessionManager(fixture.store, []byte("01234567890123456789012345678901"), time.Hour)
+	custom, err := NewRouter(Dependencies{
+		Credentials: auth.NewCredentialService(fixture.store), Sessions: sessions,
+		Projects: projects.NewService(fixture.store), Revisions: revisions.NewService(fixture.store), Machines: fixture.service,
+	}, Options{
+		PublicOrigin: testOrigin,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Register: func(mux *http.ServeMux) {
+			mux.HandleFunc("GET /api/v1/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(w, 299, map[string]string{"status": "custom"})
+			})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"/api/v1/custom",
+		"/api/v1/projects/shop%2Fenvironments/production/config",
+	} {
+		request = fixture.request(t, "admin", http.MethodGet, path, "")
+		request.Header.Set("Authorization", "Bearer "+fixture.token.Plaintext)
+		response = httptest.NewRecorder()
+		custom.ServeHTTP(response, request)
+		assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
+	}
+}
+
+func TestMachineHTTPReadOnlyRequestDoesNotBlockConfigWrite(t *testing.T) {
+	fixture := newMachineHTTPFixture(t)
+	blocking := &blockingHTTPMachineRead{
+		Service: fixture.service,
+		store:   fixture.store,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	sessions := auth.NewSessionManager(fixture.store, []byte("01234567890123456789012345678901"), time.Hour)
+	handler, err := NewRouter(Dependencies{
+		Credentials: auth.NewCredentialService(fixture.store), Sessions: sessions,
+		Projects: projects.NewService(fixture.store), Revisions: revisions.NewService(fixture.store), Machines: blocking,
+	}, Options{PublicOrigin: testOrigin, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readResponse := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(http.MethodGet, machineConfigPath, nil)
+		request.Header.Set("Authorization", "Bearer "+fixture.token.Plaintext)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		readResponse <- response
+	}()
+	<-blocking.started
+
+	writeResponse := make(chan *httptest.ResponseRecorder, 1)
+	writeRequest := fixture.request(t, "admin", http.MethodPut, machineConfigPath, `{"base_revision":1,"entries":[{"key":"VALUE","value":"after"}]}`)
+	go func() {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, writeRequest)
+		writeResponse <- response
+	}()
+	select {
+	case response := <-writeResponse:
+		if response.Code != http.StatusCreated {
+			close(blocking.release)
+			<-readResponse
+			t.Fatalf("write status=%d body=%s", response.Code, response.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		close(blocking.release)
+		<-readResponse
+		t.Fatal("HTTP machine read blocked the config write")
+	}
+	close(blocking.release)
+	response := <-readResponse
+	if response.Code != http.StatusOK {
+		t.Fatalf("read status=%d body=%s", response.Code, response.Body.String())
+	}
 }
 
 func TestBearerTokenStateScopeAndRouteBinding(t *testing.T) {
@@ -341,6 +483,28 @@ func TestMachineAccessLogsRedactBearerAndConfiguration(t *testing.T) {
 	assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
 	if strings.Contains(response.Body.String(), fixture.token.Plaintext) || strings.Contains(fixture.logs.String(), fixture.token.Plaintext) {
 		t.Fatalf("invalid token leaked: body=%s logs=%s", response.Body.String(), fixture.logs.String())
+	}
+}
+
+func TestMachineHTTPCorruptSnapshotReturnsSafeInternalError(t *testing.T) {
+	fixture := newMachineHTTPFixture(t)
+	if _, err := fixture.store.DB().Exec(`INSERT INTO revisions (id, environment_id, version, created_by, created_at)
+		VALUES ('http-corrupt-revision', 'shop-production', 2, 'admin-id', 2)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value)
+		VALUES ('http-corrupt-revision', 'SECRET', CAST('http-corrupt-secret' || X'FF' AS TEXT))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`UPDATE environments SET current_revision_id = 'http-corrupt-revision' WHERE id = 'shop-production'`); err != nil {
+		t.Fatal(err)
+	}
+	fixture.logs.Reset()
+
+	response := fixture.bearerRead(t, fixture.token.Plaintext, machineConfigPath)
+	assertMachineHTTPError(t, response, http.StatusInternalServerError, "internal_error")
+	if strings.Contains(response.Body.String(), "http-corrupt-secret") || strings.Contains(fixture.logs.String(), "http-corrupt-secret") {
+		t.Fatalf("corrupt snapshot leaked secret: body=%s logs=%s", response.Body.String(), fixture.logs.String())
 	}
 }
 

@@ -433,6 +433,41 @@ func validateReplaceInput(input ReplaceInput) (ReplaceInput, error) {
 	return ReplaceInput{BaseRevision: input.BaseRevision, Message: message, Entries: entries}, nil
 }
 
+// ValidateStoredEntries verifies that persisted snapshot entries still satisfy
+// the canonical limits enforced when a revision is created. It intentionally
+// returns only a generic integrity error so stored configuration cannot leak
+// through diagnostics.
+func ValidateStoredEntries(entries []Entry) error {
+	if len(entries) > MaxEntryCount {
+		return ErrDataIntegrity
+	}
+	seen := make(map[string]struct{}, len(entries))
+	remainingBytes := int64(MaxSnapshotBytes)
+	for _, entry := range entries {
+		if !utf8.ValidString(entry.Key) || len(entry.Key) > MaxKeyBytes || strings.TrimSpace(entry.Key) != entry.Key || !keyPattern.MatchString(entry.Key) {
+			return ErrDataIntegrity
+		}
+		if _, exists := seen[entry.Key]; exists {
+			return ErrDataIntegrity
+		}
+		seen[entry.Key] = struct{}{}
+		if !utf8.ValidString(entry.Value) || len(entry.Value) > MaxValueBytes {
+			return ErrDataIntegrity
+		}
+		if !utf8.ValidString(entry.Service) || len(entry.Service) > MaxServiceBytes || strings.TrimSpace(entry.Service) != entry.Service {
+			return ErrDataIntegrity
+		}
+		for _, byteCount := range []int{len(entry.Key), len(entry.Value), len(entry.Service)} {
+			var ok bool
+			remainingBytes, ok = consumeSnapshotBudget(remainingBytes, byteCount)
+			if !ok {
+				return ErrDataIntegrity
+			}
+		}
+	}
+	return nil
+}
+
 func consumeSnapshotBudget(remaining int64, byteCount int) (int64, bool) {
 	if byteCount < 0 || int64(byteCount) > remaining {
 		return remaining, false

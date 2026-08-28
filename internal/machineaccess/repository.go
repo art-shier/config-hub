@@ -9,6 +9,7 @@ import (
 
 	"confighub.local/internal/auth"
 	"confighub.local/internal/database"
+	"confighub.local/internal/revisions"
 )
 
 type repository struct {
@@ -198,40 +199,42 @@ func (r *repository) currentConfig(ctx context.Context, q queryer, environmentID
 		return 0, map[string]string{}, nil
 	}
 	var version int64
-	err = q.QueryRowContext(ctx, `SELECT version FROM revisions WHERE id = ? AND environment_id = ?`, revisionID.String, environmentID).Scan(&version)
+	var sealed int
+	err = q.QueryRowContext(ctx, `SELECT version, sealed FROM revisions WHERE id = ? AND environment_id = ?`, revisionID.String, environmentID).Scan(&version, &sealed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil, ErrDataIntegrity
 	}
 	if err != nil {
 		return 0, nil, database.ClassifyError(fmt.Errorf("load machine current revision: %w", err))
 	}
-	if version <= 0 {
+	if version <= 0 || sealed != 1 {
 		return 0, nil, ErrDataIntegrity
 	}
-	query := `SELECT re.key, re.value FROM revision_entries re
-		JOIN revisions r ON r.id = re.revision_id
-		WHERE re.revision_id = ? AND r.environment_id = ?`
-	args := []any{revisionID.String, environmentID}
-	if service != "" {
-		query += ` AND re.service = ?`
-		args = append(args, service)
-	}
-	query += ` ORDER BY re.key`
-	rows, err := q.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, `SELECT key, value, COALESCE(service, '')
+		FROM revision_entries WHERE revision_id = ? ORDER BY key`, revisionID.String)
 	if err != nil {
 		return 0, nil, database.ClassifyError(fmt.Errorf("load machine config entries: %w", err))
 	}
 	defer rows.Close()
-	values := make(map[string]string)
+	entries := make([]revisions.Entry, 0)
 	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
+		var entry revisions.Entry
+		if err := rows.Scan(&entry.Key, &entry.Value, &entry.Service); err != nil {
 			return 0, nil, database.ClassifyError(fmt.Errorf("scan machine config entry: %w", err))
 		}
-		values[key] = value
+		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, nil, database.ClassifyError(fmt.Errorf("iterate machine config entries: %w", err))
+	}
+	if err := revisions.ValidateStoredEntries(entries); err != nil {
+		return 0, nil, ErrDataIntegrity
+	}
+	values := make(map[string]string)
+	for _, entry := range entries {
+		if service == "" || entry.Service == service {
+			values[entry.Key] = entry.Value
+		}
 	}
 	return version, values, nil
 }

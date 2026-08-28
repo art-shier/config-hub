@@ -74,7 +74,11 @@ func TestSessionRejectsExpiredDisabledWrongKeyAndTampering(t *testing.T) {
 	}
 	wrongKey := NewSessionManager(store, []byte("abcdefghijklmnopqrstuvwxyzABCDEF"), time.Hour)
 	malformed := []string{"", "a.b", issued.CookieValue + "x", strings.Repeat("A", 1<<20)}
-	tampered := issued.CookieValue[:len(issued.CookieValue)-1] + "A"
+	replacement := byte('A')
+	if issued.CookieValue[len(issued.CookieValue)-1] == replacement {
+		replacement = 'B'
+	}
+	tampered := issued.CookieValue[:len(issued.CookieValue)-1] + string(replacement)
 	malformed = append(malformed, tampered)
 	for _, cookie := range malformed {
 		if _, err := manager.Authenticate(ctx, cookie); !errors.Is(err, ErrInvalidSession) {

@@ -113,6 +113,9 @@ type Service struct {
 	repository *repository
 	now        func() time.Time
 	random     io.Reader
+	// Hooks are package-test observers for deterministic transaction tests.
+	afterReadTxBegin          func()
+	afterMachineAuthorization func()
 }
 
 func NewService(store *database.Store) *Service {
@@ -158,7 +161,7 @@ func (s *Service) ListIdentities(ctx context.Context, actor auth.User) ([]Identi
 		return nil, err
 	}
 	var identities []Identity
-	err := s.repository.store.InTx(ctx, func(tx *sql.Tx) error {
+	err := s.repository.store.InReadTx(ctx, func(tx *sql.Tx) error {
 		if _, err := s.repository.currentAdmin(ctx, tx, actor.ID); err != nil {
 			return err
 		}
@@ -180,7 +183,7 @@ func (s *Service) GetIdentity(ctx context.Context, actor auth.User, identityID s
 		return IdentityDetail{}, ErrNotFound
 	}
 	var detail IdentityDetail
-	err := s.repository.store.InTx(ctx, func(tx *sql.Tx) error {
+	err := s.repository.store.InReadTx(ctx, func(tx *sql.Tx) error {
 		if _, err := s.repository.currentAdmin(ctx, tx, actor.ID); err != nil {
 			return err
 		}
@@ -306,7 +309,6 @@ func (s *Service) IssueToken(ctx context.Context, actor auth.User, identityID st
 		return IssuedToken{}, fmt.Errorf("generate machine token: %w", err)
 	}
 	hash := sha256.Sum256([]byte(plaintext))
-	now := s.now().UTC().Truncate(time.Second)
 	issued := IssuedToken{
 		ID: uuid.NewString(), Name: normalized.Name, Prefix: plaintext[:displayPrefixLength], Plaintext: plaintext, ExpiresAt: normalized.ExpiresAt,
 	}
@@ -320,6 +322,10 @@ func (s *Service) IssueToken(ctx context.Context, actor auth.User, identityID st
 		}
 		if !identity.Enabled {
 			return &ValidationError{Fields: map[string]string{"identity": "must be enabled to issue a token"}}
+		}
+		now := s.now().UTC().Truncate(time.Second)
+		if err := validateTokenExpiry(issued.ExpiresAt, now); err != nil {
+			return err
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO access_tokens (id, identity_id, name, prefix, token_hash, expires_at, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`, issued.ID, identityID, issued.Name, issued.Prefix, hash[:], issued.ExpiresAt.Unix(), now.Unix())
@@ -391,10 +397,16 @@ func (s *Service) ReadCurrentForProject(ctx context.Context, plaintext, projectS
 		return CurrentConfig{}, ErrInvalidToken
 	}
 	config := CurrentConfig{Project: projectSlug, Environment: environmentSlug, Values: map[string]string{}}
-	err = s.repository.store.InTx(ctx, func(tx *sql.Tx) error {
+	err = s.repository.store.InReadTx(ctx, func(tx *sql.Tx) error {
+		if s.afterReadTxBegin != nil {
+			s.afterReadTxBegin()
+		}
 		_, environmentID, err := s.repository.authenticateForProjectEnvironment(ctx, tx, hash[:], projectSlug, environmentSlug, s.now().UTC().Unix())
 		if err != nil {
 			return err
+		}
+		if s.afterMachineAuthorization != nil {
+			s.afterMachineAuthorization()
 		}
 		if !utf8.ValidString(service) || len(service) > MaxNameBytes {
 			return &ValidationError{Fields: map[string]string{"service": fmt.Sprintf("must be valid UTF-8 and at most %d bytes", MaxNameBytes)}}
@@ -497,17 +509,29 @@ func validateGrants(grants []EnvironmentGrant) ([]EnvironmentGrant, error) {
 func (s *Service) validateIssueToken(input IssueToken) (IssueToken, error) {
 	name, err := validateName("name", input.Name)
 	fields := validationFields(err)
-	now := s.now().UTC()
 	expiresAt := input.ExpiresAt.UTC().Truncate(time.Second)
+	if expiryValidation := validateTokenExpiry(expiresAt, s.now().UTC()); expiryValidation != nil {
+		for field, message := range expiryValidation.Fields {
+			fields[field] = message
+		}
+	}
+	if len(fields) > 0 {
+		return IssueToken{}, &ValidationError{Fields: fields}
+	}
+	return IssueToken{Name: name, ExpiresAt: expiresAt}, nil
+}
+
+func validateTokenExpiry(expiresAt, now time.Time) *ValidationError {
+	fields := make(map[string]string)
 	if !expiresAt.After(now) {
 		fields["expires_at"] = "must be strictly in the future"
 	} else if expiresAt.After(now.Add(MaxTokenLifetime)) {
 		fields["expires_at"] = fmt.Sprintf("must be no more than %s in the future", MaxTokenLifetime)
 	}
 	if len(fields) > 0 {
-		return IssueToken{}, &ValidationError{Fields: fields}
+		return &ValidationError{Fields: fields}
 	}
-	return IssueToken{Name: name, ExpiresAt: expiresAt}, nil
+	return nil
 }
 
 func validationFields(err error) map[string]string {

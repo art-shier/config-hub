@@ -1,6 +1,7 @@
 package machineaccess
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -14,6 +15,7 @@ import (
 
 	"confighub.local/internal/auth"
 	"confighub.local/internal/database"
+	"confighub.local/internal/revisions"
 )
 
 var machineTestNow = time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
@@ -132,6 +134,208 @@ func TestMachineCurrentConfigRejectsInvalidCurrentRevisionMetadata(t *testing.T)
 	}
 	if _, err := fixture.service.ReadCurrentForProject(context.Background(), issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, ""); !errors.Is(err, ErrDataIntegrity) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestMachineCurrentConfigRejectsCorruptStoredSnapshot(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		service string
+		insert  func(*testing.T, *machineServiceFixture)
+	}{
+		{
+			name: "unsealed revision",
+			insert: func(t *testing.T, fixture *machineServiceFixture) {
+				t.Helper()
+				if _, err := fixture.store.DB().Exec(`DROP TRIGGER environments_seal_current_revision_update`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value) VALUES ('corrupt-machine-revision', 'SECRET', 'unsealed-secret')`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:    "filtered invalid UTF-8 value",
+			service: "api",
+			insert: func(t *testing.T, fixture *machineServiceFixture) {
+				t.Helper()
+				if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value, service) VALUES
+					('corrupt-machine-revision', 'VISIBLE', 'safe', 'api'),
+					('corrupt-machine-revision', 'HIDDEN', CAST(X'FF' AS TEXT), 'worker')`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "invalid key",
+			insert: func(t *testing.T, fixture *machineServiceFixture) {
+				t.Helper()
+				if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value) VALUES ('corrupt-machine-revision', 'INVALID-KEY', 'invalid-key-secret')`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "aggregate budget exceeded",
+			insert: func(t *testing.T, fixture *machineServiceFixture) {
+				t.Helper()
+				if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value) VALUES
+					('corrupt-machine-revision', 'ONE', ?), ('corrupt-machine-revision', 'TWO', ?)`,
+					strings.Repeat("1", revisions.MaxSnapshotBytes/2), strings.Repeat("2", revisions.MaxSnapshotBytes/2)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:    "filtered non-canonical service",
+			service: "api",
+			insert: func(t *testing.T, fixture *machineServiceFixture) {
+				t.Helper()
+				if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value, service) VALUES
+					('corrupt-machine-revision', 'VISIBLE', 'safe', 'api'),
+					('corrupt-machine-revision', 'HIDDEN', 'non-canonical-service-secret', ' worker ')`); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMachineServiceFixture(t)
+			identity := createMachineIdentity(t, fixture, "corrupt-reader-ci")
+			replaceMachineGrants(t, fixture, identity.ID, []EnvironmentGrant{{ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID}})
+			issued := issueMachineToken(t, fixture, identity.ID, "primary", machineTestNow.Add(time.Hour))
+			if _, err := fixture.store.DB().Exec(`INSERT INTO revisions (id, environment_id, version, created_by, created_at)
+				VALUES ('corrupt-machine-revision', ?, 9, ?, ?)`, fixture.allowedEnv.ID, fixture.admin.ID, machineTestNow.Unix()); err != nil {
+				t.Fatal(err)
+			}
+			test.insert(t, fixture)
+			if _, err := fixture.store.DB().Exec(`UPDATE environments SET current_revision_id = 'corrupt-machine-revision' WHERE id = ?`, fixture.allowedEnv.ID); err != nil {
+				t.Fatal(err)
+			}
+
+			config, err := fixture.service.ReadCurrentForProject(context.Background(), issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, test.service)
+			if !errors.Is(err, ErrDataIntegrity) {
+				t.Fatalf("config=%+v error=%v", config, err)
+			}
+			for _, secret := range []string{"unsealed-secret", "invalid-key-secret", "non-canonical-service-secret"} {
+				if strings.Contains(fmt.Sprint(err), secret) {
+					t.Fatalf("integrity error leaked %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestMachineCurrentReadKeepsSnapshotWithoutBlockingSecurityOrConfigWrites(t *testing.T) {
+	fixture := newMachineServiceFixture(t)
+	identity := createMachineIdentity(t, fixture, "snapshot-ci")
+	replaceMachineGrants(t, fixture, identity.ID, []EnvironmentGrant{{ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID}})
+	issued := issueMachineToken(t, fixture, identity.ID, "primary", machineTestNow.Add(time.Hour))
+	revisionService := revisions.NewService(fixture.store)
+	first, err := revisionService.ReplaceForProject(context.Background(), fixture.admin, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, revisions.ReplaceInput{
+		Entries: []revisions.Entry{{Key: "VALUE", Value: "before"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var once sync.Once
+	fixture.service.afterMachineAuthorization = func() {
+		once.Do(func() {
+			close(readStarted)
+			<-releaseRead
+		})
+	}
+	type readResult struct {
+		config CurrentConfig
+		err    error
+	}
+	result := make(chan readResult, 1)
+	go func() {
+		config, err := fixture.service.ReadCurrentForProject(context.Background(), issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, "")
+		result <- readResult{config: config, err: err}
+	}()
+	<-readStarted
+
+	writes := make(chan error, 1)
+	go func() {
+		if _, err := revisionService.ReplaceForProject(context.Background(), fixture.admin, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, revisions.ReplaceInput{
+			BaseRevision: first.Version, Entries: []revisions.Entry{{Key: "VALUE", Value: "after"}},
+		}); err != nil {
+			writes <- err
+			return
+		}
+		if err := fixture.service.ReplaceGrants(context.Background(), fixture.admin, identity.ID, nil); err != nil {
+			writes <- err
+			return
+		}
+		writes <- fixture.service.RevokeToken(context.Background(), fixture.admin, identity.ID, issued.ID)
+	}()
+	select {
+	case err := <-writes:
+		if err != nil {
+			close(releaseRead)
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseRead)
+		<-result
+		t.Fatal("machine read blocked revoke, grant, or config write")
+	}
+	close(releaseRead)
+	read := <-result
+	if read.err != nil || read.config.Revision != 1 || read.config.Values["VALUE"] != "before" {
+		t.Fatalf("snapshot config=%+v error=%v", read.config, read.err)
+	}
+	if _, err := fixture.service.ReadCurrentForProject(context.Background(), issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, ""); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("revocation after snapshot error=%v", err)
+	}
+}
+
+func TestCanonicalInvalidTokenReadDoesNotBlockWriter(t *testing.T) {
+	fixture := newMachineServiceFixture(t)
+	identity := createMachineIdentity(t, fixture, "invalid-reader-ci")
+	issued := issueMachineToken(t, fixture, identity.ID, "primary", machineTestNow.Add(time.Hour))
+	unknown := issued.Plaintext
+	if unknown[3] == 'A' {
+		unknown = unknown[:3] + "B" + unknown[4:]
+	} else {
+		unknown = unknown[:3] + "A" + unknown[4:]
+	}
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	fixture.service.afterReadTxBegin = func() {
+		close(readStarted)
+		<-releaseRead
+	}
+	readResult := make(chan error, 1)
+	go func() {
+		_, err := fixture.service.ReadCurrentForProject(context.Background(), unknown, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, "")
+		readResult <- err
+	}()
+	<-readStarted
+
+	writeResult := make(chan error, 1)
+	go func() {
+		writeResult <- fixture.service.RevokeToken(context.Background(), fixture.admin, identity.ID, issued.ID)
+	}()
+	select {
+	case err := <-writeResult:
+		if err != nil {
+			close(releaseRead)
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseRead)
+		<-readResult
+		t.Fatal("canonical invalid token read blocked writer")
+	}
+	close(releaseRead)
+	if err := <-readResult; !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("read error=%v", err)
 	}
 }
 
@@ -287,6 +491,136 @@ func TestIssueTokenValidatesExpiryAndUniqueName(t *testing.T) {
 	}
 	if _, err := fixture.service.IssueToken(context.Background(), fixture.admin, "missing", IssueToken{Name: "missing", ExpiresAt: machineTestNow.Add(time.Hour)}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing identity issue error=%v", err)
+	}
+}
+
+func TestIssueTokenRevalidatesExpiryAfterWaitingForWriteLock(t *testing.T) {
+	for _, test := range []struct {
+		name, tokenName        string
+		expiresAt, postLockNow time.Time
+	}{
+		{name: "expired while waiting", tokenName: "expired", expiresAt: machineTestNow.Add(time.Second), postLockNow: machineTestNow.Add(time.Second)},
+		{name: "too far after clock rollback", tokenName: "too-far", expiresAt: machineTestNow.Add(MaxTokenLifetime), postLockNow: machineTestNow.Add(-time.Second)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMachineServiceFixture(t)
+			identity := createMachineIdentity(t, fixture, "delayed-issue-ci")
+			fixture.service.random = bytes.NewReader(make([]byte, tokenRandomBytes))
+
+			writer, err := fixture.store.DB().Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = writer.Rollback() }()
+			if _, err := writer.Exec(`UPDATE machine_identities SET updated_at = updated_at WHERE id = ?`, identity.ID); err != nil {
+				t.Fatal(err)
+			}
+
+			clockCalls := make(chan time.Time, 4)
+			call := 0
+			fixture.service.now = func() time.Time {
+				call++
+				value := machineTestNow
+				if call > 1 {
+					value = test.postLockNow
+				}
+				clockCalls <- value
+				return value
+			}
+			type issueResult struct {
+				issued IssuedToken
+				err    error
+			}
+			result := make(chan issueResult, 1)
+			go func() {
+				issued, err := fixture.service.IssueToken(context.Background(), fixture.admin, identity.ID, IssueToken{Name: test.tokenName, ExpiresAt: test.expiresAt})
+				result <- issueResult{issued: issued, err: err}
+			}()
+
+			if got := <-clockCalls; !got.Equal(machineTestNow) {
+				t.Fatalf("initial validation time=%s", got)
+			}
+			select {
+			case got := <-clockCalls:
+				t.Fatalf("issuance time sampled before writer lock was acquired: %s", got)
+			case <-time.After(100 * time.Millisecond):
+			}
+			if err := writer.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+
+			completed := <-result
+			if !errors.Is(completed.err, ErrInvalid) || completed.issued.Plaintext != "" {
+				t.Fatalf("issued=%+v error=%v", completed.issued, completed.err)
+			}
+			var tokenCount int
+			if err := fixture.store.DB().QueryRow(`SELECT COUNT(*) FROM access_tokens WHERE identity_id = ?`, identity.ID).Scan(&tokenCount); err != nil || tokenCount != 0 {
+				t.Fatalf("token count=%d error=%v", tokenCount, err)
+			}
+		})
+	}
+}
+
+func TestIssueTokenUsesOnePostLockTimeForValidationAndCreation(t *testing.T) {
+	fixture := newMachineServiceFixture(t)
+	identity := createMachineIdentity(t, fixture, "created-at-ci")
+	fixture.service.random = bytes.NewReader(make([]byte, tokenRandomBytes))
+
+	writer, err := fixture.store.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Rollback() }()
+	if _, err := writer.Exec(`UPDATE machine_identities SET updated_at = updated_at WHERE id = ?`, identity.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	postLockNow := machineTestNow.Add(time.Hour)
+	clockCalls := make(chan time.Time, 4)
+	call := 0
+	fixture.service.now = func() time.Time {
+		call++
+		value := machineTestNow
+		if call > 1 {
+			value = postLockNow
+		}
+		clockCalls <- value
+		return value
+	}
+	result := make(chan struct {
+		issued IssuedToken
+		err    error
+	}, 1)
+	go func() {
+		issued, err := fixture.service.IssueToken(context.Background(), fixture.admin, identity.ID, IssueToken{Name: "created-at", ExpiresAt: machineTestNow.Add(2 * time.Hour)})
+		result <- struct {
+			issued IssuedToken
+			err    error
+		}{issued: issued, err: err}
+	}()
+
+	if got := <-clockCalls; !got.Equal(machineTestNow) {
+		t.Fatalf("initial validation time=%s", got)
+	}
+	select {
+	case got := <-clockCalls:
+		t.Fatalf("issuance time sampled before writer lock was acquired: %s", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := writer.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	completed := <-result
+	if completed.err != nil {
+		t.Fatal(completed.err)
+	}
+	var createdAt int64
+	if err := fixture.store.DB().QueryRow(`SELECT created_at FROM access_tokens WHERE id = ?`, completed.issued.ID).Scan(&createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if createdAt != postLockNow.Unix() || call != 2 {
+		t.Fatalf("created_at=%d clock calls=%d", createdAt, call)
 	}
 }
 

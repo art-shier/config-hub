@@ -58,6 +58,42 @@ func TestReplaceCreatesAtomicSnapshotAndRejectsStaleBase(t *testing.T) {
 	}
 }
 
+func TestValidateStoredEntriesRejectsNonCanonicalOrUnsafeSnapshots(t *testing.T) {
+	if err := ValidateStoredEntries([]Entry{{Key: "DATABASE_URL", Value: "postgres://db", Service: "api"}, {Key: "PORT", Value: "8080"}}); err != nil {
+		t.Fatalf("valid stored entries error=%v", err)
+	}
+
+	tooMany := make([]Entry, MaxEntryCount+1)
+	for index := range tooMany {
+		tooMany[index] = Entry{Key: fmt.Sprintf("KEY_%d", index)}
+	}
+	for _, test := range []struct {
+		name    string
+		entries []Entry
+	}{
+		{name: "invalid key", entries: []Entry{{Key: "NOT-A-KEY", Value: "secret"}}},
+		{name: "duplicate key", entries: []Entry{{Key: "DUPLICATE"}, {Key: "DUPLICATE"}}},
+		{name: "invalid UTF-8 value", entries: []Entry{{Key: "SECRET", Value: string([]byte{0xff})}}},
+		{name: "non-canonical service", entries: []Entry{{Key: "SECRET", Value: "hidden", Service: " api "}}},
+		{name: "oversized value", entries: []Entry{{Key: "SECRET", Value: strings.Repeat("x", MaxValueBytes+1)}}},
+		{name: "aggregate too large", entries: []Entry{
+			{Key: "ONE", Value: strings.Repeat("1", MaxSnapshotBytes/2)},
+			{Key: "TWO", Value: strings.Repeat("2", MaxSnapshotBytes/2)},
+		}},
+		{name: "too many entries", entries: tooMany},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateStoredEntries(test.entries)
+			if !errors.Is(err, ErrDataIntegrity) {
+				t.Fatalf("error=%v", err)
+			}
+			if strings.Contains(fmt.Sprint(err), "secret") || strings.Contains(fmt.Sprint(err), "hidden") {
+				t.Fatalf("integrity error leaked entry content: %v", err)
+			}
+		})
+	}
+}
+
 func TestCurrentReturnsEmptySnapshotBeforeFirstSave(t *testing.T) {
 	fixture := newRevisionFixture(t)
 	revision, err := fixture.service.Current(context.Background(), fixture.viewer, fixture.environmentID, "")

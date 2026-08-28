@@ -7,9 +7,85 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"modernc.org/sqlite"
 )
+
+func TestInReadTxDoesNotReserveWriterWhileCallbackIsBlocked(t *testing.T) {
+	store := openTestStore(t)
+	store.DB().SetMaxOpenConns(4)
+	readerStarted := make(chan struct{})
+	releaseReader := make(chan struct{})
+	readerResult := make(chan error, 1)
+	go func() {
+		readerResult <- store.InReadTx(context.Background(), func(tx *sql.Tx) error {
+			var one int
+			if err := tx.QueryRow(`SELECT 1`).Scan(&one); err != nil {
+				return err
+			}
+			close(readerStarted)
+			<-releaseReader
+			return nil
+		})
+	}()
+	<-readerStarted
+
+	writerResult := make(chan error, 1)
+	go func() {
+		writerResult <- store.InTx(context.Background(), func(tx *sql.Tx) error {
+			_, err := tx.Exec(`INSERT INTO machine_identities (id, name, enabled, created_at, updated_at)
+				VALUES ('read-tx-writer', 'read-tx-writer', 1, 1, 1)`)
+			return err
+		})
+	}()
+	select {
+	case err := <-writerResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer was blocked by read-only transaction")
+	}
+	close(releaseReader)
+	if err := <-readerResult; err != nil {
+		t.Fatal(err)
+	}
+	assertRowCount(t, store, `SELECT count(*) FROM machine_identities WHERE id = 'read-tx-writer'`, 1)
+}
+
+func TestInReadTxPropagatesCallbackErrorsAndRollsBackPanics(t *testing.T) {
+	store := openTestStore(t)
+	sentinel := errors.New("stop read")
+	if err := store.InReadTx(context.Background(), func(*sql.Tx) error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("callback error=%v", err)
+	}
+	if err := store.InReadTx(context.Background(), nil); err == nil {
+		t.Fatal("nil callback succeeded")
+	}
+	const panicValue = "read transaction panic"
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != panicValue {
+				t.Fatalf("panic=%v", recovered)
+			}
+		}()
+		_ = store.InReadTx(context.Background(), func(tx *sql.Tx) error {
+			var one int
+			if err := tx.QueryRow(`SELECT 1`).Scan(&one); err != nil {
+				return err
+			}
+			panic(panicValue)
+		})
+	}()
+	if err := store.InTx(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO machine_identities (id, name, enabled, created_at, updated_at)
+			VALUES ('after-read-panic', 'after-read-panic', 1, 1, 1)`)
+		return err
+	}); err != nil {
+		t.Fatalf("writer after read panic: %v", err)
+	}
+}
 
 func TestInTxClassifiesSQLiteBusyAndPreservesDriverError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "busy.db")

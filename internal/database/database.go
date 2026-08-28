@@ -148,10 +148,20 @@ func (s *Store) Ready(ctx context.Context) error {
 // InTx executes fn in an immediate SQLite transaction. Callback errors are
 // returned after rollback; a successful callback is committed.
 func (s *Store) InTx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
+	return s.inTx(ctx, nil, fn)
+}
+
+// InReadTx executes fn in a deferred read-only SQLite transaction. Unlike
+// InTx, it does not acquire SQLite's immediate writer reservation.
+func (s *Store) InReadTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	return s.inTx(ctx, &sql.TxOptions{ReadOnly: true}, fn)
+}
+
+func (s *Store) inTx(ctx context.Context, options *sql.TxOptions, fn func(*sql.Tx) error) (err error) {
 	if fn == nil {
 		return errors.New("transaction callback is nil")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, options)
 	if err != nil {
 		return ClassifyError(fmt.Errorf("begin transaction: %w", err))
 	}
