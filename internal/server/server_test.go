@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -73,16 +75,175 @@ func TestRunRefusesToListenWhenInitialUserSyncFails(t *testing.T) {
 }
 
 func TestRunTreatsUnexpectedListenerExitAsRuntimeError(t *testing.T) {
-	server := New(immediateHTTPServer{err: http.ErrServerClosed},
-		WithUserReloader(&fakeReloader{}),
+	for _, test := range []struct {
+		name     string
+		serveErr error
+	}{
+		{name: "server closed", serveErr: http.ErrServerClosed},
+		{name: "nil", serveErr: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := New(immediateHTTPServer{err: test.serveErr},
+				WithUserReloader(&fakeReloader{}),
+				WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+			)
+
+			if err := server.Run(context.Background()); !errors.Is(err, ErrHTTPServe) {
+				t.Fatalf("error=%v, want ErrHTTPServe", err)
+			}
+			if server.Live() || server.Ready() {
+				t.Fatalf("failed state live=%v ready=%v", server.Live(), server.Ready())
+			}
+		})
+	}
+}
+
+func TestListenerExitPreventsInFlightReloadFromRestoringReadiness(t *testing.T) {
+	httpServer := newControlledHTTPServer(errors.New("listener failed"))
+	reloader := &terminalRaceReloader{reloadStarted: make(chan struct{}), releaseReload: make(chan struct{})}
+	server := New(httpServer,
+		WithUserReloader(reloader),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run(context.Background()) }()
+	<-httpServer.started
 
-	if err := server.Run(context.Background()); !errors.Is(err, ErrHTTPServe) {
-		t.Fatalf("error=%v, want ErrHTTPServe", err)
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- server.Reload(context.Background()) }()
+	<-reloader.reloadStarted
+	close(httpServer.releaseServe)
+	if err := <-runDone; !errors.Is(err, ErrHTTPServe) {
+		t.Fatalf("Run error=%v, want ErrHTTPServe", err)
 	}
-	if server.Live() || server.Ready() {
-		t.Fatalf("failed state live=%v ready=%v", server.Live(), server.Ready())
+	if server.Ready() {
+		t.Fatal("listener exit left server ready")
+	}
+
+	close(reloader.releaseReload)
+	if err := <-reloadDone; err != nil {
+		t.Fatal(err)
+	}
+	if server.Ready() {
+		t.Fatal("in-flight reload restored readiness after listener exit")
+	}
+}
+
+func TestShutdownWaitsForServeAndReportsConcurrentListenerError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		httpServer := newControlledHTTPServer(errors.New("accept failed during shutdown"))
+		server := New(httpServer,
+			WithUserReloader(&fakeReloader{}),
+			WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		)
+		ctx, cancel := context.WithCancel(context.Background())
+		runDone := make(chan error, 1)
+		go func() { runDone <- server.Run(ctx) }()
+		<-httpServer.started
+		cancel()
+		<-httpServer.serveStopping
+		synctest.Wait()
+
+		select {
+		case err := <-runDone:
+			close(httpServer.releaseServe)
+			synctest.Wait()
+			t.Fatalf("Run returned before ListenAndServe completed: %v", err)
+		default:
+		}
+		close(httpServer.releaseServe)
+		if err := <-runDone; !errors.Is(err, ErrHTTPServe) {
+			t.Fatalf("Run error=%v, want ErrHTTPServe", err)
+		}
+	})
+}
+
+func TestShutdownClassifiesListenerResult(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		serveErr error
+		wantErr  error
+	}{
+		{name: "server closed", serveErr: http.ErrServerClosed},
+		{name: "wrapped server closed", serveErr: fmt.Errorf("serve stopped: %w", http.ErrServerClosed)},
+		{name: "nil", serveErr: nil, wantErr: ErrHTTPServe},
+		{name: "unexpected", serveErr: errors.New("accept failed"), wantErr: ErrHTTPServe},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			httpServer := newShutdownResultHTTPServer(test.serveErr)
+			server := New(httpServer,
+				WithUserReloader(&fakeReloader{}),
+				WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+			)
+			ctx, cancel := context.WithCancel(context.Background())
+			runDone := make(chan error, 1)
+			go func() { runDone <- server.Run(ctx) }()
+			<-httpServer.started
+			cancel()
+			gotErr := <-runDone
+			if test.wantErr == nil {
+				if gotErr != nil {
+					t.Fatalf("Run error=%v, want nil", gotErr)
+				}
+			} else if !errors.Is(gotErr, test.wantErr) {
+				t.Fatalf("Run error=%v, want %v", gotErr, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestCancellationPreventsInFlightReloadFromRestoringReadinessBeforeShutdownReturns(t *testing.T) {
+	httpServer := newBlockingShutdownHTTPServer()
+	reloader := &terminalRaceReloader{reloadStarted: make(chan struct{}), releaseReload: make(chan struct{})}
+	server := New(httpServer,
+		WithUserReloader(reloader),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run(ctx) }()
+	<-httpServer.started
+
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- server.Reload(context.Background()) }()
+	<-reloader.reloadStarted
+	cancel()
+	<-httpServer.shutdownStarted
+	close(reloader.releaseReload)
+	if err := <-reloadDone; err != nil {
+		t.Fatal(err)
+	}
+	readyDuringShutdown := server.Ready()
+	close(httpServer.releaseShutdown)
+	if err := <-runDone; err != nil {
+		t.Fatal(err)
+	}
+	if readyDuringShutdown {
+		t.Fatal("in-flight reload restored readiness while Shutdown was blocked")
+	}
+}
+
+func TestStaleReloadCannotPublishReadinessForLaterRun(t *testing.T) {
+	reloader := &blockingReloader{started: make(chan struct{}), release: make(chan struct{})}
+	server := New(nil,
+		WithUserReloader(reloader),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	firstGeneration := server.beginRun()
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- server.Reload(context.Background()) }()
+	<-reloader.started
+
+	server.finishRun(firstGeneration)
+	secondGeneration := server.beginRun()
+	close(reloader.release)
+	if err := <-reloadDone; err != nil {
+		t.Fatal(err)
+	}
+	readyDuringSecondRun := server.Ready()
+	server.finishRun(secondGeneration)
+	if readyDuringSecondRun {
+		t.Fatal("stale reload published readiness for a later run")
 	}
 }
 
@@ -170,6 +331,36 @@ type fakeReloader struct {
 	calls   int
 }
 
+type terminalRaceReloader struct {
+	mu            sync.Mutex
+	calls         int
+	reloadStarted chan struct{}
+	releaseReload chan struct{}
+}
+
+type blockingReloader struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingReloader) Reload(context.Context) error {
+	close(r.started)
+	<-r.release
+	return nil
+}
+
+func (r *terminalRaceReloader) Reload(context.Context) error {
+	r.mu.Lock()
+	r.calls++
+	call := r.calls
+	r.mu.Unlock()
+	if call == 2 {
+		close(r.reloadStarted)
+		<-r.releaseReload
+	}
+	return nil
+}
+
 type serializedReloader struct {
 	mu            sync.Mutex
 	calls         int
@@ -229,8 +420,95 @@ type fakeHTTPServer struct {
 
 type immediateHTTPServer struct{ err error }
 
+type controlledHTTPServer struct {
+	started        chan struct{}
+	releaseServe   chan struct{}
+	shutdownCalled chan struct{}
+	serveStopping  chan struct{}
+	shutdownOnce   sync.Once
+	serveErr       error
+}
+
+type blockingShutdownHTTPServer struct {
+	started         chan struct{}
+	stopped         chan struct{}
+	shutdownStarted chan struct{}
+	releaseShutdown chan struct{}
+}
+
+type shutdownResultHTTPServer struct {
+	started  chan struct{}
+	stop     chan struct{}
+	stopOnce sync.Once
+	serveErr error
+}
+
 func (s immediateHTTPServer) ListenAndServe() error        { return s.err }
 func (immediateHTTPServer) Shutdown(context.Context) error { return nil }
+
+func newControlledHTTPServer(serveErr error) *controlledHTTPServer {
+	return &controlledHTTPServer{
+		started: make(chan struct{}), releaseServe: make(chan struct{}),
+		shutdownCalled: make(chan struct{}), serveStopping: make(chan struct{}), serveErr: serveErr,
+	}
+}
+
+func (s *controlledHTTPServer) ListenAndServe() error {
+	close(s.started)
+	select {
+	case <-s.releaseServe:
+	case <-s.shutdownCalled:
+		close(s.serveStopping)
+		<-s.releaseServe
+	}
+	return s.serveErr
+}
+
+func (s *controlledHTTPServer) Shutdown(context.Context) error {
+	s.shutdownOnce.Do(func() { close(s.shutdownCalled) })
+	return nil
+}
+
+func newBlockingShutdownHTTPServer() *blockingShutdownHTTPServer {
+	return &blockingShutdownHTTPServer{
+		started:         make(chan struct{}),
+		stopped:         make(chan struct{}),
+		shutdownStarted: make(chan struct{}),
+		releaseShutdown: make(chan struct{}),
+	}
+}
+
+func (s *blockingShutdownHTTPServer) ListenAndServe() error {
+	close(s.started)
+	<-s.stopped
+	return http.ErrServerClosed
+}
+
+func (s *blockingShutdownHTTPServer) Shutdown(context.Context) error {
+	close(s.shutdownStarted)
+	<-s.releaseShutdown
+	close(s.stopped)
+	return nil
+}
+
+func newShutdownResultHTTPServer(serveErr error) *shutdownResultHTTPServer {
+	return &shutdownResultHTTPServer{
+		started:  make(chan struct{}),
+		stop:     make(chan struct{}),
+		serveErr: serveErr,
+	}
+}
+
+func (s *shutdownResultHTTPServer) ListenAndServe() error {
+	close(s.started)
+	<-s.stop
+	return s.serveErr
+}
+
+func (s *shutdownResultHTTPServer) Shutdown(context.Context) error {
+	s.stopOnce.Do(func() { close(s.stop) })
+	return nil
+}
 
 func newFakeHTTPServer() *fakeHTTPServer {
 	return &fakeHTTPServer{started: make(chan struct{}), stopped: make(chan struct{})}

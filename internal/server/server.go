@@ -23,7 +23,9 @@ var (
 	ErrAlreadyRunning  = errors.New("server is already running")
 )
 
-// HTTPServer is the net/http lifecycle surface used by Server.
+// HTTPServer is the net/http lifecycle surface used by Server. A successful
+// Shutdown must initiate listener termination; Run waits for ListenAndServe to
+// return before completing the shutdown.
 type HTTPServer interface {
 	ListenAndServe() error
 	Shutdown(context.Context) error
@@ -76,13 +78,15 @@ func WithState(state *State) Option {
 // graceful shutdown. It deliberately never logs dependency errors because a
 // users file error can contain sensitive deployment material.
 type Server struct {
-	httpServer HTTPServer
-	reloader   UserReloader
-	logger     *slog.Logger
-	state      *State
-	reloadMu   sync.Mutex
-	running    atomic.Bool
-	draining   atomic.Bool
+	httpServer  HTTPServer
+	reloader    UserReloader
+	logger      *slog.Logger
+	state       *State
+	reloadMu    sync.Mutex
+	lifecycleMu sync.Mutex
+	generation  uint64
+	terminal    bool
+	running     atomic.Bool
 }
 
 func New(httpServer HTTPServer, options ...Option) *Server {
@@ -102,12 +106,56 @@ func New(httpServer HTTPServer, options ...Option) *Server {
 func (s *Server) Live() bool  { return s != nil && s.state.Live() }
 func (s *Server) Ready() bool { return s != nil && s.state.Ready() }
 
+func (s *Server) currentGeneration() uint64 {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.generation
+}
+
+func (s *Server) beginRun() uint64 {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.generation++
+	s.terminal = false
+	s.state.ready.Store(false)
+	s.state.live.Store(true)
+	return s.generation
+}
+
+func (s *Server) markTerminal(generation uint64) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if generation == s.generation {
+		s.terminal = true
+		s.state.ready.Store(false)
+	}
+}
+
+func (s *Server) finishRun(generation uint64) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if generation == s.generation {
+		s.terminal = true
+		s.state.ready.Store(false)
+		s.state.live.Store(false)
+	}
+}
+
+func (s *Server) publishReady(generation uint64) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if generation == s.generation && !s.terminal {
+		s.state.ready.Store(true)
+	}
+}
+
 // Reload reconciles users. A failure retains both the last valid database
 // snapshot and its readiness state.
 func (s *Server) Reload(ctx context.Context) error {
 	if s == nil || s.reloader == nil {
 		return ErrUserReload
 	}
+	generation := s.currentGeneration()
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 	if err := s.reloader.Reload(ctx); err != nil {
@@ -121,9 +169,7 @@ func (s *Server) Reload(ctx context.Context) error {
 		}
 		return ErrUserReload
 	}
-	if !s.draining.Load() {
-		s.state.ready.Store(true)
-	}
+	s.publishReady(generation)
 	return nil
 }
 
@@ -136,16 +182,16 @@ func (s *Server) Run(ctx context.Context) error {
 	if !s.running.CompareAndSwap(false, true) {
 		return ErrAlreadyRunning
 	}
-	defer s.running.Store(false)
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	s.draining.Store(false)
-	s.state.live.Store(true)
-	defer s.state.live.Store(false)
+	generation := s.beginRun()
+	defer func() {
+		s.finishRun(generation)
+		s.running.Store(false)
+	}()
 	if err := s.Reload(ctx); err != nil {
-		s.state.ready.Store(false)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -157,22 +203,17 @@ func (s *Server) Run(ctx context.Context) error {
 
 	select {
 	case <-serveResult:
-		s.state.ready.Store(false)
 		return ErrHTTPServe
 	case <-ctx.Done():
-		s.draining.Store(true)
-		s.state.ready.Store(false)
+		s.markTerminal(generation)
 		shutdownContext, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 		defer cancel()
 		if err := s.httpServer.Shutdown(shutdownContext); err != nil {
 			return ErrHTTPShutdown
 		}
-		select {
-		case err := <-serveResult:
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				return ErrHTTPServe
-			}
-		default:
+		err := <-serveResult
+		if !errors.Is(err, http.ErrServerClosed) {
+			return ErrHTTPServe
 		}
 		return nil
 	}

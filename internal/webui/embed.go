@@ -60,7 +60,9 @@ func Assets() (fs.FS, error) {
 	return fallbackFS{primary: assets}, nil
 }
 
-var hashedAssetName = regexp.MustCompile(`(?:^|/)[^/]+[-.][A-Za-z0-9_-]{8,}\.[^/]+$`)
+// Vite's default output names use [name]-[hash] with an eight-character
+// base64url hash.
+var hashedAssetName = regexp.MustCompile(`(?:^|/)[^/]+-[A-Za-z0-9_-]{8}\.[^/]+$`)
 
 // NewHandler serves an embedded asset filesystem with history fallback for
 // extensionless SPA routes.

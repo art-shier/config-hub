@@ -39,9 +39,14 @@ func TestAssetsAlwaysContainBootstrapIndex(t *testing.T) {
 
 func TestHandlerFallsBackOnlyForSPARoutesAndSetsCachePolicy(t *testing.T) {
 	assets := fstest.MapFS{
-		"index.html":                     {Data: []byte("<!doctype html><title>ConfigHub Test</title>")},
-		"assets/app-abcdef1234567890.js": {Data: []byte("console.log('ok')")},
-		"assets/plain.js":                {Data: []byte("console.log('plain')")},
+		"index.html":                 {Data: []byte("<!doctype html><title>ConfigHub Test</title>")},
+		"assets/index-DrZZUHo-.js":   {Data: []byte("console.log('ok')")},
+		"assets/styles-Cm_X9ONV.css": {Data: []byte("body{}")},
+		"assets/app-production.js":   {Data: []byte("console.log('production')")},
+		"assets/app-B38A_N6.js":      {Data: []byte("console.log('short')")},
+		"assets/app-B38A_N6xx.js":    {Data: []byte("console.log('long')")},
+		"assets/app.B38A_N6x.js":     {Data: []byte("console.log('dot')")},
+		"assets/plain.js":            {Data: []byte("console.log('plain')")},
 	}
 	handler := NewHandler(assets)
 
@@ -55,13 +60,23 @@ func TestHandlerFallsBackOnlyForSPARoutesAndSetsCachePolicy(t *testing.T) {
 		}
 	}
 
-	response := serveWeb(t, handler, "/assets/app-abcdef1234567890.js")
-	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
-		t.Fatalf("hashed status=%d headers=%v", response.Code, response.Header())
+	for _, path := range []string{"/assets/index-DrZZUHo-.js", "/assets/styles-Cm_X9ONV.css"} {
+		response := serveWeb(t, handler, path)
+		if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+			t.Fatalf("%s status=%d headers=%v", path, response.Code, response.Header())
+		}
 	}
-	response = serveWeb(t, handler, "/assets/plain.js")
-	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") == "public, max-age=31536000, immutable" {
-		t.Fatalf("plain status=%d headers=%v", response.Code, response.Header())
+	for _, path := range []string{
+		"/assets/plain.js",
+		"/assets/app-production.js",
+		"/assets/app-B38A_N6.js",
+		"/assets/app-B38A_N6xx.js",
+		"/assets/app.B38A_N6x.js",
+	} {
+		response := serveWeb(t, handler, path)
+		if response.Code != http.StatusOK || response.Header().Get("Cache-Control") == "public, max-age=31536000, immutable" {
+			t.Fatalf("%s status=%d headers=%v", path, response.Code, response.Header())
+		}
 	}
 
 	for _, path := range []string{"/assets/missing.js", "/api/v1/missing", "/api"} {
