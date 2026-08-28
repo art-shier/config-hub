@@ -1,11 +1,12 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"os"
+
+	"confighub.local/internal/cli"
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "confighub: not configured")
-	os.Exit(2)
+	os.Exit(cli.Execute(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 }
