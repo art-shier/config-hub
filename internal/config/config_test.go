@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const validConfig = `server:
@@ -41,6 +42,12 @@ func TestLoadResolvesPathsAndDefaults(t *testing.T) {
 	if cfg.Auth.SessionKeyFile != filepath.Join(dir, "session.key") {
 		t.Fatalf("session key file = %q", cfg.Auth.SessionKeyFile)
 	}
+	if cfg.Auth.SessionTTL != 24*time.Hour {
+		t.Fatalf("session TTL = %s", cfg.Auth.SessionTTL)
+	}
+	if cfg.Backup.Directory != filepath.Join(dir, "backups") {
+		t.Fatalf("backup directory = %q", cfg.Backup.Directory)
+	}
 }
 
 func TestLoadRejectsUnknownYAMLKeys(t *testing.T) {
@@ -64,22 +71,42 @@ func TestLoadRejectsNonHTTPSPublicURL(t *testing.T) {
 }
 
 func TestLoadRejectsInvalidSessionTTL(t *testing.T) {
-	dir := writeValidRuntimeFiles(t)
-	writeRestricted(t, filepath.Join(dir, "config.yaml"), replace(t, validConfig, "  session_key_file: ./session.key\n", "  session_key_file: ./session.key\n  session_ttl: 0s\n"))
+	for _, ttl := range []string{"not-a-duration", "0s", "-1s"} {
+		t.Run(ttl, func(t *testing.T) {
+			dir := writeValidRuntimeFiles(t)
+			writeRestricted(t, filepath.Join(dir, "config.yaml"), replace(t, validConfig, "  session_key_file: ./session.key\n", "  session_key_file: ./session.key\n  session_ttl: "+ttl+"\n"))
 
-	_, err := Load(filepath.Join(dir, "config.yaml"))
-	if !errors.Is(err, ErrConfigValidation) {
-		t.Fatalf("error = %v, want ErrConfigValidation", err)
+			_, err := Load(filepath.Join(dir, "config.yaml"))
+			if !errors.Is(err, ErrConfigValidation) {
+				t.Fatalf("error = %v, want ErrConfigValidation", err)
+			}
+		})
 	}
 }
 
-func TestLoadRejectsMissingReferencedFile(t *testing.T) {
-	dir := t.TempDir()
-	writeRestricted(t, filepath.Join(dir, "config.yaml"), validConfig)
+func TestLoadRejectsMissingRequiredFiles(t *testing.T) {
+	for _, file := range []string{"config.yaml", "users.yaml", "session.key"} {
+		t.Run(file, func(t *testing.T) {
+			dir := writeValidRuntimeFiles(t)
+			if file != "config.yaml" {
+				writeRestricted(t, filepath.Join(dir, "config.yaml"), validConfig)
+			}
+			if file == "users.yaml" {
+				if err := os.Remove(filepath.Join(dir, file)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if file == "session.key" {
+				if err := os.Remove(filepath.Join(dir, file)); err != nil {
+					t.Fatal(err)
+				}
+			}
 
-	_, err := Load(filepath.Join(dir, "config.yaml"))
-	if !errors.Is(err, ErrConfigRead) {
-		t.Fatalf("error = %v, want ErrConfigRead", err)
+			_, err := Load(filepath.Join(dir, "config.yaml"))
+			if !errors.Is(err, ErrConfigRead) {
+				t.Fatalf("error = %v, want ErrConfigRead", err)
+			}
+		})
 	}
 }
 
@@ -94,16 +121,26 @@ func TestLoadRejectsInvalidTrustedProxyCIDR(t *testing.T) {
 }
 
 func TestLoadRejectsPermissionsBroaderThan0600(t *testing.T) {
-	dir := writeValidRuntimeFiles(t)
-	writeRestricted(t, filepath.Join(dir, "config.yaml"), validConfig)
-	usersPath := filepath.Join(dir, "users.yaml")
-	if err := os.Chmod(usersPath, 0o640); err != nil {
-		t.Fatal(err)
-	}
+	for _, testCase := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "config.yaml", mode: 0o640},
+		{name: "users.yaml", mode: 0o640},
+		{name: "session.key", mode: 0o604},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dir := writeValidRuntimeFiles(t)
+			writeRestricted(t, filepath.Join(dir, "config.yaml"), validConfig)
+			if err := os.Chmod(filepath.Join(dir, testCase.name), testCase.mode); err != nil {
+				t.Fatal(err)
+			}
 
-	_, err := Load(filepath.Join(dir, "config.yaml"))
-	if !errors.Is(err, ErrFilePermissions) {
-		t.Fatalf("error = %v, want ErrFilePermissions", err)
+			_, err := Load(filepath.Join(dir, "config.yaml"))
+			if !errors.Is(err, ErrFilePermissions) {
+				t.Fatalf("error = %v, want ErrFilePermissions", err)
+			}
+		})
 	}
 }
 
