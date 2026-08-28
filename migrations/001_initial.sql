@@ -118,6 +118,17 @@ BEGIN
     SELECT RAISE(ABORT, 'environments cannot be replaced');
 END;
 
+CREATE TRIGGER environments_prevent_update_replace
+BEFORE UPDATE OF id, project_id, slug ON environments
+WHEN EXISTS (
+    SELECT 1 FROM environments
+    WHERE id <> OLD.id
+      AND (id = NEW.id OR (project_id = NEW.project_id AND slug = NEW.slug))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'environment update conflicts with existing environment');
+END;
+
 CREATE TRIGGER environments_current_revision_insert
 BEFORE INSERT ON environments
 WHEN NEW.current_revision_id IS NOT NULL

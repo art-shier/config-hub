@@ -292,6 +292,66 @@ func TestSchemaRejectsEnvironmentReplaceConflicts(t *testing.T) {
 	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'current' AND environment_id = 'e1'", 1)
 }
 
+func TestSchemaRejectsEnvironmentUpdateOrReplaceIDConflict(t *testing.T) {
+	store := openTestStore(t)
+	db := store.DB()
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p2', 'p2', 'Project Two', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('source', 'p1', 'source', 'Source', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('target', 'p1', 'target', 'Target', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('target-revision', 'target', 1, 'u1', 1)",
+		"UPDATE environments SET current_revision_id = 'target-revision' WHERE id = 'target'",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("setup %q: %v", statement, err)
+		}
+	}
+
+	if _, err := db.Exec("UPDATE OR REPLACE environments SET id = 'target', current_revision_id = 'target-revision' WHERE id = 'source'"); err == nil {
+		t.Fatal("UPDATE OR REPLACE environment id conflict succeeded")
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'source' AND current_revision_id IS NULL", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'target' AND current_revision_id = 'target-revision'", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'target-revision' AND environment_id = 'target'", 1)
+
+	if _, err := db.Exec("UPDATE environments SET id = 'source-renamed', project_id = 'p2', slug = 'source-renamed', name = 'Source updated', updated_at = 2 WHERE id = 'source'"); err != nil {
+		t.Fatalf("non-conflicting environment key update: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('source-revision', 'source-renamed', 1, 'u1', 1)"); err != nil {
+		t.Fatalf("create source revision: %v", err)
+	}
+	if _, err := db.Exec("UPDATE environments SET current_revision_id = 'source-revision' WHERE id = 'source-renamed'"); err != nil {
+		t.Fatalf("normal current revision switch: %v", err)
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'source-renamed' AND project_id = 'p2' AND slug = 'source-renamed' AND name = 'Source updated' AND current_revision_id = 'source-revision'", 1)
+}
+
+func TestSchemaRejectsEnvironmentUpdateOrReplaceSlugConflict(t *testing.T) {
+	store := openTestStore(t)
+	db := store.DB()
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('source', 'p1', 'source', 'Source', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('target', 'p1', 'target', 'Target', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('target-revision', 'target', 1, 'u1', 1)",
+		"UPDATE environments SET current_revision_id = 'target-revision' WHERE id = 'target'",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("setup %q: %v", statement, err)
+		}
+	}
+
+	if _, err := db.Exec("UPDATE OR REPLACE environments SET slug = 'target' WHERE id = 'source'"); err == nil {
+		t.Fatal("UPDATE OR REPLACE environment slug conflict succeeded")
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'source' AND project_id = 'p1' AND slug = 'source'", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'target' AND current_revision_id = 'target-revision'", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'target-revision' AND environment_id = 'target'", 1)
+}
+
 func TestSchemaEnforcesForeignKeysAndChecks(t *testing.T) {
 	store := openTestStore(t)
 	if _, err := store.DB().Exec("INSERT INTO sessions (id, user_id, token_hash, csrf_hash, expires_at, created_at) VALUES ('s1', 'missing', x'01', x'02', 1, 1)"); err == nil {
