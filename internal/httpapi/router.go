@@ -27,6 +27,7 @@ type Dependencies struct {
 	Projects    ProjectService
 	Revisions   RevisionService
 	Machines    MachineAccessService
+	System      SystemStatus
 }
 
 type RateLimitOptions struct {
@@ -44,6 +45,7 @@ type Options struct {
 	Now               func() time.Time
 	RateLimit         RateLimitOptions
 	Register          func(*http.ServeMux)
+	WebUI             http.Handler
 }
 
 func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
@@ -59,6 +61,7 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	handlers := &authHandlers{credentials: deps.Credentials, sessions: deps.Sessions, publicOrigin: origin}
+	system := &systemHandlers{status: deps.System}
 	mux := http.NewServeMux()
 	projectsEnabled := deps.Projects != nil
 	revisionsEnabled := deps.Revisions != nil
@@ -66,9 +69,8 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	mux.HandleFunc("POST /api/v1/auth/login", handlers.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", handlers.logout)
 	mux.HandleFunc("GET /api/v1/auth/session", handlers.session)
-	mux.HandleFunc("GET /api/v1/health/live", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	mux.HandleFunc("GET /api/v1/health/live", system.live)
+	mux.HandleFunc("GET /api/v1/health/ready", system.ready)
 	if projectsEnabled {
 		projectAPI := &projectHandlers{service: deps.Projects, auth: handlers}
 		mux.HandleFunc("GET /api/v1/projects", projectAPI.list)
@@ -106,6 +108,7 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 		"/api/v1/auth/logout":  http.MethodPost,
 		"/api/v1/auth/session": http.MethodGet,
 		"/api/v1/health/live":  http.MethodGet,
+		"/api/v1/health/ready": http.MethodGet,
 	}
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		if allowed, known := allowedMethods[r.URL.Path]; known {
@@ -136,6 +139,9 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 		}
 		writeError(w, r, http.StatusNotFound, "not_found", "API route not found")
 	})
+	if options.WebUI != nil {
+		mux.Handle("/", options.WebUI)
+	}
 	sourceIP, err := newSourceIPResolver(options.TrustedProxyCIDRs)
 	if err != nil {
 		return nil, err
