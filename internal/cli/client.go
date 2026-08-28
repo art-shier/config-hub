@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -157,7 +158,13 @@ func validateBaseURL(raw string) (*url.URL, error) {
 }
 
 func validURLPort(parsed *url.URL) bool {
-	if strings.Contains(parsed.Hostname(), ":") && !strings.HasPrefix(parsed.Host, "[") {
+	hostname := parsed.Hostname()
+	if strings.HasPrefix(parsed.Host, "[") {
+		address, err := netip.ParseAddr(hostname)
+		if err != nil || !address.Is6() {
+			return false
+		}
+	} else if strings.Contains(hostname, ":") {
 		return false
 	}
 	port := parsed.Port()
