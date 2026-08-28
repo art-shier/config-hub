@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 CREATE TABLE users (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     username TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     password_hash TEXT NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE users (
 );
 
 CREATE TABLE sessions (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token_hash BLOB NOT NULL UNIQUE,
     csrf_hash BLOB NOT NULL,
@@ -24,7 +24,7 @@ CREATE TABLE sessions (
 );
 
 CREATE TABLE projects (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     slug TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
@@ -41,7 +41,7 @@ CREATE TABLE project_members (
 );
 
 CREATE TABLE environments (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     slug TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -52,12 +52,13 @@ CREATE TABLE environments (
 );
 
 CREATE TABLE revisions (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
     version INTEGER NOT NULL,
     message TEXT NOT NULL DEFAULT '',
     created_by TEXT NOT NULL REFERENCES users(id),
     created_at INTEGER NOT NULL,
+    sealed INTEGER NOT NULL DEFAULT 0 CHECK (sealed IN (0, 1)),
     UNIQUE (environment_id, version)
 );
 
@@ -70,7 +71,7 @@ CREATE TABLE revision_entries (
 );
 
 CREATE TABLE machine_identities (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
@@ -86,7 +87,7 @@ CREATE TABLE machine_grants (
 );
 
 CREATE TABLE access_tokens (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     identity_id TEXT NOT NULL REFERENCES machine_identities(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     prefix TEXT NOT NULL,
@@ -151,17 +152,45 @@ BEGIN
     SELECT RAISE(ABORT, 'current revision must belong to environment');
 END;
 
-CREATE TRIGGER revisions_prevent_current_delete
+CREATE TRIGGER environments_seal_current_revision_insert
+AFTER INSERT ON environments
+WHEN NEW.current_revision_id IS NOT NULL
+BEGIN
+    UPDATE revisions
+    SET sealed = 1
+    WHERE id = NEW.current_revision_id AND environment_id = NEW.id AND sealed = 0;
+END;
+
+CREATE TRIGGER environments_seal_current_revision_update
+AFTER UPDATE OF current_revision_id ON environments
+WHEN NEW.current_revision_id IS NOT NULL
+BEGIN
+    UPDATE revisions
+    SET sealed = 1
+    WHERE id = NEW.current_revision_id AND environment_id = NEW.id AND sealed = 0;
+END;
+
+CREATE TRIGGER revisions_prevent_direct_delete
 BEFORE DELETE ON revisions
 WHEN EXISTS (
-    SELECT 1 FROM environments WHERE current_revision_id = OLD.id
+    SELECT 1 FROM environments WHERE id = OLD.environment_id
 )
 BEGIN
-    SELECT RAISE(ABORT, 'cannot delete current revision');
+    SELECT RAISE(ABORT, 'cannot delete revision while environment exists');
 END;
 
 CREATE TRIGGER revisions_prevent_update
 BEFORE UPDATE ON revisions
+WHEN NOT (
+    OLD.sealed = 0
+    AND NEW.sealed = 1
+    AND NEW.id IS OLD.id
+    AND NEW.environment_id IS OLD.environment_id
+    AND NEW.version IS OLD.version
+    AND NEW.message IS OLD.message
+    AND NEW.created_by IS OLD.created_by
+    AND NEW.created_at IS OLD.created_at
+)
 BEGIN
     SELECT RAISE(ABORT, 'revisions are immutable');
 END;
@@ -175,6 +204,34 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'revisions are immutable');
+END;
+
+CREATE TRIGGER revision_entries_prevent_sealed_insert
+BEFORE INSERT ON revision_entries
+WHEN EXISTS (
+    SELECT 1 FROM revisions WHERE id = NEW.revision_id AND sealed = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sealed revision entries are immutable');
+END;
+
+CREATE TRIGGER revision_entries_prevent_sealed_update
+BEFORE UPDATE ON revision_entries
+WHEN EXISTS (
+    SELECT 1 FROM revisions
+    WHERE id IN (OLD.revision_id, NEW.revision_id) AND sealed = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sealed revision entries are immutable');
+END;
+
+CREATE TRIGGER revision_entries_prevent_sealed_delete
+BEFORE DELETE ON revision_entries
+WHEN EXISTS (
+    SELECT 1 FROM revisions WHERE id = OLD.revision_id AND sealed = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sealed revision entries are immutable');
 END;
 
 CREATE TRIGGER machine_grants_project_environment_insert

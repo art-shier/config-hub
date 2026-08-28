@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -222,10 +223,10 @@ func TestSchemaPreventsReverseMutationsOfRevisionAndGrantInvariants(t *testing.T
 		t.Fatal("replacing a historical revision succeeded")
 	}
 	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r2' AND environment_id = 'e2' AND version = 1", 1)
-	if _, err := db.Exec("DELETE FROM revisions WHERE id = 'r2'"); err != nil {
-		t.Fatalf("deleting non-current revision: %v", err)
+	if _, err := db.Exec("DELETE FROM revisions WHERE id = 'r2'"); err == nil {
+		t.Fatal("direct non-current revision delete succeeded")
 	}
-	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r2'", 0)
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r2'", 1)
 
 	if _, err := db.Exec("UPDATE environments SET project_id = 'p2' WHERE id = 'e1'"); err == nil {
 		t.Fatal("moving environment with a grant to another project succeeded")
@@ -362,6 +363,241 @@ func TestSchemaEnforcesForeignKeysAndChecks(t *testing.T) {
 	}
 }
 
+func TestSchemaSealsCurrentRevisionsAndProtectsEntries(t *testing.T) {
+	store := openTestStore(t)
+	db := store.DB()
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Environment One', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('r1', 'e1', 1, 'u1', 1)",
+		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r1', 'key', 'initial')",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("setup %q: %v", statement, err)
+		}
+	}
+
+	assertRowCount(t, store, "SELECT count(*) FROM revision_entries WHERE revision_id = 'r1' AND key = 'key' AND value = 'initial'", 1)
+	if _, err := db.Exec("UPDATE environments SET current_revision_id = 'r1' WHERE id = 'e1'"); err != nil {
+		t.Fatalf("set initial current revision: %v", err)
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r1' AND sealed = 1", 1)
+	if _, err := db.Exec("UPDATE environments SET current_revision_id = 'r1' WHERE id = 'e1'"); err != nil {
+		t.Fatalf("reassert sealed current revision: %v", err)
+	}
+
+	for _, statement := range []string{
+		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r1', 'new', 'new-value')",
+		"UPDATE revision_entries SET value = 'changed' WHERE revision_id = 'r1' AND key = 'key'",
+		"DELETE FROM revision_entries WHERE revision_id = 'r1' AND key = 'key'",
+		"INSERT OR REPLACE INTO revision_entries (revision_id, key, value) VALUES ('r1', 'key', 'replaced')",
+		"UPDATE OR REPLACE revision_entries SET value = 'replaced' WHERE revision_id = 'r1' AND key = 'key'",
+	} {
+		if _, err := db.Exec(statement); err == nil {
+			t.Fatalf("sealed revision entry mutation succeeded: %q", statement)
+		}
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM revision_entries WHERE revision_id = 'r1'", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM revision_entries WHERE revision_id = 'r1' AND key = 'key' AND value = 'initial'", 1)
+
+	for _, statement := range []string{
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('r2', 'e1', 2, 'u1', 2)",
+		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r2', 'key', 'second')",
+		"UPDATE environments SET current_revision_id = 'r2' WHERE id = 'e1'",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("create and publish second revision %q: %v", statement, err)
+		}
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id IN ('r1', 'r2') AND sealed = 1", 2)
+	if _, err := db.Exec("UPDATE revision_entries SET value = 'changed-again' WHERE revision_id = 'r1' AND key = 'key'"); err == nil {
+		t.Fatal("historical sealed revision entry update succeeded")
+	}
+	if _, err := db.Exec("DELETE FROM revisions WHERE id = 'r1'"); err == nil {
+		t.Fatal("direct historical revision delete succeeded")
+	}
+	if _, err := db.Exec("DELETE FROM revisions WHERE id = 'r2'"); err == nil {
+		t.Fatal("direct current revision delete succeeded")
+	}
+	for _, statement := range []string{
+		"UPDATE revisions SET sealed = 0 WHERE id = 'r1'",
+		"UPDATE revisions SET message = 'changed' WHERE id = 'r1'",
+	} {
+		if _, err := db.Exec(statement); err == nil {
+			t.Fatalf("sealed revision mutation succeeded: %q", statement)
+		}
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r1' AND sealed = 1 AND message = ''", 1)
+}
+
+func TestSchemaAllowsRevisionCascadesAfterEnvironmentAndProjectDeletion(t *testing.T) {
+	store := openTestStore(t)
+	db := store.DB()
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Environment One', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('r1', 'e1', 1, 'u1', 1)",
+		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r1', 'key', 'value')",
+		"UPDATE environments SET current_revision_id = 'r1' WHERE id = 'e1'",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("setup %q: %v", statement, err)
+		}
+	}
+	if _, err := db.Exec("DELETE FROM environments WHERE id = 'e1'"); err != nil {
+		t.Fatalf("delete environment with revision cascade: %v", err)
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r1'", 0)
+	assertRowCount(t, store, "SELECT count(*) FROM revision_entries WHERE revision_id = 'r1'", 0)
+
+	for _, statement := range []string{
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e2', 'p1', 'e2', 'Environment Two', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('r2', 'e2', 1, 'u1', 1)",
+		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r2', 'key', 'value')",
+		"UPDATE environments SET current_revision_id = 'r2' WHERE id = 'e2'",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("second setup %q: %v", statement, err)
+		}
+	}
+	if _, err := db.Exec("DELETE FROM projects WHERE id = 'p1'"); err != nil {
+		t.Fatalf("delete project with revision cascade: %v", err)
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'e2'", 0)
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r2'", 0)
+	assertRowCount(t, store, "SELECT count(*) FROM revision_entries WHERE revision_id = 'r2'", 0)
+}
+
+func TestSchemaRejectsNullSingleColumnPrimaryKeys(t *testing.T) {
+	store := openTestStore(t)
+	db := store.DB()
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Environment One', 1, 1)",
+		"INSERT INTO machine_identities (id, name, enabled, created_at, updated_at) VALUES ('m1', 'machine-one', 1, 1, 1)",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("setup %q: %v", statement, err)
+		}
+	}
+
+	for _, test := range []struct {
+		table     string
+		statement string
+	}{
+		{"users", "INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES (NULL, 'u2', 'User Two', 'hash', 'member', 1, 1, 1)"},
+		{"sessions", "INSERT INTO sessions (id, user_id, token_hash, csrf_hash, expires_at, created_at) VALUES (NULL, 'u1', x'01', x'02', 1, 1)"},
+		{"projects", "INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES (NULL, 'p2', 'Project Two', 'u1', 1, 1)"},
+		{"environments", "INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES (NULL, 'p1', 'e2', 'Environment Two', 1, 1)"},
+		{"revisions", "INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES (NULL, 'e1', 1, 'u1', 1)"},
+		{"machine_identities", "INSERT INTO machine_identities (id, name, enabled, created_at, updated_at) VALUES (NULL, 'machine-two', 1, 1, 1)"},
+		{"access_tokens", "INSERT INTO access_tokens (id, identity_id, name, prefix, token_hash, expires_at, created_at) VALUES (NULL, 'm1', 'token', 'prefix', x'03', 1, 1)"},
+	} {
+		t.Run(test.table, func(t *testing.T) {
+			if _, err := db.Exec(test.statement); err == nil {
+				t.Fatalf("NULL primary key succeeded for %s", test.table)
+			}
+		})
+	}
+}
+
+func TestOpenRestrictsDatabaseAndSidecarPermissions(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "shared-parent")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "confighub.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec("INSERT INTO machine_identities (id, name, enabled, created_at, updated_at) VALUES ('m1', 'machine-one', 1, 1, 1)"); err != nil {
+		t.Fatal(err)
+	}
+	assertDatabaseFilesPrivate(t, path)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertDatabaseFilesPrivate(t, path)
+
+	existingPath := filepath.Join(parent, "existing.db")
+	if err := os.WriteFile(existingPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(existingPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	existing, err := Open(existingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := existing.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertDatabaseFilesPrivate(t, existingPath)
+}
+
+func TestConnectionsReceiveSafetyPragmasAndImmediateTransactions(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	first, err := store.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := store.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	for _, conn := range []*sql.Conn{first, second} {
+		var foreignKeys, busyTimeout int
+		var journalMode string
+		if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&journalMode); err != nil {
+			t.Fatal(err)
+		}
+		if foreignKeys != 1 || busyTimeout != 5000 || journalMode != "wal" {
+			t.Fatalf("connection pragmas foreign_keys=%d busy_timeout=%d journal_mode=%q", foreignKeys, busyTimeout, journalMode)
+		}
+	}
+
+	firstTx, err := first.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstTx.Rollback()
+	if _, err := second.ExecContext(ctx, "PRAGMA busy_timeout = 25"); err != nil {
+		t.Fatal(err)
+	}
+	if secondTx, err := second.BeginTx(ctx, nil); err == nil {
+		_ = secondTx.Rollback()
+		t.Fatal("second BeginTx succeeded while first immediate transaction was open")
+	}
+	if err := firstTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	secondTx, err := second.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("second BeginTx after rollback: %v", err)
+	}
+	if err := secondTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOpenHandlesURISpecialCharactersInPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config hub ? #.db")
 	store, err := Open(path)
@@ -392,5 +628,21 @@ func assertRowCount(t *testing.T, store *Store, query string, want int) {
 	}
 	if got != want {
 		t.Fatalf("count = %d, want %d", got, want)
+	}
+}
+
+func assertDatabaseFilesPrivate(t *testing.T, path string) {
+	t.Helper()
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Stat(file)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("%s mode = %o, want no group or other bits", file, info.Mode().Perm())
+		}
 	}
 }

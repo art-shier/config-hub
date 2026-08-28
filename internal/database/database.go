@@ -33,6 +33,9 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
+	if err := ensurePrivateDatabaseFile(absPath); err != nil {
+		return nil, err
+	}
 
 	db, err := sql.Open(driverName, sqliteDSN(absPath))
 	if err != nil {
@@ -47,7 +50,38 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := hardenDatabaseFiles(absPath); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
+}
+
+func ensurePrivateDatabaseFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("create database file: %w", err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("restrict database file permissions: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close database file: %w", err)
+	}
+	return nil
+}
+
+func hardenDatabaseFiles(path string) error {
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(file, 0o600); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("restrict database file permissions: %w", err)
+		}
+	}
+	return nil
 }
 
 func sqliteDSN(path string) string {
@@ -86,6 +120,9 @@ func (s *Store) Ready(ctx context.Context) error {
 // InTx executes fn in an immediate SQLite transaction. Callback errors are
 // returned after rollback; a successful callback is committed.
 func (s *Store) InTx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
+	if fn == nil {
+		return errors.New("transaction callback is nil")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -107,9 +144,6 @@ func (s *Store) InTx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
 		}
 	}()
 
-	if fn == nil {
-		return errors.New("transaction callback is nil")
-	}
 	if callbackErr := fn(tx); callbackErr != nil {
 		return callbackErr
 	}
