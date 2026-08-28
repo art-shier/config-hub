@@ -1,0 +1,1 @@
+ConfigHub web assets are replaced by the Vite build.

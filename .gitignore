@@ -1,1 +1,11 @@
 .worktrees/
+
+# Go
+/bin/
+
+# Node and Vite
+web/node_modules/
+web/dist/
+internal/webui/dist/*
+!internal/webui/dist/bootstrap.txt
+*.tsbuildinfo
