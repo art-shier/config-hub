@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	sessionRandomBytes  = 32
-	sessionEncodedBytes = 43
-	sessionCookieLength = sessionEncodedBytes*2 + 1
+	sessionRandomBytes          = 32
+	sessionEncodedBytes         = 43
+	sessionCookieLength         = sessionEncodedBytes*2 + 1
+	credentialVerifyConcurrency = 2
 )
 
 var (
@@ -41,42 +42,70 @@ type SessionManager struct {
 }
 
 type CredentialService struct {
-	store *database.Store
+	store          *database.Store
+	verifyPassword func(string, string) bool
+	afterVerify    func()
+	verifyGate     chan struct{}
 }
 
 func NewCredentialService(store *database.Store) *CredentialService {
-	return &CredentialService{store: store}
+	return &CredentialService{store: store, verifyPassword: VerifyPassword, verifyGate: make(chan struct{}, credentialVerifyConcurrency)}
 }
 
 func (s *CredentialService) Authenticate(ctx context.Context, username, password string) (User, error) {
-	if s == nil {
-		return User{}, ErrInvalidCredentials
+	credential, err := s.Verify(ctx, username, password)
+	return credential.User, err
+}
+
+type VerifiedCredential struct {
+	User         User
+	passwordHash string
+}
+
+const dummyPasswordHash = "$argon2id$v=19$m=65536,t=3,p=2$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+// Verify performs exactly one password verification for every syntactically
+// valid, non-empty credential attempt, including missing and disabled users.
+func (s *CredentialService) Verify(ctx context.Context, username, password string) (VerifiedCredential, error) {
+	if s == nil || s.store == nil || s.verifyPassword == nil || s.verifyGate == nil || password == "" || !usernamePattern.MatchString(username) {
+		return VerifiedCredential{}, ErrInvalidCredentials
 	}
-	return AuthenticateCredentials(ctx, s.store, username, password)
+	var credential VerifiedCredential
+	var enabled int
+	exists := true
+	err := s.store.DB().QueryRowContext(ctx, `SELECT id, username, display_name, role, enabled, password_hash FROM users WHERE username = ?`, username).
+		Scan(&credential.User.ID, &credential.User.Username, &credential.User.DisplayName, &credential.User.Role, &enabled, &credential.passwordHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		exists = false
+		credential.passwordHash = dummyPasswordHash
+	} else if err != nil {
+		return VerifiedCredential{}, database.ClassifyError(fmt.Errorf("authenticate credentials: %w", err))
+	}
+	hashToVerify := credential.passwordHash
+	if _, _, ok := parsePasswordHash(hashToVerify); !ok {
+		hashToVerify = dummyPasswordHash
+	}
+	select {
+	case s.verifyGate <- struct{}{}:
+		defer func() { <-s.verifyGate }()
+	case <-ctx.Done():
+		return VerifiedCredential{}, ctx.Err()
+	}
+	matches := s.verifyPassword(hashToVerify, password)
+	if s.afterVerify != nil {
+		s.afterVerify()
+	}
+	credential.User.Enabled = enabled != 0
+	if !exists || !credential.User.Enabled || !matches || hashToVerify != credential.passwordHash {
+		return VerifiedCredential{}, ErrInvalidCredentials
+	}
+	return credential, nil
 }
 
 // AuthenticateCredentials verifies one enabled user using an exact username
 // match. Account lookup and password mismatches share one public error.
 func AuthenticateCredentials(ctx context.Context, store *database.Store, username, password string) (User, error) {
-	if store == nil || username == "" || password == "" {
-		return User{}, ErrInvalidCredentials
-	}
-	var user User
-	var passwordHash string
-	var enabled int
-	err := store.DB().QueryRowContext(ctx, `SELECT id, username, display_name, role, enabled, password_hash FROM users WHERE username = ? AND enabled = 1`, username).
-		Scan(&user.ID, &user.Username, &user.DisplayName, &user.Role, &enabled, &passwordHash)
-	if errors.Is(err, sql.ErrNoRows) {
-		return User{}, ErrInvalidCredentials
-	}
-	if err != nil {
-		return User{}, fmt.Errorf("authenticate credentials: %w", err)
-	}
-	if !VerifyPassword(passwordHash, password) {
-		return User{}, ErrInvalidCredentials
-	}
-	user.Enabled = enabled != 0
-	return user, nil
+	return NewCredentialService(store).Authenticate(ctx, username, password)
 }
 
 func NewSessionManager(store *database.Store, key []byte, ttl time.Duration) *SessionManager {
@@ -84,6 +113,17 @@ func NewSessionManager(store *database.Store, key []byte, ttl time.Duration) *Se
 }
 
 func (m *SessionManager) Create(ctx context.Context, user User) (IssuedSession, error) {
+	return m.create(ctx, user, "", false)
+}
+
+func (m *SessionManager) CreateVerified(ctx context.Context, credential VerifiedCredential) (IssuedSession, error) {
+	if credential.passwordHash == "" {
+		return IssuedSession{}, ErrInvalidCredentials
+	}
+	return m.create(ctx, credential.User, credential.passwordHash, true)
+}
+
+func (m *SessionManager) create(ctx context.Context, user User, expectedPasswordHash string, verified bool) (IssuedSession, error) {
 	if !m.valid() || !user.Enabled || user.ID == "" {
 		return IssuedSession{}, errors.New("cannot create session")
 	}
@@ -96,11 +136,28 @@ func (m *SessionManager) Create(ctx context.Context, user User) (IssuedSession, 
 	now := time.Now().UTC().Truncate(time.Second)
 	expires := now.Add(m.ttl)
 	err = m.store.InTx(ctx, func(tx *sql.Tx) error {
+		var enabled int
+		var currentPasswordHash string
+		if err := tx.QueryRowContext(ctx, `SELECT enabled, password_hash FROM users WHERE id = ?`, user.ID).Scan(&enabled, &currentPasswordHash); err != nil {
+			if verified && errors.Is(err, sql.ErrNoRows) {
+				return ErrInvalidCredentials
+			}
+			return err
+		}
+		if enabled != 1 || (verified && currentPasswordHash != expectedPasswordHash) {
+			if verified {
+				return ErrInvalidCredentials
+			}
+			return errors.New("session user is disabled")
+		}
 		_, err := tx.ExecContext(ctx, `INSERT INTO sessions (id, user_id, token_hash, csrf_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
 			uuid.NewString(), user.ID, SHA256(random), SHA256(csrf), expires.Unix(), now.Unix())
 		return err
 	})
 	if err != nil {
+		if verified && errors.Is(err, ErrInvalidCredentials) {
+			return IssuedSession{}, ErrInvalidCredentials
+		}
 		return IssuedSession{}, fmt.Errorf("create session: %w", err)
 	}
 	return IssuedSession{CookieValue: cookie, CSRFToken: csrf, ExpiresAt: expires}, nil
@@ -128,7 +185,7 @@ func (m *SessionManager) AuthenticateWithExpiry(ctx context.Context, cookie stri
 		return User{}, time.Time{}, ErrInvalidSession
 	}
 	if err != nil {
-		return User{}, time.Time{}, fmt.Errorf("authenticate session: %w", err)
+		return User{}, time.Time{}, database.ClassifyError(fmt.Errorf("authenticate session: %w", err))
 	}
 	user.Enabled = enabled != 0
 	return user, time.Unix(expires, 0).UTC(), nil
@@ -163,7 +220,7 @@ func (m *SessionManager) Revoke(ctx context.Context, cookie string) error {
 	}
 	_, err := m.store.DB().ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = ?`, SHA256(random))
 	if err != nil {
-		return fmt.Errorf("revoke session: %w", err)
+		return database.ClassifyError(fmt.Errorf("revoke session: %w", err))
 	}
 	return nil
 }

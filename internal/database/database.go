@@ -9,10 +9,28 @@ import (
 	"os"
 	"path/filepath"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 const driverName = "sqlite"
+
+var ErrBusy = errors.New("database temporarily unavailable")
+
+// ClassifyError adds a stable availability sentinel for SQLite BUSY/LOCKED
+// errors while retaining the original driver error in the unwrap chain.
+func ClassifyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		switch sqliteErr.Code() & 0xff {
+		case 5, 6:
+			return errors.Join(ErrBusy, err)
+		}
+	}
+	return err
+}
 
 // Store owns the database connection pool.
 type Store struct {
@@ -135,7 +153,7 @@ func (s *Store) InTx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return ClassifyError(fmt.Errorf("begin transaction: %w", err))
 	}
 
 	defer func() {
@@ -147,11 +165,10 @@ func (s *Store) InTx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
 			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 				err = fmt.Errorf("%w (rollback transaction: %v)", err, rollbackErr)
 			}
-			return
-		}
-		if commitErr := tx.Commit(); commitErr != nil {
+		} else if commitErr := tx.Commit(); commitErr != nil {
 			err = fmt.Errorf("commit transaction: %w", commitErr)
 		}
+		err = ClassifyError(err)
 	}()
 
 	if callbackErr := fn(tx); callbackErr != nil {

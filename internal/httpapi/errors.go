@@ -2,11 +2,22 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+
+	"confighub.local/internal/database"
 )
 
 type errorEnvelope struct {
 	Error apiError `json:"error"`
+}
+
+func writeOperationalError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, database.ErrBusy) {
+		writeError(w, r, http.StatusServiceUnavailable, "service_unavailable", "Service temporarily unavailable")
+		return
+	}
+	writeError(w, r, http.StatusInternalServerError, "internal_error", "Internal server error")
 }
 
 type apiError struct {

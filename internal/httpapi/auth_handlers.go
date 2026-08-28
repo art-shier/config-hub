@@ -56,20 +56,25 @@ func (h *authHandlers) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusTooManyRequests, "rate_limited", "Too many login attempts")
 		return
 	}
-	user, err := h.credentials.Authenticate(r.Context(), input.Username, input.Password)
+	credential, err := h.credentials.Verify(r.Context(), input.Username, input.Password)
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidCredentials) {
 			writeError(w, r, http.StatusUnauthorized, "invalid_credentials", "Invalid username or password")
 		} else {
-			writeError(w, r, http.StatusInternalServerError, "internal_error", "Internal server error")
+			writeOperationalError(w, r, err)
 		}
 		return
 	}
-	issued, err := h.sessions.Create(r.Context(), user)
+	issued, err := h.sessions.CreateVerified(r.Context(), credential)
 	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "internal_error", "Internal server error")
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			writeError(w, r, http.StatusUnauthorized, "invalid_credentials", "Invalid username or password")
+		} else {
+			writeOperationalError(w, r, err)
+		}
 		return
 	}
+	user := credential.User
 	h.setSessionCookie(w, issued.CookieValue, issued.ExpiresAt)
 	writeJSON(w, http.StatusOK, sessionResponse{User: publicUser(user), CSRFToken: issued.CSRFToken, ExpiresAt: issued.ExpiresAt})
 }
@@ -92,7 +97,7 @@ func (h *authHandlers) logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.sessions.Revoke(r.Context(), cookie.Value); err != nil {
-		writeError(w, r, http.StatusInternalServerError, "internal_error", "Internal server error")
+		writeOperationalError(w, r, err)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: SessionCookieName, Value: "", Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, Expires: time.Unix(1, 0).UTC(), MaxAge: -1})
@@ -122,7 +127,7 @@ func writeSessionAuthenticationError(w http.ResponseWriter, r *http.Request, err
 		writeError(w, r, http.StatusUnauthorized, "invalid_session", "Invalid or expired session")
 		return
 	}
-	writeError(w, r, http.StatusInternalServerError, "internal_error", "Internal server error")
+	writeOperationalError(w, r, err)
 }
 
 func (h *authHandlers) sessionCookie(w http.ResponseWriter, r *http.Request) (*http.Cookie, bool) {

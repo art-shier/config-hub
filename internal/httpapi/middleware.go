@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -39,10 +41,18 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 func recoveryMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
-			if recover() != nil {
-				logger.Error("request handler panic recovered", "request_id", requestIDFromContext(r.Context()))
-				writeError(w, r, http.StatusInternalServerError, "internal_error", "Internal server error")
+			recovered := recover()
+			if recovered == nil {
+				return
 			}
+			if recovered == http.ErrAbortHandler {
+				panic(http.ErrAbortHandler)
+			}
+			logger.Error("request handler panic recovered", "request_id", requestIDFromContext(r.Context()))
+			if state, ok := w.(interface{ Committed() bool }); ok && state.Committed() {
+				panic(http.ErrAbortHandler)
+			}
+			writeError(w, r, http.StatusInternalServerError, "internal_error", "Internal server error")
 		}()
 		next.ServeHTTP(w, r)
 	})
@@ -59,8 +69,21 @@ func securityMiddleware(next http.Handler) http.Handler {
 			writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "Request body is too large")
 			return
 		}
-		if r.Body != nil {
-			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		if r.Body != nil && r.Body != http.NoBody {
+			original := r.Body
+			limited := http.MaxBytesReader(w, original, maxRequestBodyBytes)
+			body, err := io.ReadAll(limited)
+			_ = original.Close()
+			if err != nil {
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "Request body is too large")
+				} else {
+					writeError(w, r, http.StatusBadRequest, "malformed_request", "Malformed request body")
+				}
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -87,6 +110,23 @@ func (w *responseCapture) Write(p []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(p)
 	w.bytes += n
 	return n, err
+}
+
+func (w *responseCapture) Committed() bool {
+	return w.status != 0
+}
+
+func (w *responseCapture) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *responseCapture) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func accessLogMiddleware(logger *slog.Logger, sourceIP func(*http.Request) string, next http.Handler) http.Handler {
@@ -180,21 +220,27 @@ type loginBucket struct {
 }
 
 type loginLimiter struct {
-	mu             sync.Mutex
-	buckets        map[string]loginBucket
-	capacity       float64
-	refillInterval time.Duration
-	maxEntries     int
-	now            func() time.Time
-	operations     uint64
+	mu               sync.Mutex
+	buckets          map[string]loginBucket
+	sourceBuckets    map[string]loginBucket
+	capacity         float64
+	sourceCapacity   float64
+	refillInterval   time.Duration
+	maxEntries       int
+	sourceMaxEntries int
+	now              func() time.Time
+	nextCleanup      time.Time
 }
 
 func newLoginLimiter(options RateLimitOptions, now func() time.Time) (*loginLimiter, error) {
-	if options.Capacity < 0 || options.RefillInterval < 0 || options.MaxEntries < 0 {
+	if options.Capacity < 0 || options.SourceCapacity < 0 || options.RefillInterval < 0 || options.MaxEntries < 0 || options.SourceMaxEntries < 0 {
 		return nil, errors.New("invalid login rate limit options")
 	}
 	if options.Capacity == 0 {
 		options.Capacity = 5
+	}
+	if options.SourceCapacity == 0 {
+		options.SourceCapacity = 20
 	}
 	if options.RefillInterval == 0 {
 		options.RefillInterval = time.Minute
@@ -202,10 +248,18 @@ func newLoginLimiter(options RateLimitOptions, now func() time.Time) (*loginLimi
 	if options.MaxEntries == 0 {
 		options.MaxEntries = 4096
 	}
+	if options.SourceMaxEntries == 0 {
+		options.SourceMaxEntries = 2048
+	}
 	if now == nil {
 		now = time.Now
 	}
-	return &loginLimiter{buckets: make(map[string]loginBucket), capacity: float64(options.Capacity), refillInterval: options.RefillInterval, maxEntries: options.MaxEntries, now: now}, nil
+	return &loginLimiter{
+		buckets: make(map[string]loginBucket), sourceBuckets: make(map[string]loginBucket),
+		capacity: float64(options.Capacity), sourceCapacity: float64(options.SourceCapacity),
+		refillInterval: options.RefillInterval, maxEntries: options.MaxEntries,
+		sourceMaxEntries: options.SourceMaxEntries, now: now,
+	}, nil
 }
 
 // Allow consumes one token for every login attempt. Username matching for the
@@ -216,21 +270,27 @@ func (l *loginLimiter) Allow(sourceIP, username string) bool {
 	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.operations++
-	if l.operations%256 == 0 {
+	if l.nextCleanup.IsZero() || !now.Before(l.nextCleanup) {
 		l.cleanup(now)
 	}
-	bucket, exists := l.buckets[key]
+	if !l.consume(l.sourceBuckets, sourceIP, l.sourceCapacity, l.sourceMaxEntries, now) {
+		return false
+	}
+	return l.consume(l.buckets, key, l.capacity, l.maxEntries, now)
+}
+
+func (l *loginLimiter) consume(buckets map[string]loginBucket, key string, capacity float64, maxEntries int, now time.Time) bool {
+	bucket, exists := buckets[key]
 	if !exists {
-		if len(l.buckets) >= l.maxEntries {
-			l.evictOldest()
+		if len(buckets) >= maxEntries {
+			return false
 		}
-		bucket = loginBucket{tokens: l.capacity, updated: now}
+		bucket = loginBucket{tokens: capacity, updated: now}
 	}
 	if elapsed := now.Sub(bucket.updated); elapsed > 0 {
 		bucket.tokens += float64(elapsed) / float64(l.refillInterval)
-		if bucket.tokens > l.capacity {
-			bucket.tokens = l.capacity
+		if bucket.tokens > capacity {
+			bucket.tokens = capacity
 		}
 		bucket.updated = now
 	}
@@ -239,7 +299,7 @@ func (l *loginLimiter) Allow(sourceIP, username string) bool {
 	if allowed {
 		bucket.tokens--
 	}
-	l.buckets[key] = bucket
+	buckets[key] = bucket
 	return allowed
 }
 
@@ -253,17 +313,10 @@ func (l *loginLimiter) cleanup(now time.Time) {
 			delete(l.buckets, key)
 		}
 	}
-}
-
-func (l *loginLimiter) evictOldest() {
-	var oldestKey string
-	var oldest time.Time
-	for key, bucket := range l.buckets {
-		if oldestKey == "" || bucket.lastSeen.Before(oldest) {
-			oldestKey, oldest = key, bucket.lastSeen
+	for key, bucket := range l.sourceBuckets {
+		if now.Sub(bucket.lastSeen) > idleLimit {
+			delete(l.sourceBuckets, key)
 		}
 	}
-	if oldestKey != "" {
-		delete(l.buckets, oldestKey)
-	}
+	l.nextCleanup = now.Add(idleLimit)
 }

@@ -7,7 +7,48 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"modernc.org/sqlite"
 )
+
+func TestInTxClassifiesSQLiteBusyAndPreservesDriverError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "busy.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.DB().SetMaxOpenConns(1)
+	if _, err := store.DB().Exec(`PRAGMA busy_timeout=1`); err != nil {
+		t.Fatal(err)
+	}
+	locker, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+	if _, err := locker.Exec(`PRAGMA busy_timeout=1`); err != nil {
+		t.Fatal(err)
+	}
+	lockTx, err := locker.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockTx.Rollback()
+	if _, err := lockTx.Exec(`INSERT INTO machine_identities (id, name, enabled, created_at, updated_at) VALUES ('lock', 'lock', 1, 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.InTx(context.Background(), func(*sql.Tx) error { return nil })
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("error=%v", err)
+	}
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != 5 {
+		t.Fatalf("driver error not preserved: error=%v sqlite=%v", err, sqliteErr)
+	}
+}
 
 func TestOpenMigratesAndEnablesSQLiteSafety(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "confighub.db"))

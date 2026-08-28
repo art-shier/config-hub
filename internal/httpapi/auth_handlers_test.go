@@ -3,7 +3,10 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -104,6 +107,22 @@ func TestDeclaredOversizedBodyIsRejectedBeforeRouteChecks(t *testing.T) {
 	}
 }
 
+func TestChunkedOversizedLogoutBodyIsRejected(t *testing.T) {
+	handler, _, _ := testRouter(t, nil)
+	cookie, csrf := loginSession(t, handler)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", strings.NewReader(strings.Repeat("x", int(maxRequestBodyBytes)+1)))
+	request.ContentLength = -1
+	request.TransferEncoding = []string{"chunked"}
+	request.AddCookie(cookie)
+	request.Header.Set("Origin", testOrigin)
+	request.Header.Set(CSRFHeaderName, csrf)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge || responseErrorCode(t, response) != "request_too_large" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestPanicRecoverySecurityHeadersAndRedactedLogs(t *testing.T) {
 	const secret = "DO_NOT_LOG_secret_password_token"
 	handler, _, logs := testRouter(t, func(options *Options) {
@@ -134,6 +153,53 @@ func TestPanicRecoverySecurityHeadersAndRedactedLogs(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `route="GET /api/v1/test/panic"`) || !strings.Contains(logs.String(), "status=500") || !strings.Contains(logs.String(), "source_ip=198.51.100.7") {
 		t.Fatalf("safe access fields missing: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), fmt.Sprintf("bytes=%d", response.Body.Len())) {
+		t.Fatalf("panic response bytes not captured: body=%d logs=%s", response.Body.Len(), logs.String())
+	}
+}
+
+func TestPanicAfterResponseCommitAbortsWithoutAppendingJSON(t *testing.T) {
+	const secret = "PANIC_VALUE_MUST_NOT_BE_LOGGED"
+	handler, _, logs := testRouter(t, func(options *Options) {
+		options.Register = func(mux *http.ServeMux) {
+			mux.HandleFunc("GET /api/v1/test/panic-header", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+				w.(http.Flusher).Flush()
+				panic(secret)
+			})
+			mux.HandleFunc("GET /api/v1/test/panic-body", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte("prefix"))
+				w.(http.Flusher).Flush()
+				panic(secret)
+			})
+		}
+	})
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	for _, test := range []struct {
+		path, wantBody string
+	}{
+		{path: "/api/v1/test/panic-header"},
+		{path: "/api/v1/test/panic-body", wantBody: "prefix"},
+	} {
+		response, err := server.Client().Get(server.URL + test.path)
+		if err != nil {
+			t.Fatalf("%s request error=%v", test.path, err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusAccepted || string(body) != test.wantBody || readErr == nil {
+			t.Fatalf("%s status=%d body=%q readErr=%v", test.path, response.StatusCode, body, readErr)
+		}
+		if strings.Contains(string(body), "internal_error") || strings.Contains(string(body), secret) {
+			t.Fatalf("%s appended/leaked panic response: %q", test.path, body)
+		}
+	}
+	server.Close()
+	if strings.Contains(logs.String(), secret) || !strings.Contains(logs.String(), "status=202") || !strings.Contains(logs.String(), "bytes=6") {
+		t.Fatalf("unsafe or inaccurate panic logs: %s", logs.String())
 	}
 }
 
@@ -191,6 +257,44 @@ func TestLoginRateLimitUsesSourceAndLowercaseUsernameWithClockSeam(t *testing.T)
 	}
 }
 
+func TestLoginSourceRateLimitCannotBeBypassedByRotatingUsernames(t *testing.T) {
+	handler, _, _ := testRouter(t, func(options *Options) {
+		options.RateLimit = RateLimitOptions{Capacity: 5, SourceCapacity: 2, RefillInterval: time.Hour, MaxEntries: 32}
+	})
+	for _, username := range []string{"first", "second"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, loginRequestFor(t, username, "wrong", "198.51.100.30:1234"))
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("username=%s status=%d", username, response.Code)
+		}
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, loginRequestFor(t, "third", "wrong", "198.51.100.30:1234"))
+	if response.Code != http.StatusTooManyRequests || responseErrorCode(t, response) != "rate_limited" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestLoginRateLimitCapacityFailsClosedWithoutResettingExistingPenalty(t *testing.T) {
+	handler, _, _ := testRouter(t, func(options *Options) {
+		options.RateLimit = RateLimitOptions{Capacity: 1, SourceCapacity: 100, RefillInterval: time.Hour, MaxEntries: 2, SourceMaxEntries: 8}
+	})
+	for _, username := range []string{"target", "other"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, loginRequestFor(t, username, "wrong", "198.51.100.31:1234"))
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("username=%s status=%d", username, response.Code)
+		}
+	}
+	for _, username := range []string{"new-key", "target"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, loginRequestFor(t, username, "wrong", "198.51.100.31:1234"))
+		if response.Code != http.StatusTooManyRequests || responseErrorCode(t, response) != "rate_limited" {
+			t.Fatalf("username=%s status=%d body=%s", username, response.Code, response.Body.String())
+		}
+	}
+}
+
 func loginRequestFor(t *testing.T, username, password, remoteAddr string) *http.Request {
 	t.Helper()
 	body, err := json.Marshal(loginRequest{Username: username, Password: password})
@@ -218,6 +322,50 @@ func TestLoginRejectsWrongPasswordAndDisabledAccountUniformly(t *testing.T) {
 	}
 	if got := loginErrorCode(t, handler, "missing", "secret"); got != wantCode {
 		t.Fatalf("missing code=%q want=%q", got, wantCode)
+	}
+}
+
+type snapshotCredentials struct {
+	credential auth.VerifiedCredential
+}
+
+func (s snapshotCredentials) Authenticate(context.Context, string, string) (auth.User, error) {
+	return s.credential.User, nil
+}
+
+func (s snapshotCredentials) Verify(context.Context, string, string) (auth.VerifiedCredential, error) {
+	return s.credential, nil
+}
+
+func TestLoginRejectsCredentialSnapshotAfterPasswordRotation(t *testing.T) {
+	store, err := database.Open(filepath.Join(t.TempDir(), "config-hub.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	oldFile := auth.UserFile{Users: []auth.UserSpec{{Username: "admin", DisplayName: "Admin", Password: "old", Role: "admin", Enabled: true}}}
+	if _, err := auth.NewUserSyncer(store).Sync(context.Background(), oldFile); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := auth.NewCredentialService(store).Verify(context.Background(), "admin", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFile := auth.UserFile{Users: []auth.UserSpec{{Username: "admin", DisplayName: "Admin", Password: "new", Role: "admin", Enabled: true}}}
+	if _, err := auth.NewUserSyncer(store).Sync(context.Background(), newFile); err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewRouter(Dependencies{
+		Credentials: snapshotCredentials{credential: credential},
+		Sessions:    auth.NewSessionManager(store, []byte("01234567890123456789012345678901"), time.Hour),
+	}, Options{PublicOrigin: testOrigin, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, loginRequestFor(t, "admin", "old", "198.51.100.1:1234"))
+	if response.Code != http.StatusUnauthorized || responseErrorCode(t, response) != "invalid_credentials" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -331,6 +479,56 @@ func TestSessionDatabaseFailureMapsToSafeInternalError(t *testing.T) {
 	}
 	if strings.Contains(response.Body.String(), "sql") || strings.Contains(response.Body.String(), "closed") || strings.Contains(logs.String(), cookie.Value) {
 		t.Fatalf("operational details leaked: body=%s logs=%s", response.Body.String(), logs.String())
+	}
+}
+
+func TestLoginSQLiteBusyMapsToServiceUnavailable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "busy-http.db")
+	store, err := database.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	file := auth.UserFile{Users: []auth.UserSpec{{Username: "admin", DisplayName: "Admin", Password: "secret", Role: "admin", Enabled: true}}}
+	if _, err := auth.NewUserSyncer(store).Sync(context.Background(), file); err != nil {
+		t.Fatal(err)
+	}
+	store.DB().SetMaxOpenConns(1)
+	if _, err := store.DB().Exec(`PRAGMA busy_timeout=1`); err != nil {
+		t.Fatal(err)
+	}
+	locker, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+	if _, err := locker.Exec(`PRAGMA busy_timeout=1`); err != nil {
+		t.Fatal(err)
+	}
+	lockTx, err := locker.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockTx.Rollback()
+	if _, err := lockTx.Exec(`INSERT INTO machine_identities (id, name, enabled, created_at, updated_at) VALUES ('lock', 'lock', 1, 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	logs := new(bytes.Buffer)
+	handler, err := NewRouter(Dependencies{
+		Credentials: auth.NewCredentialService(store),
+		Sessions:    auth.NewSessionManager(store, []byte("01234567890123456789012345678901"), time.Hour),
+	}, Options{PublicOrigin: testOrigin, Logger: slog.New(slog.NewTextHandler(logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, loginRequestFor(t, "admin", "secret", "198.51.100.40:1234"))
+	if response.Code != http.StatusServiceUnavailable || responseErrorCode(t, response) != "service_unavailable" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "locked") || strings.Contains(response.Body.String(), "SQLITE") || strings.Contains(logs.String(), "locked") {
+		t.Fatalf("database details leaked: body=%s logs=%s", response.Body.String(), logs.String())
 	}
 }
 

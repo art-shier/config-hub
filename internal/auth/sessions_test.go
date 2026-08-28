@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,6 +182,116 @@ func TestSessionDatabaseFailureIsNotInvalidSession(t *testing.T) {
 	if err == nil || errors.Is(err, ErrInvalidSession) {
 		t.Fatalf("database error=%v", err)
 	}
+}
+
+func TestCredentialServiceVerifiesEveryExistingAndMissingAccountOnce(t *testing.T) {
+	store := testStoreWithUser(t, "admin", "secret")
+	service := NewCredentialService(store)
+	calls := 0
+	service.verifyPassword = func(hash, password string) bool {
+		calls++
+		return VerifyPassword(hash, password)
+	}
+
+	assertInvalidOnce := func(username, password string) {
+		t.Helper()
+		calls = 0
+		_, err := service.Verify(context.Background(), username, password)
+		if !errors.Is(err, ErrInvalidCredentials) || calls != 1 {
+			t.Fatalf("username=%q err=%v verify calls=%d", username, err, calls)
+		}
+	}
+	assertInvalidOnce("admin", "wrong")
+	assertInvalidOnce("missing", "wrong")
+	if _, err := store.DB().Exec(`UPDATE users SET enabled = 0 WHERE username = 'admin'`); err != nil {
+		t.Fatal(err)
+	}
+	assertInvalidOnce("admin", "secret")
+	if _, err := store.DB().Exec(`UPDATE users SET enabled = 1, password_hash = 'malformed' WHERE username = 'admin'`); err != nil {
+		t.Fatal(err)
+	}
+	assertInvalidOnce("admin", "secret")
+}
+
+func TestPasswordRotationBetweenVerifyAndSessionInsertRejectsOldCredential(t *testing.T) {
+	ctx := context.Background()
+	store := testStoreWithUser(t, "admin", "old-password")
+	service := NewCredentialService(store)
+	verified := make(chan struct{})
+	resume := make(chan struct{})
+	service.afterVerify = func() {
+		close(verified)
+		<-resume
+	}
+
+	type result struct {
+		credential VerifiedCredential
+		err        error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		credential, err := service.Verify(ctx, "admin", "old-password")
+		resultCh <- result{credential: credential, err: err}
+	}()
+	<-verified
+	file := UserFile{Users: []UserSpec{{Username: "admin", DisplayName: "Admin", Password: "new-password", Role: "admin", Enabled: true}}}
+	if _, err := NewUserSyncer(store).Sync(ctx, file); err != nil {
+		t.Fatal(err)
+	}
+	close(resume)
+	verifiedResult := <-resultCh
+	if verifiedResult.err != nil {
+		t.Fatal(verifiedResult.err)
+	}
+	manager := NewSessionManager(store, []byte("01234567890123456789012345678901"), time.Hour)
+	if _, err := manager.CreateVerified(ctx, verifiedResult.credential); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("create error=%v", err)
+	}
+	if count := countSessions(t, store, verifiedResult.credential.User.ID); count != 0 {
+		t.Fatalf("old credential created %d sessions", count)
+	}
+}
+
+func TestCredentialServiceBoundsConcurrentPasswordVerification(t *testing.T) {
+	store := testStoreWithUser(t, "admin", "secret")
+	service := NewCredentialService(store)
+	started := make(chan struct{}, credentialVerifyConcurrency+1)
+	release := make(chan struct{})
+	service.verifyPassword = func(string, string) bool {
+		started <- struct{}{}
+		<-release
+		return false
+	}
+
+	var workers sync.WaitGroup
+	for range credentialVerifyConcurrency {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			_, _ = service.Verify(context.Background(), "admin", "wrong")
+		}()
+	}
+	for range credentialVerifyConcurrency {
+		<-started
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := service.Verify(ctx, "admin", "wrong")
+		result <- err
+	}()
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued verification error=%v", err)
+	}
+	select {
+	case <-started:
+		t.Fatal("verification concurrency exceeded gate capacity")
+	default:
+	}
+	close(release)
+	workers.Wait()
 }
 
 func testStoreWithUser(t *testing.T, username, password string) *database.Store {

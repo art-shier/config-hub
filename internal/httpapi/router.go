@@ -18,7 +18,7 @@ const (
 )
 
 type CredentialAuthenticator interface {
-	Authenticate(context.Context, string, string) (auth.User, error)
+	Verify(context.Context, string, string) (auth.VerifiedCredential, error)
 }
 
 type Dependencies struct {
@@ -27,9 +27,11 @@ type Dependencies struct {
 }
 
 type RateLimitOptions struct {
-	Capacity       int
-	RefillInterval time.Duration
-	MaxEntries     int
+	Capacity         int
+	SourceCapacity   int
+	RefillInterval   time.Duration
+	MaxEntries       int
+	SourceMaxEntries int
 }
 
 type Options struct {
@@ -89,8 +91,8 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	handlers.sourceIP = sourceIP
 	handlers.limiter = limiter
 	handler := securityMiddleware(mux)
-	handler = accessLogMiddleware(logger, sourceIP, handler)
 	handler = recoveryMiddleware(logger, handler)
+	handler = accessLogMiddleware(logger, sourceIP, handler)
 	handler = requestIDMiddleware(handler)
 	return handler, nil
 }
