@@ -1,0 +1,19 @@
+# Copy this file to config.yaml and restrict it with: chmod 600 config.yaml
+server:
+  listen: 127.0.0.1:8080
+  public_url: https://config.example.com
+  trusted_proxy_cidrs:
+    - 127.0.0.1/32
+    - ::1/128
+
+database:
+  path: ../data/confighub.db
+
+auth:
+  users_file: ./users.yaml
+  # session.key is a secret and must also have permissions no broader than 0600.
+  session_key_file: ./session.key
+  session_ttl: 24h
+
+backup:
+  directory: ../backups

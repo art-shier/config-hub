@@ -1,0 +1,13 @@
+# Copy this file to users.yaml, set its permissions to 0600, and never commit it.
+users:
+  - username: admin
+    display_name: Administrator
+    password: change-me
+    role: admin
+    enabled: true
+
+  - username: developer-a
+    display_name: Developer A
+    password: another-password
+    role: member
+    enabled: true
