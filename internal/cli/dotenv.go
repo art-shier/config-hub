@@ -15,6 +15,9 @@ func EncodeDotenv(values map[string]string) (string, error) {
 		if !environmentKeyPattern.MatchString(key) {
 			return "", errors.New("invalid environment variable name")
 		}
+		if !validEnvironmentValue(values[key]) {
+			return "", errors.New("invalid environment variable value")
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
@@ -27,4 +30,8 @@ func EncodeDotenv(values map[string]string) (string, error) {
 		output.WriteString("'\n")
 	}
 	return output.String(), nil
+}
+
+func validEnvironmentValue(value string) bool {
+	return !strings.ContainsRune(value, '\x00')
 }

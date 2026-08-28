@@ -82,6 +82,59 @@ func TestClientRejectsResponseWithoutRevisionField(t *testing.T) {
 	}
 }
 
+func TestClientRejectsInvalidSuccessfulResponses(t *testing.T) {
+	invalidUTF8 := append([]byte(`{"project":"shop","environment":"production","revision":1,"values":{"KEY":"`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}}`)...)
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "invalid UTF-8", body: invalidUTF8},
+		{name: "duplicate top-level field", body: []byte(`{"project":"other","project":"shop","environment":"production","revision":1,"values":{}}`)},
+		{name: "duplicate value key", body: []byte(`{"project":"shop","environment":"production","revision":1,"values":{"KEY":"first","KEY":"second"}}`)},
+		{name: "unsafe value key", body: []byte(`{"project":"shop","environment":"production","revision":1,"values":{"BAD-NAME":"value"}}`)},
+		{name: "zero revision with values", body: []byte(`{"project":"shop","environment":"production","revision":0,"values":{"KEY":"value"}}`)},
+		{name: "unpaired high surrogate", body: []byte(`{"project":"shop","environment":"production","revision":1,"values":{"KEY":"\ud800"}}`)},
+		{name: "unpaired low surrogate", body: []byte(`{"project":"shop","environment":"production","revision":1,"values":{"KEY":"\udc00"}}`)},
+		{name: "trailing JSON", body: []byte(`{"project":"shop","environment":"production","revision":1,"values":{}} {}`)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(test.body)
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := client.FetchConfig(context.Background(), "shop", "production", ""); err == nil {
+				t.Fatal("FetchConfig accepted an invalid successful response")
+			}
+		})
+	}
+}
+
+func TestClientAcceptsUnicodeAndPairedSurrogateInSuccessfulResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"project":"shop","environment":"production","revision":1,"values":{"UNICODE":"雪-\ud83d\ude03"}}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := client.FetchConfig(context.Background(), "shop", "production", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := response.Values["UNICODE"], "雪-😃"; got != want {
+		t.Fatalf("value=%q want=%q", got, want)
+	}
+}
+
 func TestClientRejectsUnsafeProjectAndEnvironmentBeforeRequest(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -114,6 +167,48 @@ func TestClientRejectsUnsafeProjectAndEnvironmentBeforeRequest(t *testing.T) {
 	}
 	if got := attempts.Load(); got != 0 {
 		t.Fatalf("unsafe slugs caused %d requests", got)
+	}
+}
+
+func TestClientValidatesServiceBeforeRequest(t *testing.T) {
+	var attempts atomic.Int32
+	var gotService string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		gotService = r.URL.Query().Get("service")
+		_, _ = io.WriteString(w, `{"project":"shop","environment":"production","revision":1,"values":{}}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		service string
+	}{
+		{name: "invalid UTF-8", service: string([]byte{0xff})},
+		{name: "too long", service: strings.Repeat("s", 129)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := client.FetchConfig(context.Background(), "shop", "production", test.service); err == nil {
+				t.Fatalf("FetchConfig accepted invalid service of %d bytes", len(test.service))
+			}
+		})
+	}
+	if attempts.Load() != 0 {
+		t.Fatalf("invalid services caused %d requests", attempts.Load())
+	}
+
+	service := strings.Repeat("界", 42) + "ab"
+	if len(service) != 128 {
+		t.Fatalf("boundary fixture is %d bytes", len(service))
+	}
+	if _, err := client.FetchConfig(context.Background(), "shop", "production", service); err != nil {
+		t.Fatal(err)
+	}
+	if attempts.Load() != 1 || gotService != service {
+		t.Fatalf("attempts=%d service=%q", attempts.Load(), gotService)
 	}
 }
 
@@ -263,6 +358,118 @@ func TestClientErrorsDoNotLeakTokenResponseBodyOrConfig(t *testing.T) {
 	assertErrorOmits(t, err, configSecret, token)
 }
 
+func TestClientClassifiesRuntimeFailuresWithoutLeakingCauses(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport http.RoundTripper
+		want      error
+		secret    string
+	}{
+		{
+			name:   "transport",
+			want:   errRequestTransport,
+			secret: "TRANSPORT_CAUSE_SECRET",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("TRANSPORT_CAUSE_SECRET")
+			}),
+		},
+		{
+			name: "timeout",
+			want: context.DeadlineExceeded,
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.DeadlineExceeded
+			}),
+		},
+		{
+			name:   "response read",
+			want:   errResponseRead,
+			secret: "RESPONSE_READ_CAUSE_SECRET",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				body := io.NopCloser(readerFunc(func([]byte) (int, error) {
+					return 0, errors.New("RESPONSE_READ_CAUSE_SECRET")
+				}))
+				return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
+			}),
+		},
+		{
+			name: "response too large",
+			want: errResponseTooLarge,
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				body := io.NopCloser(strings.NewReader(strings.Repeat("x", maxResponseBodyBytes+1)))
+				return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
+			}),
+		},
+		{
+			name:   "invalid response",
+			want:   errInvalidResponse,
+			secret: "INVALID_RESPONSE_CONFIG_SECRET",
+			transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				body := io.NopCloser(strings.NewReader(`{"project":"shop","environment":"production","revision":1,"values":{"KEY":"INVALID_RESPONSE_CONFIG_SECRET"}`))
+				return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
+			}),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := NewClient("https://config.example.com/private-sensitive-path", "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.http.Transport = test.transport
+			_, err = client.FetchConfig(context.Background(), "shop", "production", "")
+			if !errors.Is(err, test.want) {
+				t.Fatalf("error=%v want category %v", err, test.want)
+			}
+			secrets := []string{"private-sensitive-path", "token"}
+			if test.secret != "" {
+				secrets = append(secrets, test.secret)
+			}
+			assertErrorOmits(t, err, secrets...)
+		})
+	}
+}
+
+func TestClientPrioritizesContextErrorWhenResponseReadFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client, err := NewClient("https://config.example.com", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.http.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		body := io.NopCloser(readerFunc(func([]byte) (int, error) {
+			cancel()
+			return 0, errors.New("READ_CAUSE_SECRET")
+		}))
+		return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
+	})
+
+	_, err = client.FetchConfig(ctx, "shop", "production", "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v want context canceled", err)
+	}
+	assertErrorOmits(t, err, "READ_CAUSE_SECRET", "token")
+}
+
+func TestClientPreservesAPIStatusForMalformedErrorBody(t *testing.T) {
+	const bodySecret = "MALFORMED_API_BODY_SECRET"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, bodySecret)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.FetchConfig(context.Background(), "shop", "production", "")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadGateway {
+		t.Fatalf("error=%T %v", err, err)
+	}
+	assertErrorOmits(t, err, bodySecret, "token")
+}
+
 func TestClientDoesNotFollowRedirects(t *testing.T) {
 	var targetRequests atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -308,6 +515,10 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
 }
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(value []byte) (int, error) { return f(value) }
 
 func assertErrorOmits(t *testing.T, err error, secrets ...string) {
 	t.Helper()

@@ -14,6 +14,11 @@ import (
 
 const maxTokenFileBytes = 4096
 
+const (
+	maxDiagnosticCodeBytes      = 64
+	maxDiagnosticRequestIDBytes = 128
+)
+
 var (
 	errCommandUsage = errors.New("command usage error")
 	errLocalInput   = errors.New("local input error")
@@ -37,7 +42,7 @@ func Execute(ctx context.Context, args []string, getenv func(string) string, std
 	case err == nil:
 		return 0
 	case errors.Is(err, errRuntime):
-		fmt.Fprintln(stderr, "confighub: export failed")
+		fmt.Fprintln(stderr, runtimeDiagnostic(err))
 		return 1
 	default:
 		fmt.Fprintln(stderr, "confighub: invalid command usage")
@@ -69,7 +74,7 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 		Short: "Export the current configuration",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			if (format != "json" && format != "dotenv") || !slugPattern.MatchString(project) || !slugPattern.MatchString(environment) {
+			if (format != "json" && format != "dotenv") || !slugPattern.MatchString(project) || !slugPattern.MatchString(environment) || !validService(service) {
 				return errLocalInput
 			}
 			resolvedURL, err := resolveServerURL(root, serverURL, getenv)
@@ -86,10 +91,10 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 			}
 			response, err := client.FetchConfig(command.Context(), project, environment, service)
 			if err != nil {
-				return errRuntime
+				return markRuntime(err)
 			}
 			if err := WriteExport(stdout, format, response); err != nil {
-				return errRuntime
+				return markRuntime(err)
 			}
 			return nil
 		},
@@ -103,6 +108,72 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 	_ = export.MarkFlagRequired("format")
 	root.AddCommand(export)
 	return root
+}
+
+type runtimeFailure struct {
+	cause error
+}
+
+func (e *runtimeFailure) Error() string { return errRuntime.Error() }
+func (e *runtimeFailure) Unwrap() error { return e.cause }
+func (e *runtimeFailure) Is(target error) bool {
+	return target == errRuntime
+}
+
+func markRuntime(cause error) error {
+	return &runtimeFailure{cause: cause}
+}
+
+func runtimeDiagnostic(err error) string {
+	var apiErr *APIError
+	switch {
+	case errors.As(err, &apiErr):
+		message := fmt.Sprintf("confighub: API request failed: status %d", apiErr.Status)
+		if safeDiagnosticField(apiErr.Code, maxDiagnosticCodeBytes) {
+			message += ", code " + apiErr.Code
+		}
+		if safeDiagnosticField(apiErr.RequestID, maxDiagnosticRequestIDBytes) {
+			message += ", request_id " + apiErr.RequestID
+		}
+		return message
+	case errors.Is(err, context.DeadlineExceeded):
+		return "confighub: request timed out"
+	case errors.Is(err, context.Canceled):
+		return "confighub: request canceled"
+	case errors.Is(err, errRequestTransport):
+		return "confighub: network request failed"
+	case errors.Is(err, errInvalidResponse):
+		return "confighub: invalid server response"
+	case errors.Is(err, errResponseTooLarge):
+		return "confighub: response too large"
+	case errors.Is(err, errResponseRead):
+		return "confighub: response read failed"
+	case errors.Is(err, errExportEncoding):
+		return "confighub: export encoding failed"
+	case errors.Is(err, errOutputWrite):
+		return "confighub: stdout write failed"
+	default:
+		return "confighub: export failed"
+	}
+}
+
+func safeDiagnosticField(value string, maxBytes int) bool {
+	if value == "" || len(value) > maxBytes || !asciiLetterOrDigit(value[0]) {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if asciiLetterOrDigit(character) || character == '_' || character == '-' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func asciiLetterOrDigit(character byte) bool {
+	return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+		(character >= '0' && character <= '9')
 }
 
 func resolveServerURL(root *cobra.Command, flagValue string, getenv func(string) string) (string, error) {

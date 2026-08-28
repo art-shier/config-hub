@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,9 +21,17 @@ import (
 const (
 	defaultHTTPTimeout   = 10 * time.Second
 	maxResponseBodyBytes = 8 << 20
+	maxServiceBytes      = 128
 )
 
 var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+var (
+	errRequestTransport = errors.New("request transport failed")
+	errResponseRead     = errors.New("response read failed")
+	errResponseTooLarge = errors.New("response too large")
+	errInvalidResponse  = errors.New("invalid server response")
+)
 
 type ConfigResponse struct {
 	Project     string            `json:"project"`
@@ -45,7 +54,12 @@ type APIError struct {
 	Fields    map[string]string
 }
 
-func (e *APIError) Error() string { return e.Message }
+func (e *APIError) Error() string {
+	if e == nil || e.Message == "" {
+		return "API request failed"
+	}
+	return e.Message
+}
 
 func NewClient(baseURL, token string) (*Client, error) {
 	parsed, err := validateBaseURL(baseURL)
@@ -71,6 +85,9 @@ func (c *Client) FetchConfig(ctx context.Context, project, environment, service 
 	if c == nil || c.http == nil || !slugPattern.MatchString(project) || !slugPattern.MatchString(environment) {
 		return ConfigResponse{}, errors.New("invalid project or environment")
 	}
+	if !validService(service) {
+		return ConfigResponse{}, errors.New("invalid service")
+	}
 	endpoint, err := url.Parse(c.baseURL)
 	if err != nil {
 		return ConfigResponse{}, errors.New("invalid client configuration")
@@ -95,21 +112,58 @@ func (c *Client) FetchConfig(ctx context.Context, project, environment, service 
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ConfigResponse{}, ctxErr
 		}
-		return ConfigResponse{}, errors.New("request failed")
+		if errors.Is(err, context.DeadlineExceeded) {
+			return ConfigResponse{}, context.DeadlineExceeded
+		}
+		if errors.Is(err, context.Canceled) {
+			return ConfigResponse{}, context.Canceled
+		}
+		return ConfigResponse{}, errRequestTransport
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, int64(maxResponseBodyBytes)+1))
 	if err != nil {
-		return ConfigResponse{}, errors.New("could not read response")
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ConfigResponse{}, ctxErr
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return ConfigResponse{}, context.DeadlineExceeded
+		}
+		if errors.Is(err, context.Canceled) {
+			return ConfigResponse{}, context.Canceled
+		}
+		return ConfigResponse{}, errResponseRead
 	}
 	if len(body) > maxResponseBodyBytes {
-		return ConfigResponse{}, errors.New("response is too large")
+		return ConfigResponse{}, errResponseTooLarge
 	}
 	if response.StatusCode != http.StatusOK {
 		return ConfigResponse{}, decodeAPIError(response.StatusCode, body)
 	}
 
+	payload, err := decodeConfigResponse(body)
+	if err != nil || payload.Project != project || payload.Environment != environment {
+		return ConfigResponse{}, errInvalidResponse
+	}
+	return payload, nil
+}
+
+func decodeConfigResponse(body []byte) (ConfigResponse, error) {
+	if err := validateStrictJSON(body); err != nil {
+		return ConfigResponse{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || len(fields) != 4 {
+		return ConfigResponse{}, errors.New("invalid server response")
+	}
+	for field := range fields {
+		switch field {
+		case "project", "environment", "revision", "values":
+		default:
+			return ConfigResponse{}, errors.New("invalid server response")
+		}
+	}
 	var payload struct {
 		Project     string            `json:"project"`
 		Environment string            `json:"environment"`
@@ -117,14 +171,129 @@ func (c *Client) FetchConfig(ctx context.Context, project, environment, service 
 		Values      map[string]string `json:"values"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
+		return ConfigResponse{}, err
+	}
+	if payload.Project == "" || payload.Environment == "" || payload.Revision == nil || *payload.Revision < 0 || payload.Values == nil || (*payload.Revision == 0 && len(payload.Values) != 0) {
 		return ConfigResponse{}, errors.New("invalid server response")
 	}
-	if payload.Project != project || payload.Environment != environment || payload.Revision == nil || *payload.Revision < 0 || payload.Values == nil {
-		return ConfigResponse{}, errors.New("invalid server response")
+	for key := range payload.Values {
+		if !environmentKeyPattern.MatchString(key) {
+			return ConfigResponse{}, errors.New("invalid server response")
+		}
 	}
 	return ConfigResponse{
 		Project: payload.Project, Environment: payload.Environment, Revision: *payload.Revision, Values: payload.Values,
 	}, nil
+}
+
+func validateStrictJSON(body []byte) error {
+	if !utf8.Valid(body) || !validJSONSurrogates(body) {
+		return errors.New("invalid JSON")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := validateJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func validateJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("invalid JSON object key")
+			}
+			if _, exists := seen[key]; exists {
+				return errors.New("duplicate JSON object key")
+			}
+			seen[key] = struct{}{}
+			if err := validateJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return errors.New("invalid JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := validateJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return errors.New("invalid JSON array")
+		}
+	default:
+		return errors.New("invalid JSON delimiter")
+	}
+	return nil
+}
+
+func validJSONSurrogates(body []byte) bool {
+	inString := false
+	for index := 0; index < len(body); index++ {
+		switch body[index] {
+		case '"':
+			inString = !inString
+		case '\\':
+			if !inString || index+1 >= len(body) {
+				continue
+			}
+			if body[index+1] != 'u' {
+				index++
+				continue
+			}
+			value, ok := parseJSONUnicodeEscape(body, index)
+			if !ok {
+				return false
+			}
+			switch {
+			case value >= 0xd800 && value <= 0xdbff:
+				next := index + 6
+				low, ok := parseJSONUnicodeEscape(body, next)
+				if !ok || low < 0xdc00 || low > 0xdfff {
+					return false
+				}
+				index = next + 5
+			case value >= 0xdc00 && value <= 0xdfff:
+				return false
+			default:
+				index += 5
+			}
+		}
+	}
+	return true
+}
+
+func parseJSONUnicodeEscape(body []byte, index int) (uint16, bool) {
+	if index < 0 || index+6 > len(body) || body[index] != '\\' || body[index+1] != 'u' {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(string(body[index+2:index+6]), 16, 16)
+	return uint16(value), err == nil
 }
 
 func validateBaseURL(raw string) (*url.URL, error) {
@@ -192,6 +361,10 @@ func validToken(token string) bool {
 	})
 }
 
+func validService(service string) bool {
+	return utf8.ValidString(service) && len(service) <= maxServiceBytes
+}
+
 func decodeAPIError(status int, body []byte) error {
 	var envelope struct {
 		Error struct {
@@ -201,8 +374,8 @@ func decodeAPIError(status int, body []byte) error {
 			Fields    map[string]string `json:"fields"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Error.Code == "" || envelope.Error.Message == "" {
-		return errors.New("server request failed")
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return &APIError{Status: status}
 	}
 	return &APIError{
 		Status:    status,
