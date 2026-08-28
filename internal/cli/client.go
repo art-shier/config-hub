@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -133,6 +134,9 @@ func validateBaseURL(raw string) (*url.URL, error) {
 	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" {
 		return nil, errors.New("invalid URL")
 	}
+	if !validURLPort(parsed) {
+		return nil, errors.New("invalid URL")
+	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" || parsed.RawPath != "" {
 		return nil, errors.New("invalid URL")
 	}
@@ -150,6 +154,18 @@ func validateBaseURL(raw string) (*url.URL, error) {
 		}
 	}
 	return nil, errors.New("invalid URL")
+}
+
+func validURLPort(parsed *url.URL) bool {
+	if strings.Contains(parsed.Hostname(), ":") && !strings.HasPrefix(parsed.Host, "[") {
+		return false
+	}
+	port := parsed.Port()
+	if port == "" {
+		return !strings.HasSuffix(parsed.Host, ":")
+	}
+	number, err := strconv.ParseUint(port, 10, 16)
+	return err == nil && number != 0
 }
 
 func isLoopbackHost(host string) bool {

@@ -155,6 +155,25 @@ func TestExecuteDoesNotFallbackFromInvalidExplicitServer(t *testing.T) {
 	}
 }
 
+func TestExecuteRejectsInvalidExplicitServerPortWithoutFallbackOrLeak(t *testing.T) {
+	const invalidURL = "https://localhost:65536/private-sensitive-server-path"
+	var attempts atomic.Int32
+	fallback := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		attempts.Add(1)
+	}))
+	defer fallback.Close()
+	var stdout, stderr bytes.Buffer
+	code := Execute(context.Background(), []string{
+		"export", "--server", invalidURL, "--project", "shop", "--env", "production", "--format", "json",
+	}, mapEnvironment(map[string]string{"CONFIGHUB_URL": fallback.URL, "CONFIGHUB_TOKEN": "token"}), &stdout, &stderr)
+	if code != 2 || attempts.Load() != 0 || stdout.Len() != 0 {
+		t.Fatalf("exit=%d attempts=%d stdout=%q stderr=%q", code, attempts.Load(), stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), invalidURL) || strings.Contains(stderr.String(), "private-sensitive-server-path") {
+		t.Fatalf("stderr leaked invalid server URL: %q", stderr.String())
+	}
+}
+
 func TestExecuteMapsInvalidProjectOrEnvironmentToLocalInput(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
