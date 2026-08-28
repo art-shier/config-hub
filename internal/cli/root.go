@@ -38,9 +38,12 @@ func Execute(ctx context.Context, args []string, getenv func(string) string, std
 	command := newRootCommand(ctx, getenv, stdout, stderr)
 	command.SetArgs(args)
 	err := command.Execute()
+	var childExit *childExitStatus
 	switch {
 	case err == nil:
 		return 0
+	case errors.As(err, &childExit):
+		return childExit.code
 	case errors.Is(err, errRuntime):
 		fmt.Fprintln(stderr, runtimeDiagnostic(err))
 		return 1
@@ -107,11 +110,65 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 	_ = export.MarkFlagRequired("env")
 	_ = export.MarkFlagRequired("format")
 	root.AddCommand(export)
+
+	var runProject, runEnvironment, runService string
+	run := &cobra.Command{
+		Use:   "run --project P --env E [--service S] -- command [arg...]",
+		Short: "Run a command with the current configuration",
+		Args: func(command *cobra.Command, argv []string) error {
+			if len(argv) == 0 || command.ArgsLenAtDash() != 0 {
+				return errCommandUsage
+			}
+			return nil
+		},
+		RunE: func(command *cobra.Command, argv []string) error {
+			if !slugPattern.MatchString(runProject) || !slugPattern.MatchString(runEnvironment) || !validService(runService) {
+				return errLocalInput
+			}
+			resolvedURL, err := resolveServerURL(root, serverURL, getenv)
+			if err != nil {
+				return errLocalInput
+			}
+			resolvedToken, err := resolveToken(root, tokenFile, getenv)
+			if err != nil {
+				return errLocalInput
+			}
+			client, err := NewClient(resolvedURL, resolvedToken)
+			if err != nil {
+				return errLocalInput
+			}
+			runner := Runner{Fetch: func(ctx context.Context) (map[string]string, error) {
+				response, err := client.FetchConfig(ctx, runProject, runEnvironment, runService)
+				return response.Values, err
+			}}
+			code, err := runner.Run(command.Context(), argv, os.Environ(), stdout, stderr)
+			if err != nil {
+				return markRunRuntime(err)
+			}
+			if code != 0 {
+				return &childExitStatus{code: code}
+			}
+			return nil
+		},
+	}
+	run.Flags().StringVar(&runProject, "project", "", "project slug")
+	run.Flags().StringVar(&runEnvironment, "env", "", "environment slug")
+	run.Flags().StringVar(&runService, "service", "", "optional service filter")
+	_ = run.MarkFlagRequired("project")
+	_ = run.MarkFlagRequired("env")
+	root.AddCommand(run)
 	return root
 }
 
+type childExitStatus struct {
+	code int
+}
+
+func (e *childExitStatus) Error() string { return "child process exited" }
+
 type runtimeFailure struct {
-	cause error
+	operation string
+	cause     error
 }
 
 func (e *runtimeFailure) Error() string { return errRuntime.Error() }
@@ -121,10 +178,25 @@ func (e *runtimeFailure) Is(target error) bool {
 }
 
 func markRuntime(cause error) error {
-	return &runtimeFailure{cause: cause}
+	return &runtimeFailure{operation: "export", cause: cause}
+}
+
+func markRunRuntime(cause error) error {
+	return &runtimeFailure{operation: "run", cause: cause}
 }
 
 func runtimeDiagnostic(err error) string {
+	var runFailure *runExecutionFailure
+	if errors.As(err, &runFailure) {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return "confighub: run timed out"
+		case errors.Is(err, context.Canceled):
+			return "confighub: run canceled"
+		default:
+			return "confighub: run failed"
+		}
+	}
 	var apiErr *APIError
 	switch {
 	case errors.As(err, &apiErr):
@@ -153,6 +225,10 @@ func runtimeDiagnostic(err error) string {
 	case errors.Is(err, errOutputWrite):
 		return "confighub: stdout write failed"
 	default:
+		var failure *runtimeFailure
+		if errors.As(err, &failure) && failure.operation == "run" {
+			return "confighub: run failed"
+		}
 		return "confighub: export failed"
 	}
 }
