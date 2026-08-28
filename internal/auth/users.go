@@ -51,6 +51,10 @@ type SyncResult struct {
 
 type UserSyncer struct {
 	store *database.Store
+
+	// afterMutation is only a package-test observer for deterministic
+	// transaction-boundary tests. Production syncers leave it nil.
+	afterMutation func()
 }
 
 func NewUserSyncer(store *database.Store) *UserSyncer {
@@ -177,6 +181,7 @@ func (s *UserSyncer) syncTx(ctx context.Context, tx *sql.Tx, specs []normalizedU
 				uuid.NewString(), spec.username, spec.displayName, hash, spec.role, boolAsInt(spec.enabled), now, now); err != nil {
 				return fmt.Errorf("create configured user %q: %w", spec.username, err)
 			}
+			s.notifyMutation()
 			result.Created++
 			continue
 		}
@@ -184,7 +189,7 @@ func (s *UserSyncer) syncTx(ctx context.Context, tx *sql.Tx, specs []normalizedU
 		passwordChanged := !VerifyPassword(current.passwordHash, spec.password)
 		fieldsChanged := current.DisplayName != spec.displayName || current.Role != spec.role || current.Enabled != spec.enabled
 		if !spec.enabled {
-			if err := deleteUserSessions(ctx, tx, current.ID); err != nil {
+			if err := s.deleteUserSessions(ctx, tx, current.ID); err != nil {
 				return err
 			}
 		}
@@ -198,7 +203,7 @@ func (s *UserSyncer) syncTx(ctx context.Context, tx *sql.Tx, specs []normalizedU
 			if err != nil {
 				return fmt.Errorf("hash password for configured user: %w", err)
 			}
-			if err := deleteUserSessions(ctx, tx, current.ID); err != nil {
+			if err := s.deleteUserSessions(ctx, tx, current.ID); err != nil {
 				return err
 			}
 			result.PasswordsChanged++
@@ -207,6 +212,7 @@ func (s *UserSyncer) syncTx(ctx context.Context, tx *sql.Tx, specs []normalizedU
 			spec.displayName, hash, spec.role, boolAsInt(spec.enabled), now, current.ID); err != nil {
 			return fmt.Errorf("update configured user %q: %w", spec.username, err)
 		}
+		s.notifyMutation()
 		result.Updated++
 		if current.Enabled && !spec.enabled {
 			result.Disabled++
@@ -217,7 +223,7 @@ func (s *UserSyncer) syncTx(ctx context.Context, tx *sql.Tx, specs []normalizedU
 		if _, found := configured[username]; found {
 			continue
 		}
-		if err := deleteUserSessions(ctx, tx, current.ID); err != nil {
+		if err := s.deleteUserSessions(ctx, tx, current.ID); err != nil {
 			return err
 		}
 		if !current.Enabled {
@@ -226,6 +232,7 @@ func (s *UserSyncer) syncTx(ctx context.Context, tx *sql.Tx, specs []normalizedU
 		if _, err := tx.ExecContext(ctx, `UPDATE users SET enabled = 0, updated_at = ? WHERE id = ?`, now, current.ID); err != nil {
 			return fmt.Errorf("disable missing configured user %q: %w", username, err)
 		}
+		s.notifyMutation()
 		result.Updated++
 		result.Disabled++
 	}
@@ -255,11 +262,18 @@ func loadUsers(ctx context.Context, tx *sql.Tx) (map[string]databaseUser, error)
 	return users, nil
 }
 
-func deleteUserSessions(ctx context.Context, tx *sql.Tx, userID string) error {
+func (s *UserSyncer) deleteUserSessions(ctx context.Context, tx *sql.Tx, userID string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID); err != nil {
 		return fmt.Errorf("revoke user sessions: %w", err)
 	}
+	s.notifyMutation()
 	return nil
+}
+
+func (s *UserSyncer) notifyMutation() {
+	if s.afterMutation != nil {
+		s.afterMutation()
+	}
 }
 
 func boolAsInt(value bool) int {

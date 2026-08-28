@@ -264,6 +264,39 @@ func TestSyncUsersCanceledContextLeavesDatabaseUnchanged(t *testing.T) {
 	assertAdminSessionUnchanged(t, store, admin)
 }
 
+func TestSyncUsersCanceledAfterMutationRollsBack(t *testing.T) {
+	store := testStore(t)
+	syncer := NewUserSyncer(store)
+	admin := seedAdminWithSession(t, store, syncer)
+	ctx, cancel := context.WithCancel(context.Background())
+	barrierReached := false
+	syncer.afterMutation = func() {
+		if barrierReached {
+			return
+		}
+		barrierReached = true
+		cancel()
+	}
+
+	changed := UserFile{Users: []UserSpec{{Username: "admin", DisplayName: "Changed", Password: "second", Role: "admin", Enabled: true}}}
+	_, err := syncer.Sync(ctx, changed)
+	if !barrierReached {
+		t.Fatal("transaction mutation barrier was not reached")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v; want context canceled", err)
+	}
+	assertAdminSessionUnchanged(t, store, admin)
+	var sessionID string
+	if err := store.DB().QueryRow(`SELECT id FROM sessions WHERE user_id = ?`, admin.ID).Scan(&sessionID); err != nil || sessionID != "session-"+admin.ID {
+		t.Fatalf("session was not restored: id=%q err=%v", sessionID, err)
+	}
+	var users int
+	if err := store.DB().QueryRow(`SELECT count(*) FROM users`).Scan(&users); err != nil || users != 1 {
+		t.Fatalf("unexpected users after rollback: count=%d err=%v", users, err)
+	}
+}
+
 func testStore(t *testing.T) *database.Store {
 	t.Helper()
 	store, err := database.Open(filepath.Join(t.TempDir(), "config-hub.db"))
