@@ -470,6 +470,68 @@ func TestSchemaAllowsRevisionCascadesAfterEnvironmentAndProjectDeletion(t *testi
 	assertRowCount(t, store, "SELECT count(*) FROM revision_entries WHERE revision_id = 'r2'", 0)
 }
 
+func TestSchemaRejectsProjectReplaceAndPreservesSealedHistory(t *testing.T) {
+	store := openTestStore(t)
+	db := store.DB()
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Environment One', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('r1', 'e1', 1, 'u1', 1)",
+		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r1', 'key', 'value')",
+		"UPDATE environments SET current_revision_id = 'r1' WHERE id = 'e1'",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("setup %q: %v", statement, err)
+		}
+	}
+
+	if _, err := db.Exec("INSERT OR REPLACE INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Replacement', 'u1', 2, 2)"); err == nil {
+		t.Fatal("project replacement succeeded")
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM projects WHERE id = 'p1' AND slug = 'p1'", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'e1' AND project_id = 'p1'", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r1' AND environment_id = 'e1' AND sealed = 1", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM revision_entries WHERE revision_id = 'r1' AND key = 'key' AND value = 'value'", 1)
+}
+
+func TestSchemaRejectsProjectUpdateOrReplaceConflicts(t *testing.T) {
+	for _, conflict := range []struct {
+		name      string
+		statement string
+	}{
+		{"id", "UPDATE OR REPLACE projects SET id = 'target' WHERE id = 'source'"},
+		{"slug", "UPDATE OR REPLACE projects SET slug = 'target' WHERE id = 'source'"},
+	} {
+		t.Run(conflict.name, func(t *testing.T) {
+			store := openTestStore(t)
+			db := store.DB()
+			for _, statement := range []string{
+				"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+				"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('source', 'source', 'Source', 'u1', 1, 1)",
+				"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('target', 'target', 'Target', 'u1', 1, 1)",
+				"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'target', 'e1', 'Environment One', 1, 1)",
+				"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('r1', 'e1', 1, 'u1', 1)",
+				"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r1', 'key', 'value')",
+				"UPDATE environments SET current_revision_id = 'r1' WHERE id = 'e1'",
+			} {
+				if _, err := db.Exec(statement); err != nil {
+					t.Fatalf("setup %q: %v", statement, err)
+				}
+			}
+
+			if _, err := db.Exec(conflict.statement); err == nil {
+				t.Fatalf("project %s conflict replacement succeeded", conflict.name)
+			}
+			assertRowCount(t, store, "SELECT count(*) FROM projects WHERE id = 'source' AND slug = 'source'", 1)
+			assertRowCount(t, store, "SELECT count(*) FROM projects WHERE id = 'target' AND slug = 'target'", 1)
+			assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'e1' AND project_id = 'target'", 1)
+			assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'r1' AND environment_id = 'e1' AND sealed = 1", 1)
+			assertRowCount(t, store, "SELECT count(*) FROM revision_entries WHERE revision_id = 'r1'", 1)
+		})
+	}
+}
+
 func TestSchemaRejectsNullSingleColumnPrimaryKeys(t *testing.T) {
 	store := openTestStore(t)
 	db := store.DB()
@@ -541,6 +603,39 @@ func TestOpenRestrictsDatabaseAndSidecarPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDatabaseFilesPrivate(t, existingPath)
+}
+
+func TestOpenHardensExistingSidecarsBeforeSQLiteFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "invalid.db")
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.WriteFile(file, []byte("not a SQLite database"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(file, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("Open accepted an invalid database")
+	}
+	assertFilesExactlyPrivate(t, path)
+	assertDatabaseFilesPrivate(t, path)
+}
+
+func TestHardenDatabaseFilesRestrictsExistingSidecars(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "confighub.db")
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.WriteFile(file, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(file, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := hardenDatabaseFiles(path); err != nil {
+		t.Fatal(err)
+	}
+	assertFilesExactlyPrivate(t, path, path+"-wal", path+"-shm")
 }
 
 func TestConnectionsReceiveSafetyPragmasAndImmediateTransactions(t *testing.T) {
@@ -643,6 +738,19 @@ func assertDatabaseFilesPrivate(t *testing.T, path string) {
 		}
 		if info.Mode().Perm()&0o077 != 0 {
 			t.Fatalf("%s mode = %o, want no group or other bits", file, info.Mode().Perm())
+		}
+	}
+}
+
+func assertFilesExactlyPrivate(t *testing.T, files ...string) {
+	t.Helper()
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			t.Fatalf("stat %s: %v", file, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s mode = %o, want 600", file, info.Mode().Perm())
 		}
 	}
 }

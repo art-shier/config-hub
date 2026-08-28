@@ -36,6 +36,9 @@ func Open(path string) (*Store, error) {
 	if err := ensurePrivateDatabaseFile(absPath); err != nil {
 		return nil, err
 	}
+	if err := hardenDatabaseFiles(absPath); err != nil {
+		return nil, err
+	}
 
 	db, err := sql.Open(driverName, sqliteDSN(absPath))
 	if err != nil {
@@ -73,12 +76,19 @@ func ensurePrivateDatabaseFile(path string) error {
 }
 
 func hardenDatabaseFiles(path string) error {
-	for _, file := range []string{path, path + "-wal", path + "-shm"} {
-		if err := os.Chmod(file, 0o600); err != nil {
+	for _, file := range []struct {
+		path string
+		kind string
+	}{
+		{path: path, kind: "database"},
+		{path: path + "-wal", kind: "database WAL"},
+		{path: path + "-shm", kind: "database SHM"},
+	} {
+		if err := os.Chmod(file.path, 0o600); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return fmt.Errorf("restrict database file permissions: %w", err)
+			return fmt.Errorf("restrict %s permissions: %w", file.kind, err)
 		}
 	}
 	return nil

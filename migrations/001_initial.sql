@@ -108,6 +108,27 @@ CREATE INDEX machine_grants_project_id_idx ON machine_grants(project_id);
 CREATE INDEX machine_grants_environment_id_idx ON machine_grants(environment_id);
 CREATE INDEX access_tokens_identity_id_idx ON access_tokens(identity_id);
 
+CREATE TRIGGER projects_prevent_replace
+BEFORE INSERT ON projects
+WHEN EXISTS (
+    SELECT 1 FROM projects
+    WHERE id = NEW.id OR slug = NEW.slug
+)
+BEGIN
+    SELECT RAISE(ABORT, 'projects cannot be replaced');
+END;
+
+CREATE TRIGGER projects_prevent_update_replace
+BEFORE UPDATE OF id, slug ON projects
+WHEN EXISTS (
+    SELECT 1 FROM projects
+    WHERE id <> OLD.id
+      AND (id = NEW.id OR slug = NEW.slug)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'project update conflicts with existing project');
+END;
+
 CREATE TRIGGER environments_prevent_replace
 BEFORE INSERT ON environments
 WHEN EXISTS (
