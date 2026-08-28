@@ -61,6 +61,9 @@ func (h *revisionHandlers) replace(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !revisionQueryAbsent(w, r) {
+		return
+	}
 	var request replaceRevisionRequest
 	if !decodeRevisionJSON(w, r, &request) {
 		return
@@ -80,6 +83,9 @@ func (h *revisionHandlers) list(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !revisionQueryAbsent(w, r) {
+		return
+	}
 	result, err := h.service.ListForProject(r.Context(), actor, r.PathValue("project"), r.PathValue("environment"))
 	if err != nil {
 		writeRevisionServiceError(w, r, err)
@@ -91,6 +97,9 @@ func (h *revisionHandlers) list(w http.ResponseWriter, r *http.Request) {
 func (h *revisionHandlers) detail(w http.ResponseWriter, r *http.Request) {
 	actor, _, ok := h.authenticate(w, r)
 	if !ok {
+		return
+	}
+	if !revisionQueryAbsent(w, r) {
 		return
 	}
 	version, ok := revisionVersion(w, r)
@@ -110,6 +119,9 @@ func (h *revisionHandlers) diff(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !revisionQueryAbsent(w, r) {
+		return
+	}
 	version, ok := revisionVersion(w, r)
 	if !ok {
 		return
@@ -125,6 +137,9 @@ func (h *revisionHandlers) diff(w http.ResponseWriter, r *http.Request) {
 func (h *revisionHandlers) rollback(w http.ResponseWriter, r *http.Request) {
 	actor, _, ok := h.authenticateWrite(w, r)
 	if !ok {
+		return
+	}
+	if !revisionQueryAbsent(w, r) {
 		return
 	}
 	version, ok := revisionVersion(w, r)
@@ -192,7 +207,20 @@ func revisionServiceQuery(w http.ResponseWriter, r *http.Request) (string, bool)
 		writeError(w, r, http.StatusBadRequest, "malformed_query", "Query parameters are invalid")
 		return "", false
 	}
-	return values[0], true
+	service := strings.TrimSpace(values[0])
+	if service == "" {
+		writeRevisionServiceError(w, r, &revisions.ValidationError{Fields: map[string]string{"service": "must not be empty when provided"}})
+		return "", false
+	}
+	return service, true
+}
+
+func revisionQueryAbsent(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.RawQuery == "" {
+		return true
+	}
+	writeError(w, r, http.StatusBadRequest, "malformed_query", "Query parameters are invalid")
+	return false
 }
 
 func revisionVersion(w http.ResponseWriter, r *http.Request) (int64, bool) {

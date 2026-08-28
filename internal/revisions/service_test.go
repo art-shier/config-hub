@@ -256,6 +256,60 @@ func TestReplaceFailureRollsBackRevisionAndCurrentPointer(t *testing.T) {
 	}
 }
 
+func TestRollbackFailureLeavesCurrentAndHistoryUnchanged(t *testing.T) {
+	fixture := newRevisionFixture(t)
+	ctx := context.Background()
+	target, err := fixture.service.Replace(ctx, fixture.editor, fixture.environmentID, ReplaceInput{Entries: []Entry{
+		{Key: "A_FIRST", Value: "target first"},
+		{Key: "FAIL_COPY", Value: "target secret value", Service: "api"},
+		{Key: "Z_LAST", Value: "target last"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentBefore, err := fixture.service.Replace(ctx, fixture.editor, fixture.environmentID, ReplaceInput{
+		BaseRevision: target.Version,
+		Entries:      []Entry{{Key: "CURRENT", Value: "current value", Service: "worker"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`CREATE TRIGGER inject_rollback_entry_failure BEFORE INSERT ON revision_entries
+		WHEN NEW.key = 'FAIL_COPY'
+		 AND (SELECT version FROM revisions WHERE id = NEW.revision_id) = 3
+		BEGIN SELECT RAISE(ABORT, 'injected rollback copy failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fixture.service.Rollback(ctx, fixture.editor, fixture.environmentID, target.Version, "restore target")
+	if err == nil || errors.Is(err, ErrForbidden) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrRevisionConflict) || strings.Contains(err.Error(), "target secret value") {
+		t.Fatalf("rollback error=%v", err)
+	}
+	currentAfter, err := fixture.service.Current(ctx, fixture.viewer, fixture.environmentID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentAfter.ID != currentBefore.ID || currentAfter.Version != currentBefore.Version || len(currentAfter.Entries) != 1 || currentAfter.Entries[0] != currentBefore.Entries[0] {
+		t.Fatalf("current before=%+v after=%+v", currentBefore, currentAfter)
+	}
+	var revisions, unsealed int
+	if err := fixture.store.DB().QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN sealed = 0 THEN 1 ELSE 0 END), 0)
+		FROM revisions WHERE environment_id = ?`, fixture.environmentID).Scan(&revisions, &unsealed); err != nil {
+		t.Fatal(err)
+	}
+	if revisions != 2 || unsealed != 0 {
+		t.Fatalf("revisions=%d unsealed=%d", revisions, unsealed)
+	}
+	var copiedEntries int
+	if err := fixture.store.DB().QueryRow(`SELECT COUNT(*) FROM revision_entries re
+		JOIN revisions r ON r.id = re.revision_id WHERE r.environment_id = ? AND r.version = 3`, fixture.environmentID).Scan(&copiedEntries); err != nil {
+		t.Fatal(err)
+	}
+	if copiedEntries != 0 {
+		t.Fatalf("rollback left copied entries=%d", copiedEntries)
+	}
+}
+
 func TestConcurrentEditorsUsingSameBaseAllowExactlyOneSave(t *testing.T) {
 	fixture := newRevisionFixture(t)
 	ctx := context.Background()

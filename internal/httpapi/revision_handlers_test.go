@@ -102,6 +102,19 @@ func TestRevisionHTTPConfigLifecycleValidationAndServiceFilter(t *testing.T) {
 	if response.Code != http.StatusOK || len(filtered.Revision.Entries) != 1 || filtered.Revision.Entries[0].Key != "DATABASE_URL" {
 		t.Fatalf("filtered status=%d revision=%+v", response.Code, filtered.Revision)
 	}
+	response = fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, revisionConfigPath+"?service=%20api%20", ""))
+	decodeResponse(t, response, &filtered)
+	if response.Code != http.StatusOK || len(filtered.Revision.Entries) != 1 || filtered.Revision.Entries[0].Key != "DATABASE_URL" {
+		t.Fatalf("trimmed filter status=%d revision=%+v", response.Code, filtered.Revision)
+	}
+	response = fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, revisionConfigPath, ""))
+	var unfiltered struct {
+		Revision revisions.Revision `json:"revision"`
+	}
+	decodeResponse(t, response, &unfiltered)
+	if response.Code != http.StatusOK || len(unfiltered.Revision.Entries) != 2 {
+		t.Fatalf("unfiltered status=%d revision=%+v", response.Code, unfiltered.Revision)
+	}
 
 	response = fixture.serve(t, fixture.request(t, "viewer", http.MethodPut, revisionConfigPath, `{"base_revision":1,"entries":[]}`))
 	assertRevisionHTTPError(t, response, http.StatusForbidden, "forbidden")
@@ -180,8 +193,10 @@ func TestRevisionHTTPRejectsAmbiguousQueriesAndInvalidVersions(t *testing.T) {
 		code       string
 	}{
 		{name: "multiple service values", path: revisionConfigPath + "?service=api&service=worker", status: http.StatusBadRequest, code: "malformed_query"},
+		{name: "explicit empty service", path: revisionConfigPath + "?service=", status: http.StatusUnprocessableEntity, code: "validation_failed"},
+		{name: "whitespace service", path: revisionConfigPath + "?service=%20%20", status: http.StatusUnprocessableEntity, code: "validation_failed"},
 		{name: "invalid UTF-8 service", path: revisionConfigPath + "?service=%FF", status: http.StatusUnprocessableEntity, code: "validation_failed"},
-		{name: "overlong service", path: revisionConfigPath + "?service=" + strings.Repeat("x", revisions.MaxServiceBytes+1), status: http.StatusUnprocessableEntity, code: "validation_failed"},
+		{name: "overlong service", path: revisionConfigPath + "?service=service-secret-" + strings.Repeat("x", revisions.MaxServiceBytes+1), status: http.StatusUnprocessableEntity, code: "validation_failed"},
 		{name: "unknown query parameter", path: revisionConfigPath + "?scope=all", status: http.StatusBadRequest, code: "malformed_query"},
 		{name: "zero version", path: revisionListPath + "/0", status: http.StatusBadRequest, code: "malformed_request"},
 		{name: "negative version", path: revisionListPath + "/-1", status: http.StatusBadRequest, code: "malformed_request"},
@@ -194,7 +209,50 @@ func TestRevisionHTTPRejectsAmbiguousQueriesAndInvalidVersions(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			response := fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, test.path, ""))
 			assertRevisionHTTPError(t, response, test.status, test.code)
+			if strings.Contains(response.Body.String(), "service-secret") || strings.Contains(response.Body.String(), "%FF") {
+				t.Fatalf("service query leaked in error envelope: %s", response.Body.String())
+			}
 		})
+	}
+}
+
+func TestRevisionHTTPRejectsQueriesOnRoutesWithoutQueryContractsBeforeWrites(t *testing.T) {
+	fixture := newRevisionHTTPFixture(t)
+	first := replaceRevisionHTTP(t, fixture, 0, "first", []revisions.Entry{{Key: "VALUE", Value: "original"}})
+
+	tests := []struct {
+		name, username, method, path, body string
+	}{
+		{name: "replace empty query value", username: "editor", method: http.MethodPut, path: revisionConfigPath + "?service=", body: `{"base_revision":1,"entries":[{"key":"VALUE","value":"value-secret"}]}`},
+		{name: "list service query", username: "viewer", method: http.MethodGet, path: revisionListPath + "?service=service-secret"},
+		{name: "detail duplicate query", username: "viewer", method: http.MethodGet, path: revisionListPath + "/1?view=one&view=two"},
+		{name: "diff empty unknown query", username: "viewer", method: http.MethodGet, path: revisionListPath + "/1/diff?unknown="},
+		{name: "rollback unknown query", username: "editor", method: http.MethodPost, path: revisionListPath + "/1/rollback?service=service-secret", body: `{"message":"value-secret"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := fixture.serve(t, fixture.request(t, test.username, test.method, test.path, test.body))
+			assertRevisionHTTPError(t, response, http.StatusBadRequest, "malformed_query")
+			if strings.Contains(response.Body.String(), "service-secret") || strings.Contains(response.Body.String(), "value-secret") {
+				t.Fatalf("query or value leaked in error envelope: %s", response.Body.String())
+			}
+		})
+	}
+
+	currentResponse := fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, revisionConfigPath, ""))
+	var current struct {
+		Revision revisions.Revision `json:"revision"`
+	}
+	decodeResponse(t, currentResponse, &current)
+	if currentResponse.Code != http.StatusOK || current.Revision.ID != first.ID || current.Revision.Version != first.Version || len(current.Revision.Entries) != 1 || current.Revision.Entries[0].Value != "original" {
+		t.Fatalf("query-bearing writes changed current: status=%d revision=%+v", currentResponse.Code, current.Revision)
+	}
+	var revisionCount int
+	if err := fixture.store.DB().QueryRow(`SELECT COUNT(*) FROM revisions WHERE environment_id = 'visible-environment'`).Scan(&revisionCount); err != nil {
+		t.Fatal(err)
+	}
+	if revisionCount != 1 {
+		t.Fatalf("query-bearing writes created revisions=%d", revisionCount)
 	}
 }
 
