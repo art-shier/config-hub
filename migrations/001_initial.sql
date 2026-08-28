@@ -107,6 +107,17 @@ CREATE INDEX machine_grants_project_id_idx ON machine_grants(project_id);
 CREATE INDEX machine_grants_environment_id_idx ON machine_grants(environment_id);
 CREATE INDEX access_tokens_identity_id_idx ON access_tokens(identity_id);
 
+CREATE TRIGGER environments_prevent_replace
+BEFORE INSERT ON environments
+WHEN EXISTS (
+    SELECT 1 FROM environments
+    WHERE id = NEW.id
+       OR (project_id = NEW.project_id AND slug = NEW.slug)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'environments cannot be replaced');
+END;
+
 CREATE TRIGGER environments_current_revision_insert
 BEFORE INSERT ON environments
 WHEN NEW.current_revision_id IS NOT NULL
@@ -138,14 +149,10 @@ BEGIN
     SELECT RAISE(ABORT, 'cannot delete current revision');
 END;
 
-CREATE TRIGGER revisions_prevent_current_pointer_update
-BEFORE UPDATE OF id, environment_id ON revisions
-WHEN EXISTS (
-    SELECT 1 FROM environments WHERE current_revision_id = OLD.id
-)
- AND (NEW.id <> OLD.id OR NEW.environment_id <> OLD.environment_id)
+CREATE TRIGGER revisions_prevent_update
+BEFORE UPDATE ON revisions
 BEGIN
-    SELECT RAISE(ABORT, 'cannot update current revision pointer');
+    SELECT RAISE(ABORT, 'revisions are immutable');
 END;
 
 CREATE TRIGGER revisions_prevent_replace

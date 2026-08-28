@@ -234,6 +234,64 @@ func TestSchemaPreventsReverseMutationsOfRevisionAndGrantInvariants(t *testing.T
 	assertRowCount(t, store, "SELECT count(*) FROM machine_grants WHERE identity_id = 'm1' AND project_id = 'p1' AND environment_id = 'e1'", 1)
 }
 
+func TestSchemaMakesRevisionsImmutableAgainstUpdateOrReplace(t *testing.T) {
+	store := openTestStore(t)
+	db := store.DB()
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Environment One', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('historical', 'e1', 1, 'u1', 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('current', 'e1', 2, 'u1', 1)",
+		"UPDATE environments SET current_revision_id = 'current' WHERE id = 'e1'",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("setup %q: %v", statement, err)
+		}
+	}
+
+	if _, err := db.Exec("UPDATE OR REPLACE revisions SET version = 2 WHERE id = 'historical'"); err == nil {
+		t.Fatal("UPDATE OR REPLACE replaced the current revision")
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'historical' AND environment_id = 'e1' AND version = 1", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'current' AND environment_id = 'e1' AND version = 2", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'e1' AND current_revision_id = 'current'", 1)
+
+	if _, err := db.Exec("UPDATE revisions SET message = 'changed' WHERE id = 'historical'"); err == nil {
+		t.Fatal("ordinary revision update succeeded")
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'historical' AND message = ''", 1)
+}
+
+func TestSchemaRejectsEnvironmentReplaceConflicts(t *testing.T) {
+	store := openTestStore(t)
+	db := store.DB()
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Environment One', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('current', 'e1', 1, 'u1', 1)",
+		"UPDATE environments SET current_revision_id = 'current' WHERE id = 'e1'",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("setup %q: %v", statement, err)
+		}
+	}
+
+	if _, err := db.Exec("INSERT OR REPLACE INTO environments (id, project_id, slug, name, current_revision_id, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Replacement', 'current', 2, 2)"); err == nil {
+		t.Fatal("same-id environment replacement succeeded")
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'e1' AND current_revision_id = 'current'", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'current' AND environment_id = 'e1'", 1)
+
+	if _, err := db.Exec("INSERT OR REPLACE INTO environments (id, project_id, slug, name, current_revision_id, created_at, updated_at) VALUES ('e1-copy', 'p1', 'e1', 'Replacement', 'current', 2, 2)"); err == nil {
+		t.Fatal("same-project-slug environment replacement succeeded")
+	}
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'e1-copy'", 0)
+	assertRowCount(t, store, "SELECT count(*) FROM environments WHERE id = 'e1' AND current_revision_id = 'current'", 1)
+	assertRowCount(t, store, "SELECT count(*) FROM revisions WHERE id = 'current' AND environment_id = 'e1'", 1)
+}
+
 func TestSchemaEnforcesForeignKeysAndChecks(t *testing.T) {
 	store := openTestStore(t)
 	if _, err := store.DB().Exec("INSERT INTO sessions (id, user_id, token_hash, csrf_hash, expires_at, created_at) VALUES ('s1', 'missing', x'01', x'02', 1, 1)"); err == nil {
