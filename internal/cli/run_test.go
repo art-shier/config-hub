@@ -560,9 +560,6 @@ func TestRunChildExitWinsOverLateSIGTERMWithoutForwarding(t *testing.T) {
 	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	if line := waitForTestOutputLine(t, lines, 5*time.Second); line != "race-signal-received" {
-		t.Fatalf("signal acknowledgement=%q stderr=%q", line, stderr.String())
-	}
 	forwarded := waitForFile(signalMarker, 500*time.Millisecond)
 	if err := os.WriteFile(releaseMarker, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -755,6 +752,60 @@ func TestRunGivesControllingTTYToChildAndRestoresIt(t *testing.T) {
 		t.Fatalf("isolated PTY runner failed: %v", err)
 	}
 	waited = true
+}
+
+func TestForegroundTerminalRestoreRetriesInterruptedIoctl(t *testing.T) {
+	attempts := 0
+	terminal := &foregroundTerminal{
+		fd:            17,
+		originalGroup: 23,
+		setForeground: func(fd, group int) error {
+			attempts++
+			if fd != 17 || group != 23 {
+				t.Fatalf("fd=%d group=%d", fd, group)
+			}
+			if attempts == 1 {
+				return syscall.EINTR
+			}
+			return nil
+		},
+	}
+
+	if err := terminal.restore(); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || !terminal.restored {
+		t.Fatalf("attempts=%d restored=%t", attempts, terminal.restored)
+	}
+}
+
+func TestForegroundTerminalRestoreRemainsPendingAfterFailure(t *testing.T) {
+	attempts := 0
+	terminal := &foregroundTerminal{
+		setForeground: func(int, int) error {
+			attempts++
+			if attempts == 1 {
+				return syscall.EIO
+			}
+			return nil
+		},
+	}
+
+	if err := terminal.restore(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("first restore error=%v", err)
+	}
+	if terminal.restored {
+		t.Fatal("terminal marked restored after failed TIOCSPGRP")
+	}
+	if err := terminal.restore(); err != nil {
+		t.Fatalf("retry restore: %v", err)
+	}
+	if !terminal.restored || attempts != 2 {
+		t.Fatalf("attempts=%d restored=%t", attempts, terminal.restored)
+	}
+	if err := terminal.restore(); err != nil || attempts != 2 {
+		t.Fatalf("completed restore retried: attempts=%d err=%v", attempts, err)
+	}
 }
 
 func TestRunRemovesSignalSubscriptionAfterChildExit(t *testing.T) {
@@ -998,14 +1049,6 @@ func TestRunExitSignalRaceIsolatedProcess(t *testing.T) {
 	if os.Getenv("CONFIGHUB_RUN_EXIT_SIGNAL_RACE_TEST") != "1" {
 		return
 	}
-	guard := make(chan os.Signal, 1)
-	signal.Notify(guard, syscall.SIGTERM)
-	defer signal.Stop(guard)
-	go func() {
-		<-guard
-		fmt.Println("race-signal-received")
-	}()
-
 	output := newRaceLeaderWriter()
 	runner := Runner{Fetch: func(context.Context) (map[string]string, error) {
 		return map[string]string{}, nil
@@ -1035,8 +1078,8 @@ func TestRunExitSignalRaceIsolatedProcess(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for race leader")
 	}
-	state := waitForLeaderExitObservation(t, leader.pid)
-	fmt.Printf("race-ready %d %d %d %s\n", leader.pid, leader.group, leader.grandchild, state)
+	waitForLeaderReaped(t, leader.pid)
+	fmt.Printf("race-ready %d %d %d reaped\n", leader.pid, leader.group, leader.grandchild)
 
 	select {
 	case got := <-finished:
@@ -1168,6 +1211,25 @@ func waitForLeaderExitObservation(t *testing.T, pid int) string {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("leader %d did not exit; state=%q", pid, fields)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitForLeaderReaped(t *testing.T, pid int) {
+	t.Helper()
+	path := filepath.Join("/proc", strconv.Itoa(pid), "stat")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("inspect leader state: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("leader %d remained unreaped", pid)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

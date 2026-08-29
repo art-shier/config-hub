@@ -67,15 +67,13 @@ func (r Runner) Run(
 	command.Stdout = stdout
 	command.Stderr = stderr
 	terminal := ownedForegroundTerminal(os.Stdin)
-	terminalRestored := terminal == nil
 	restoreTerminal := func() error {
-		if terminalRestored {
+		if terminal == nil {
 			return nil
 		}
-		terminalRestored = true
 		return terminal.restore()
 	}
-	defer func() {
+	restoreTerminalBeforeReturn := func() {
 		if err := restoreTerminal(); err != nil {
 			restoreFailure := markRunExecution(fmt.Errorf("restore terminal foreground: %w", err))
 			exitCode = 1
@@ -85,7 +83,7 @@ func (r Runner) Run(
 				runErr = errors.Join(runErr, restoreFailure)
 			}
 		}
-	}()
+	}
 	if terminal == nil {
 		command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	} else {
@@ -96,15 +94,11 @@ func (r Runner) Run(
 	childSignals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	signal.Notify(childSignals, syscall.SIGCHLD)
-	signalsStopped := false
-	stopSignalDelivery := func() {
-		if !signalsStopped {
-			signal.Stop(signals)
-			signal.Stop(childSignals)
-			signalsStopped = true
-		}
-	}
-	defer stopSignalDelivery()
+	defer func() {
+		signal.Stop(signals)
+		signal.Stop(childSignals)
+	}()
+	defer restoreTerminalBeforeReturn()
 	if err := command.Start(); err != nil {
 		return 1, markRunExecution(fmt.Errorf("start child process: %w", err))
 	}
@@ -121,7 +115,6 @@ func (r Runner) Run(
 		return err
 	}
 	finishChild := func(observationErr, chosenErr error) (int, error) {
-		stopSignalDelivery()
 		restoreErr := restoreTerminal()
 		waitErr := command.Wait()
 
@@ -132,7 +125,7 @@ func (r Runner) Run(
 		if observationErr != nil {
 			failures = append(failures, fmt.Errorf("observe child process: %w", observationErr))
 		}
-		if restoreErr != nil {
+		if restoreErr != nil && terminal != nil && terminal.restored {
 			failures = append(failures, fmt.Errorf("restore terminal foreground: %w", restoreErr))
 		}
 		if len(failures) > 0 {
@@ -223,6 +216,8 @@ func observeChildLeaderExit(pid int, nonblocking bool) (bool, error) {
 type foregroundTerminal struct {
 	fd            int
 	originalGroup int
+	restored      bool
+	setForeground func(int, int) error
 }
 
 func ownedForegroundTerminal(file *os.File) *foregroundTerminal {
@@ -235,9 +230,13 @@ func ownedForegroundTerminal(file *os.File) *foregroundTerminal {
 }
 
 func (terminal *foregroundTerminal) restore() error {
-	signalNumber := int(unix.SIGTTOU) - 1
+	if terminal.restored {
+		return nil
+	}
 	blocked := unix.Sigset_t{}
-	blocked.Val[signalNumber/64] |= uint64(1) << uint(signalNumber%64)
+	if err := addSignalToSet(&blocked, syscall.SIGTTOU); err != nil {
+		return err
+	}
 	var originalMask unix.Sigset_t
 
 	runtime.LockOSThread()
@@ -245,15 +244,59 @@ func (terminal *foregroundTerminal) restore() error {
 		runtime.UnlockOSThread()
 		return fmt.Errorf("block SIGTTOU: %w", err)
 	}
-	restoreForegroundErr := unix.IoctlSetPointerInt(terminal.fd, unix.TIOCSPGRP, terminal.originalGroup)
+	setForeground := terminal.setForeground
+	if setForeground == nil {
+		setForeground = func(fd, group int) error {
+			return unix.IoctlSetPointerInt(fd, unix.TIOCSPGRP, group)
+		}
+	}
+	var restoreForegroundErr error
+	for {
+		restoreForegroundErr = setForeground(terminal.fd, terminal.originalGroup)
+		if !errors.Is(restoreForegroundErr, syscall.EINTR) {
+			break
+		}
+	}
+	if restoreForegroundErr == nil {
+		terminal.restored = true
+	}
 	restoreMaskErr := unix.PthreadSigmask(unix.SIG_SETMASK, &originalMask, nil)
 	runtime.UnlockOSThread()
 
 	if restoreForegroundErr != nil {
+		if restoreMaskErr != nil {
+			return errors.Join(restoreForegroundErr, fmt.Errorf("restore signal mask: %w", restoreMaskErr))
+		}
 		return restoreForegroundErr
 	}
 	if restoreMaskErr != nil {
 		return fmt.Errorf("restore signal mask: %w", restoreMaskErr)
+	}
+	return nil
+}
+
+func addSignalToSet(set *unix.Sigset_t, signal syscall.Signal) error {
+	signalIndex := int(signal) - 1
+	if signalIndex < 0 {
+		return fmt.Errorf("invalid signal %d", signal)
+	}
+	switch any(&set.Val[0]).(type) {
+	case *uint32:
+		const wordBits = 32
+		if signalIndex >= len(set.Val)*wordBits {
+			return fmt.Errorf("signal %d exceeds signal set", signal)
+		}
+		word := any(&set.Val[signalIndex/wordBits]).(*uint32)
+		*word |= uint32(1) << uint(signalIndex%wordBits)
+	case *uint64:
+		const wordBits = 64
+		if signalIndex >= len(set.Val)*wordBits {
+			return fmt.Errorf("signal %d exceeds signal set", signal)
+		}
+		word := any(&set.Val[signalIndex/wordBits]).(*uint64)
+		*word |= uint64(1) << uint(signalIndex%wordBits)
+	default:
+		return errors.New("unsupported signal set word type")
 	}
 	return nil
 }
