@@ -199,6 +199,45 @@ describe("ProjectMembers", () => {
     expect(screen.getByText("Alex Smith")).toBeInTheDocument();
   });
 
+  it("changes an existing viewer grant to editor and confirms the saved permission", async () => {
+    let putPath = "";
+    let putBody: unknown;
+    mockMembers();
+    server.use(
+      http.put(
+        "/api/v1/projects/shop/members/alex.smith",
+        async ({ request }) => {
+          putPath = new URL(request.url).pathname;
+          putBody = await request.json();
+          return new HttpResponse(null, { status: 204 });
+        },
+      ),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    const row = await screen.findByRole("listitem", {
+      name: "Alex Smith access",
+    });
+    const permission = within(row).getByLabelText(
+      "Permission for alex.smith",
+    );
+    expect(permission).toHaveValue("viewer");
+
+    await user.selectOptions(permission, "editor");
+    await user.click(
+      within(row).getByRole("button", { name: "Save permission" }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Permission for Alex Smith updated to Editor.",
+      ),
+    );
+    expect(putPath).toBe("/api/v1/projects/shop/members/alex.smith");
+    expect(putBody).toEqual({ permission: "editor" });
+    expect(permission).toHaveValue("editor");
+  });
+
   it("requires named confirmation, preserves it on failure, and retries removal", async () => {
     let removeRequests = 0;
     mockMembers();

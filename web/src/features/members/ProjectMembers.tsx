@@ -159,7 +159,9 @@ export function ProjectMembers({
             item.username === member.username ? { ...item, permission } : item,
           ),
         );
-        setStatus(`Permission saved for ${member.display_name}.`);
+        setStatus(
+          `Permission for ${member.display_name} updated to ${titleCase(permission)}.`,
+        );
       }
     } catch (error) {
       if (mountedRef.current) {
