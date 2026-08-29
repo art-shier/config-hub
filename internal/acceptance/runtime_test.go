@@ -89,7 +89,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 	getenv := runtimeEnvironment(fixture.url, issued.Token.Plaintext)
 	var jsonOutput, dotenvOutput, childOutput bytes.Buffer
 	var cliDiagnostics diagnosticLog
-	if code := executeCLI(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
+	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
 		t.Fatalf("JSON export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
 	}
 	var exported cli.ConfigResponse
@@ -97,14 +97,14 @@ func TestRuntimeWorkflow(t *testing.T) {
 	if exported.Revision != 1 || exported.Values["DATABASE_URL"] != databaseValue || exported.Values["FEATURE_FLAG"] != featureValue {
 		t.Fatalf("JSON export=%+v", exported)
 	}
-	if code := executeCLI(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "dotenv"}, getenv, &dotenvOutput, &cliDiagnostics); code != 0 {
+	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "dotenv"}, getenv, &dotenvOutput, &cliDiagnostics); code != 0 {
 		t.Fatalf("dotenv export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
 	}
 	if !strings.Contains(dotenvOutput.String(), "DATABASE_URL=") || !strings.Contains(dotenvOutput.String(), "FEATURE_FLAG=") {
 		t.Fatalf("dotenv export omitted values: %q", dotenvOutput.String())
 	}
 
-	if code := executeCLI(ctx, []string{"run", "--project", "shop", "--env", "production", "--", "sh", "-c", `printf '%s|%s' "$DATABASE_URL" "$FEATURE_FLAG"`}, getenv, &childOutput, &cliDiagnostics); code != 0 {
+	if code := executeCLI(cli.Execute, ctx, []string{"run", "--project", "shop", "--env", "production", "--", "sh", "-c", `printf '%s|%s' "$DATABASE_URL" "$FEATURE_FLAG"`}, getenv, &childOutput, &cliDiagnostics); code != 0 {
 		t.Fatalf("run exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
 	}
 	if childOutput.String() != databaseValue+"|"+featureValue {
@@ -112,7 +112,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 	}
 
 	var deniedOutput bytes.Buffer
-	if code := executeCLI(ctx, []string{"export", "--project", "shop", "--env", "development", "--format", "json"}, getenv, &deniedOutput, &cliDiagnostics); code != 1 {
+	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "development", "--format", "json"}, getenv, &deniedOutput, &cliDiagnostics); code != 1 {
 		t.Fatalf("development export exit=%d output=%q diagnostics=%q", code, deniedOutput.String(), cliDiagnostics.CurrentString())
 	}
 	if !strings.Contains(cliDiagnostics.CurrentString(), "status 403") || !strings.Contains(cliDiagnostics.CurrentString(), "scope_denied") {
@@ -138,7 +138,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 	}
 
 	jsonOutput.Reset()
-	if code := executeCLI(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
+	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
 		t.Fatalf("post-rollback export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
 	}
 	decodeJSON(t, jsonOutput.Bytes(), &exported)
@@ -182,7 +182,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 
 	fixture.stop(t)
 	capturedLogs := fixture.logs.String() + cliDiagnostics.AllString()
-	for label, secret := range map[string]string{
+	secrets := map[string]string{
 		"configured value":           databaseValue,
 		"revision two value":         revisionTwoValue,
 		"feature value":              featureValue,
@@ -191,10 +191,9 @@ func TestRuntimeWorkflow(t *testing.T) {
 		"developer password":         developerPassword,
 		"session cookie":             session.cookie.Value,
 		"machine token":              issued.Token.Plaintext,
-	} {
-		if strings.Contains(capturedLogs, secret) {
-			t.Fatalf("captured logs contain %s", label)
-		}
+	}
+	if label, found := findSensitiveLogLeak(capturedLogs, secrets); found {
+		t.Fatalf("captured logs contain %s", label)
 	}
 	if development.ID == "" {
 		t.Fatal("development environment was not created")
@@ -221,20 +220,35 @@ type browserSession struct {
 	csrf   string
 }
 
+type cliExecutor func(context.Context, []string, func(string) string, io.Writer, io.Writer) int
+
 func TestDiagnosticLogRetainsEarlierCallsForLeakScan(t *testing.T) {
+	const sentinel = "early-cli-diagnostic-secret"
+	calls := 0
+	executor := func(_ context.Context, _ []string, _ func(string) string, _ io.Writer, diagnostics io.Writer) int {
+		calls++
+		message := "later safe diagnostics"
+		if calls == 1 {
+			message = sentinel
+		}
+		if _, err := io.WriteString(diagnostics, message); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	}
+
 	var diagnostics diagnosticLog
-	if _, err := io.WriteString(&diagnostics, "early-secret"); err != nil {
-		t.Fatal(err)
+	for range 2 {
+		if code := executeCLI(executor, context.Background(), nil, nil, io.Discard, &diagnostics); code != 0 {
+			t.Fatalf("execute CLI exit=%d", code)
+		}
 	}
-	diagnostics.ResetCurrent()
-	if _, err := io.WriteString(&diagnostics, "later diagnostics"); err != nil {
-		t.Fatal(err)
-	}
-	if got := diagnostics.CurrentString(); got != "later diagnostics" {
+	if got := diagnostics.CurrentString(); got != "later safe diagnostics" {
 		t.Fatalf("current diagnostics=%q", got)
 	}
-	if capturedLogs := diagnostics.AllString(); !strings.Contains(capturedLogs, "early-secret") {
-		t.Fatalf("leak scan input omitted earlier diagnostics: %q", capturedLogs)
+	label, found := findSensitiveLogLeak(diagnostics.AllString(), map[string]string{"early CLI diagnostics": sentinel})
+	if !found || label != "early CLI diagnostics" {
+		t.Fatalf("leak scan result label=%q found=%t", label, found)
 	}
 }
 
@@ -269,6 +283,15 @@ func (d *diagnosticLog) AllString() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.all.String()
+}
+
+func findSensitiveLogLeak(capturedLogs string, secrets map[string]string) (string, bool) {
+	for label, secret := range secrets {
+		if strings.Contains(capturedLogs, secret) {
+			return label, true
+		}
+	}
+	return "", false
 }
 
 type lockedBuffer struct {
@@ -505,9 +528,9 @@ func (f *runtimeFixture) requestJSON(t *testing.T, session *browserSession, meth
 	return result
 }
 
-func executeCLI(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, diagnostics *diagnosticLog) int {
+func executeCLI(executor cliExecutor, ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, diagnostics *diagnosticLog) int {
 	diagnostics.ResetCurrent()
-	return cli.Execute(ctx, args, getenv, stdout, diagnostics)
+	return executor(ctx, args, getenv, stdout, diagnostics)
 }
 
 func runtimeEnvironment(serverURL, token string) func(string) string {
