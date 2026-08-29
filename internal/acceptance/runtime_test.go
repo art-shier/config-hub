@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,8 +64,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 		}
 	})
 
-	session := fixture.login(t, "admin", adminPassword)
-	leakGuard.add("session cookie", session.cookie.Value)
+	session := fixture.login(t, "admin", adminPassword, leakGuard.add)
 	project := fixture.writeJSON(t, session, http.MethodPost, "/api/v1/projects", map[string]any{
 		"slug": "shop", "name": "Shop",
 	}, http.StatusCreated)
@@ -100,16 +100,12 @@ func TestRuntimeWorkflow(t *testing.T) {
 	issuedBody := fixture.writeJSON(t, session, http.MethodPost, "/api/v1/machine-identities/"+identity.Identity.ID+"/tokens", map[string]any{
 		"name": "runtime", "expires_at": time.Now().UTC().Add(time.Hour).Truncate(time.Second),
 	}, http.StatusCreated)
-	var issued struct {
-		Token machineaccess.IssuedToken `json:"token"`
+	issuedToken, err := decodeIssuedMachineToken(issuedBody, leakGuard.add)
+	if err != nil {
+		t.Fatal(err)
 	}
-	decodeJSON(t, issuedBody, &issued)
-	if !strings.HasPrefix(issued.Token.Plaintext, "ch_") {
-		t.Fatal("machine token plaintext was not returned at issuance")
-	}
-	leakGuard.add("machine token", issued.Token.Plaintext)
 
-	getenv := runtimeEnvironment(fixture.url, issued.Token.Plaintext)
+	getenv := runtimeEnvironment(fixture.url, issuedToken.Plaintext)
 	var jsonOutput, dotenvOutput, childOutput bytes.Buffer
 	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
 		t.Fatalf("JSON export exit=%d", code)
@@ -232,6 +228,8 @@ type browserSession struct {
 
 type cliExecutor func(context.Context, []string, func(string) string, io.Writer, io.Writer) int
 
+type dynamicSecretRegistrar func(label, secret string)
+
 type runtimeLeakGuard struct {
 	stop         func()
 	capturedLogs func() string
@@ -251,6 +249,31 @@ func (g *runtimeLeakGuard) add(label, secret string) {
 func (g *runtimeLeakGuard) stopAndScan() (string, bool) {
 	g.stop()
 	return findSensitiveLogLeak(g.capturedLogs(), g.secrets)
+}
+
+func validateIssuedMachineToken(token string, register dynamicSecretRegistrar) error {
+	if register != nil {
+		register("machine token", token)
+	}
+	if !strings.HasPrefix(token, "ch_") {
+		return errors.New("machine token plaintext was not returned at issuance")
+	}
+	return nil
+}
+
+func decodeIssuedMachineToken(contents []byte, register dynamicSecretRegistrar) (machineaccess.IssuedToken, error) {
+	var response struct {
+		Token machineaccess.IssuedToken `json:"token"`
+	}
+	decodeErr := json.Unmarshal(contents, &response)
+	validationErr := validateIssuedMachineToken(response.Token.Plaintext, register)
+	if decodeErr != nil {
+		return machineaccess.IssuedToken{}, fmt.Errorf("decode issued token: %w", decodeErr)
+	}
+	if validationErr != nil {
+		return machineaccess.IssuedToken{}, validationErr
+	}
+	return response.Token, nil
 }
 
 func TestDiagnosticLogRetainsEarlierCallsForLeakScan(t *testing.T) {
@@ -305,6 +328,58 @@ func TestRuntimeLeakGuardStopsBeforeScanningAndReportsOnlyLabel(t *testing.T) {
 	}
 }
 
+func TestDynamicCredentialsAreRegisteredBeforeValidationFailure(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		secret    string
+		wantLabel string
+		validate  func(dynamicSecretRegistrar) error
+	}{
+		{
+			name:      "session cookie",
+			secret:    "invalid-session-cookie-secret",
+			wantLabel: "session cookie",
+			validate: func(register dynamicSecretRegistrar) error {
+				cookie := captureSessionCookie([]*http.Cookie{{Name: "confighub_session", Value: "invalid-session-cookie-secret"}}, register)
+				_, err := validateBrowserSession([]byte(`{"csrf_token":""}`), cookie, register)
+				return err
+			},
+		},
+		{
+			name:      "CSRF token",
+			secret:    "invalid-csrf-token-secret",
+			wantLabel: "CSRF token",
+			validate: func(register dynamicSecretRegistrar) error {
+				_, err := validateBrowserSession([]byte(`{"csrf_token":"invalid-csrf-token-secret"}`), nil, register)
+				return err
+			},
+		},
+		{
+			name:      "machine token",
+			secret:    "invalid-machine-token-secret",
+			wantLabel: "machine token",
+			validate: func(register dynamicSecretRegistrar) error {
+				return validateIssuedMachineToken("invalid-machine-token-secret", register)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			guard := newRuntimeLeakGuard(func() {}, func() string { return "captured " + test.secret })
+			err := test.validate(guard.add)
+			if err == nil {
+				t.Fatal("invalid dynamic credential passed validation")
+			}
+			if strings.Contains(err.Error(), test.secret) {
+				t.Fatal("validation error disclosed the dynamic credential")
+			}
+			label, found := guard.stopAndScan()
+			if !found || label != test.wantLabel {
+				t.Fatalf("leak result label=%q found=%t", label, found)
+			}
+		})
+	}
+}
+
 func TestRuntimeServerRetriesAnOccupiedCandidatePort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -316,6 +391,7 @@ func TestRuntimeServerRetriesAnOccupiedCandidatePort(t *testing.T) {
 	defer occupied.Close()
 
 	attempts := 0
+	startedAt := time.Now()
 	fixture := startRuntimeServerWithAddressProvider(t, ctx, func() (string, error) {
 		attempts++
 		if attempts == 1 {
@@ -326,6 +402,41 @@ func TestRuntimeServerRetriesAnOccupiedCandidatePort(t *testing.T) {
 	t.Cleanup(func() { fixture.stop(t) })
 	if attempts < 2 {
 		t.Fatalf("address attempts=%d, want at least 2", attempts)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 1500*time.Millisecond {
+		t.Fatalf("occupied-port retry elapsed=%s, want less than 1.5s", elapsed)
+	}
+}
+
+func TestRuntimeReadinessCancelsAndJoinsProbeWhenProcessExits(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.WriteHeader(http.StatusServiceUnavailable)
+		response.(http.Flusher).Flush()
+		close(requestStarted)
+		<-request.Context().Done()
+		close(requestCanceled)
+	}))
+	defer server.Close()
+
+	fixture := &runtimeFixture{
+		url:         server.URL,
+		client:      server.Client(),
+		processDone: make(chan struct{}),
+	}
+	result := make(chan error, 1)
+	go func() { result <- fixture.waitReady(context.Background()) }()
+	<-requestStarted
+	close(fixture.processDone)
+
+	if err := <-result; !errors.Is(err, errRuntimeServerExited) {
+		t.Fatalf("readiness error=%v", err)
+	}
+	select {
+	case <-requestCanceled:
+	default:
+		t.Fatal("waitReady returned before the canceled probe and response completed")
 	}
 }
 
@@ -534,32 +645,101 @@ func (f *runtimeFixture) processResult() error {
 	return f.processErr
 }
 
+type readinessProbeResult struct {
+	status int
+	err    error
+}
+
 func (f *runtimeFixture) waitReady(ctx context.Context) error {
-	deadline := time.NewTimer(30 * time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
+	overallCtx, cancelOverall := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelOverall()
 	for {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url+"/api/v1/health/ready", nil)
-		if err != nil {
-			return fmt.Errorf("create readiness request: %w", err)
+		if err := f.readinessStopped(overallCtx, ctx); err != nil {
+			return err
 		}
-		response, err := f.client.Do(request)
-		if err == nil {
-			_, _ = io.Copy(io.Discard, response.Body)
-			_ = response.Body.Close()
-			if response.StatusCode == http.StatusOK {
-				return nil
-			}
+
+		probeCtx, cancelProbe := context.WithTimeout(overallCtx, 250*time.Millisecond)
+		probeDone := make(chan readinessProbeResult, 1)
+		go func() { probeDone <- f.runReadinessProbe(probeCtx) }()
+
+		var probe readinessProbeResult
+		select {
+		case <-f.processDone:
+			cancelProbe()
+			<-probeDone
+			return fmt.Errorf("%w: %v", errRuntimeServerExited, f.processResult())
+		case <-overallCtx.Done():
+			cancelProbe()
+			<-probeDone
+			return readinessContextError(overallCtx, ctx)
+		case probe = <-probeDone:
+			cancelProbe()
 		}
+
+		// The probe and process can complete together. Never accept readiness or
+		// launch another probe after the child has already exited.
 		select {
 		case <-f.processDone:
 			return fmt.Errorf("%w: %v", errRuntimeServerExited, f.processResult())
-		case <-ctx.Done():
-			return fmt.Errorf("readiness context: %w", ctx.Err())
-		case <-deadline.C:
-			return errors.New("readiness timed out")
-		case <-ticker.C:
+		default:
+		}
+		if probe.err == nil && probe.status == http.StatusOK {
+			return nil
+		}
+
+		retry := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-f.processDone:
+			stopTimer(retry)
+			return fmt.Errorf("%w: %v", errRuntimeServerExited, f.processResult())
+		case <-overallCtx.Done():
+			stopTimer(retry)
+			return readinessContextError(overallCtx, ctx)
+		case <-retry.C:
+		}
+	}
+}
+
+func (f *runtimeFixture) runReadinessProbe(ctx context.Context) readinessProbeResult {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url+"/api/v1/health/ready", nil)
+	if err != nil {
+		return readinessProbeResult{err: fmt.Errorf("create readiness request: %w", err)}
+	}
+	response, err := f.client.Do(request)
+	if err != nil {
+		return readinessProbeResult{err: err}
+	}
+	defer response.Body.Close()
+	_, copyErr := io.Copy(io.Discard, response.Body)
+	if copyErr != nil {
+		return readinessProbeResult{err: copyErr}
+	}
+	return readinessProbeResult{status: response.StatusCode}
+}
+
+func (f *runtimeFixture) readinessStopped(overallCtx, parentCtx context.Context) error {
+	select {
+	case <-f.processDone:
+		return fmt.Errorf("%w: %v", errRuntimeServerExited, f.processResult())
+	case <-overallCtx.Done():
+		return readinessContextError(overallCtx, parentCtx)
+	default:
+		return nil
+	}
+}
+
+func readinessContextError(overallCtx, parentCtx context.Context) error {
+	if err := parentCtx.Err(); err != nil {
+		return fmt.Errorf("readiness context: %w", err)
+	}
+	return fmt.Errorf("readiness timed out: %w", overallCtx.Err())
+}
+
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
 	}
 }
@@ -594,17 +774,31 @@ func (f *runtimeFixture) stop(t *testing.T) {
 	})
 }
 
-func (f *runtimeFixture) login(t *testing.T, username, password string) browserSession {
+func (f *runtimeFixture) login(t *testing.T, username, password string, register dynamicSecretRegistrar) browserSession {
 	t.Helper()
-	body := f.requestJSON(t, nil, http.MethodPost, "/api/v1/auth/login", map[string]any{"username": username, "password": password}, http.StatusOK)
+	body := f.requestJSON(t, nil, http.MethodPost, "/api/v1/auth/login", map[string]any{"username": username, "password": password}, http.StatusOK, register)
+	session, err := validateBrowserSession(body.contents, body.cookie, register)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func validateBrowserSession(contents []byte, cookie *http.Cookie, register dynamicSecretRegistrar) (browserSession, error) {
 	var response struct {
 		CSRF string `json:"csrf_token"`
 	}
-	decodeJSON(t, body.contents, &response)
-	if response.CSRF == "" || body.cookie == nil || body.cookie.Value == "" {
-		t.Fatalf("login response omitted browser credentials")
+	decodeErr := json.Unmarshal(contents, &response)
+	if register != nil {
+		register("CSRF token", response.CSRF)
 	}
-	return browserSession{cookie: body.cookie, csrf: response.CSRF}
+	if decodeErr != nil {
+		return browserSession{}, fmt.Errorf("decode login response: %w", decodeErr)
+	}
+	if response.CSRF == "" || cookie == nil || cookie.Value == "" {
+		return browserSession{}, errors.New("login response omitted browser credentials")
+	}
+	return browserSession{cookie: cookie, csrf: response.CSRF}, nil
 }
 
 func (f *runtimeFixture) createEnvironment(t *testing.T, session browserSession, slug, name string) projects.Environment {
@@ -631,7 +825,7 @@ func (f *runtimeFixture) replaceConfig(t *testing.T, session browserSession, bas
 
 func (f *runtimeFixture) writeJSON(t *testing.T, session browserSession, method, path string, payload any, status int) []byte {
 	t.Helper()
-	return f.requestJSON(t, &session, method, path, payload, status).contents
+	return f.requestJSON(t, &session, method, path, payload, status, nil).contents
 }
 
 type runtimeResponse struct {
@@ -639,7 +833,7 @@ type runtimeResponse struct {
 	cookie   *http.Cookie
 }
 
-func (f *runtimeFixture) requestJSON(t *testing.T, session *browserSession, method, path string, payload any, status int) runtimeResponse {
+func (f *runtimeFixture) requestJSON(t *testing.T, session *browserSession, method, path string, payload any, status int, register dynamicSecretRegistrar) runtimeResponse {
 	t.Helper()
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -659,6 +853,7 @@ func (f *runtimeFixture) requestJSON(t *testing.T, session *browserSession, meth
 	if err != nil {
 		t.Fatal(err)
 	}
+	result := runtimeResponse{cookie: captureSessionCookie(response.Cookies(), register)}
 	defer response.Body.Close()
 	contents, err := io.ReadAll(response.Body)
 	if err != nil {
@@ -667,13 +862,22 @@ func (f *runtimeFixture) requestJSON(t *testing.T, session *browserSession, meth
 	if response.StatusCode != status {
 		t.Fatalf("%s %s status=%d want=%d response_length=%d", method, path, response.StatusCode, status, len(contents))
 	}
-	result := runtimeResponse{contents: contents}
-	for _, cookie := range response.Cookies() {
-		if cookie.Name == "confighub_session" {
-			result.cookie = cookie
+	result.contents = contents
+	return result
+}
+
+func captureSessionCookie(cookies []*http.Cookie, register dynamicSecretRegistrar) *http.Cookie {
+	var sessionCookie *http.Cookie
+	for _, cookie := range cookies {
+		if cookie.Name != "confighub_session" {
+			continue
+		}
+		sessionCookie = cookie
+		if register != nil {
+			register("session cookie", cookie.Value)
 		}
 	}
-	return result
+	return sessionCookie
 }
 
 func executeCLI(executor cliExecutor, ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, diagnostics *diagnosticLog) int {

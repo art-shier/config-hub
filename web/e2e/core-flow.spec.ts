@@ -24,6 +24,7 @@ const revisionTwoDatabaseValue = "postgres://e2e-revision-two";
 const originalFeatureValue = "e2e-feature-revision-one";
 const sessionSigningKey = "e2e-session-key-012345678901234567890123456789012345";
 let issuedMachineToken = "";
+const observedBrowserCredentials = new Set<string>();
 
 interface E2ERuntime {
   origin: string;
@@ -45,7 +46,7 @@ test.afterAll(async () => {
     } catch {
       stopFailed = true;
     }
-    for (const secret of [adminPassword, developerPassword, sessionSigningKey, originalDatabaseValue, revisionTwoDatabaseValue, originalFeatureValue, issuedMachineToken]) {
+    for (const secret of [adminPassword, developerPassword, sessionSigningKey, originalDatabaseValue, revisionTwoDatabaseValue, originalFeatureValue, issuedMachineToken, ...observedBrowserCredentials]) {
       if (secret === "") continue;
       if (runtimeServer.logs().includes(secret)) {
         throw new Error("runtime logs contained browser credentials or configuration values");
@@ -135,8 +136,8 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
   await page.getByLabel("Token name").fill("browser-token");
   await page.getByRole("dialog").getByRole("button", { name: "Issue Token", exact: true }).click();
   const issuedToken = await page.getByLabel("Issued Token").textContent();
-  expect(issuedToken).toMatch(/^ch_[A-Za-z0-9_-]{43}$/u);
   issuedMachineToken = issuedToken ?? "";
+  expect(issuedToken).toMatch(/^ch_[A-Za-z0-9_-]{43}$/u);
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: runtimeServer.origin });
   await page.getByRole("button", { name: "Copy Token" }).click();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(issuedToken);
@@ -150,7 +151,16 @@ async function login(page: Page): Promise<void> {
   await page.goto(`${runtimeServer.origin}/login`);
   await page.getByLabel("Username").fill("admin");
   await page.getByLabel("Password").fill(adminPassword);
-  await page.getByRole("button", { name: "Sign in" }).click();
+  const [loginResponse] = await Promise.all([
+    page.waitForResponse((response) => new URL(response.url()).pathname === "/api/v1/auth/login" && response.request().method() === "POST"),
+    page.getByRole("button", { name: "Sign in" }).click(),
+  ]);
+  const sessionCookie = (await page.context().cookies(runtimeServer.origin)).find((cookie) => cookie.name === "confighub_session");
+  if (sessionCookie?.value) observedBrowserCredentials.add(sessionCookie.value);
+  const loginPayload = await loginResponse.json() as { csrf_token?: unknown };
+  if (typeof loginPayload.csrf_token === "string" && loginPayload.csrf_token !== "") {
+    observedBrowserCredentials.add(loginPayload.csrf_token);
+  }
   await expect(page).toHaveURL(`${runtimeServer.origin}/projects`);
   await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
 }
