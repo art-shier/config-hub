@@ -574,7 +574,7 @@ type revisionFixture struct {
 
 func newRevisionFixture(t *testing.T) *revisionFixture {
 	t.Helper()
-	store, err := database.Open(filepath.Join(t.TempDir(), "revisions.db"))
+	store, err := database.Open(filepath.Join(t.TempDir(), "database", "revisions.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -116,7 +116,7 @@ type administrationHTTPFixture struct {
 
 func newAdministrationHTTPFixture(t *testing.T) *administrationHTTPFixture {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "admin-http-secret-name.db")
+	path := filepath.Join(t.TempDir(), "database", "admin-http-secret-name.db")
 	store, err := database.Open(path)
 	if err != nil {
 		t.Fatal(err)

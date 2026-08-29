@@ -299,7 +299,7 @@ type projectHTTPFixture struct {
 
 func newProjectHTTPFixture(t *testing.T) *projectHTTPFixture {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "project-http.db")
+	path := filepath.Join(t.TempDir(), "database", "project-http.db")
 	store, err := database.Open(path)
 	if err != nil {
 		t.Fatal(err)

@@ -459,7 +459,7 @@ backup:
   directory: ./backups
 ```
 
-服务只信任来自 `trusted_proxy_cidrs` 的代理来源头，避免客户端伪造来源地址绕过登录限流。所有相对路径以项目运行目录为基准。
+服务只信任来自 `trusted_proxy_cidrs` 的代理来源头，避免客户端伪造来源地址绕过登录限流。所有相对路径以 `config.yaml` 所在目录为基准。
 
 ### 13.2 构建
 

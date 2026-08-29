@@ -361,7 +361,7 @@ func (s snapshotCredentials) Verify(context.Context, string, string) (auth.Verif
 }
 
 func TestLoginRejectsCredentialSnapshotAfterPasswordRotation(t *testing.T) {
-	store, err := database.Open(filepath.Join(t.TempDir(), "config-hub.db"))
+	store, err := database.Open(filepath.Join(t.TempDir(), "database", "config-hub.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +506,7 @@ func TestSessionDatabaseFailureMapsToSafeInternalError(t *testing.T) {
 }
 
 func TestLoginSQLiteBusyMapsToServiceUnavailable(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "busy-http.db")
+	path := filepath.Join(t.TempDir(), "database", "busy-http.db")
 	store, err := database.Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -621,7 +621,7 @@ func responseErrorCode(t *testing.T, response *httptest.ResponseRecorder) string
 
 func testRouter(t *testing.T, configure func(*Options)) (http.Handler, *database.Store, *bytes.Buffer) {
 	t.Helper()
-	store, err := database.Open(filepath.Join(t.TempDir(), "config-hub.db"))
+	store, err := database.Open(filepath.Join(t.TempDir(), "database", "config-hub.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

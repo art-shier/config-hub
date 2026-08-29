@@ -6,9 +6,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"modernc.org/sqlite"
 )
 
@@ -88,7 +90,7 @@ func TestInReadTxPropagatesCallbackErrorsAndRollsBackPanics(t *testing.T) {
 }
 
 func TestInTxClassifiesSQLiteBusyAndPreservesDriverError(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "busy.db")
+	path := filepath.Join(t.TempDir(), "database", "busy.db")
 	store, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +129,7 @@ func TestInTxClassifiesSQLiteBusyAndPreservesDriverError(t *testing.T) {
 }
 
 func TestOpenMigratesAndEnablesSQLiteSafety(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "confighub.db"))
+	store, err := Open(filepath.Join(t.TempDir(), "database", "confighub.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +176,7 @@ func TestEmbeddedMigrationsAcceptsInitialMigrationName(t *testing.T) {
 }
 
 func TestOpenIsIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "confighub.db")
+	path := filepath.Join(t.TempDir(), "database", "confighub.db")
 	first, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -684,13 +686,7 @@ func TestSchemaRejectsNullSingleColumnPrimaryKeys(t *testing.T) {
 }
 
 func TestOpenRestrictsDatabaseAndSidecarPermissions(t *testing.T) {
-	parent := filepath.Join(t.TempDir(), "shared-parent")
-	if err := os.Mkdir(parent, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(parent, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	parent := filepath.Join(t.TempDir(), "private-parent")
 	path := filepath.Join(parent, "confighub.db")
 	store, err := Open(path)
 	if err != nil {
@@ -704,6 +700,7 @@ func TestOpenRestrictsDatabaseAndSidecarPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDatabaseFilesPrivate(t, path)
+	assertDatabaseDirectoryPrivateOwned(t, parent)
 
 	existingPath := filepath.Join(parent, "existing.db")
 	if err := os.WriteFile(existingPath, nil, 0o644); err != nil {
@@ -722,8 +719,156 @@ func TestOpenRestrictsDatabaseAndSidecarPermissions(t *testing.T) {
 	assertDatabaseFilesPrivate(t, existingPath)
 }
 
+func TestDatabasePathStatsRequireCurrentOwnerAndExpectedFileTypes(t *testing.T) {
+	uid := uint32(os.Geteuid())
+	safeDirectory := unix.Stat_t{Uid: uid, Mode: unix.S_IFDIR | 0o700}
+	for name, stat := range map[string]unix.Stat_t{
+		"safe directory": safeDirectory,
+		"wrong owner":    {Uid: uid + 1, Mode: safeDirectory.Mode},
+		"group read":     {Uid: uid, Mode: unix.S_IFDIR | 0o740},
+		"sticky":         {Uid: uid, Mode: unix.S_IFDIR | 0o700 | unix.S_ISVTX},
+		"regular file":   {Uid: uid, Mode: unix.S_IFREG | 0o700},
+	} {
+		t.Run("directory "+name, func(t *testing.T) {
+			want := name == "safe directory"
+			if got := isSafeDatabaseDirectoryStat(&stat, uid); got != want {
+				t.Fatalf("isSafeDatabaseDirectoryStat()=%v, want %v", got, want)
+			}
+		})
+	}
+
+	safeFile := unix.Stat_t{Uid: uid, Mode: unix.S_IFREG | 0o600}
+	for name, stat := range map[string]unix.Stat_t{
+		"safe file":     safeFile,
+		"wrong owner":   {Uid: uid + 1, Mode: safeFile.Mode},
+		"directory":     {Uid: uid, Mode: unix.S_IFDIR | 0o600},
+		"symbolic link": {Uid: uid, Mode: unix.S_IFLNK | 0o777},
+	} {
+		t.Run("file "+name, func(t *testing.T) {
+			want := name == "safe file"
+			if got := isOwnedRegularDatabaseFileStat(&stat, uid); got != want {
+				t.Fatalf("isOwnedRegularDatabaseFileStat()=%v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsUnsafeExistingDatabaseDirectoryWithoutCreatingDatabase(t *testing.T) {
+	for _, mode := range []os.FileMode{0o755, 0o777} {
+		t.Run(mode.String(), func(t *testing.T) {
+			parent := filepath.Join(t.TempDir(), "unsafe-database-directory")
+			if err := os.Mkdir(parent, mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(parent, mode); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(parent, "confighub.db")
+
+			store, err := Open(path)
+			if store != nil {
+				_ = store.Close()
+			}
+			if err == nil {
+				t.Error("Open accepted an unsafe existing database directory")
+			} else {
+				assertDatabaseOpenErrorOmitsPaths(t, err, parent, path)
+			}
+			if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+				t.Errorf("database was created in unsafe directory: %v", statErr)
+			}
+			info, statErr := os.Lstat(parent)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if info.Mode().Perm() != mode {
+				t.Errorf("unsafe directory mode changed: got=%#o want=%#o", info.Mode().Perm(), mode)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsDatabaseSymlinkWithoutChangingTarget(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "database")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "sensitive-target")
+	targetContents := []byte("sensitive target contents")
+	if err := os.WriteFile(target, targetContents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "confighub.db")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if store != nil {
+		_ = store.Close()
+	}
+	if err == nil {
+		t.Error("Open followed a symlinked database path")
+	} else {
+		assertDatabaseOpenErrorOmitsPaths(t, err, path, target)
+	}
+	got, readErr := os.ReadFile(target)
+	if readErr != nil || string(got) != string(targetContents) {
+		t.Fatalf("database symlink target contents changed: contents=%q err=%v", got, readErr)
+	}
+	targetInfo, statErr := os.Stat(target)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if targetInfo.Mode().Perm() != 0o644 {
+		t.Fatalf("database symlink target mode changed: got=%#o want=0644", targetInfo.Mode().Perm())
+	}
+	linkInfo, statErr := os.Lstat(path)
+	if statErr != nil || linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("database symlink changed: info=%v err=%v", linkInfo, statErr)
+	}
+}
+
+func TestOpenRejectsSymlinkedDatabaseDirectory(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target-directory")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "database-directory")
+	if err := os.Symlink(target, parent); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "confighub.db")
+
+	store, err := Open(path)
+	if store != nil {
+		_ = store.Close()
+	}
+	if err == nil {
+		t.Error("Open followed a symlinked database directory")
+	} else {
+		assertDatabaseOpenErrorOmitsPaths(t, err, parent, target)
+	}
+	if _, statErr := os.Lstat(filepath.Join(target, "confighub.db")); !os.IsNotExist(statErr) {
+		t.Fatalf("database was created through a symlinked directory: %v", statErr)
+	}
+	linkInfo, statErr := os.Lstat(parent)
+	if statErr != nil || linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("database directory symlink changed: info=%v err=%v", linkInfo, statErr)
+	}
+}
+
 func TestOpenHardensExistingSidecarsBeforeSQLiteFailure(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "invalid.db")
+	parent := filepath.Join(t.TempDir(), "database")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "invalid.db")
 	for _, file := range []string{path, path + "-wal", path + "-shm"} {
 		if err := os.WriteFile(file, []byte("not a SQLite database"), 0o644); err != nil {
 			t.Fatal(err)
@@ -740,7 +885,11 @@ func TestOpenHardensExistingSidecarsBeforeSQLiteFailure(t *testing.T) {
 }
 
 func TestHardenDatabaseFilesRestrictsExistingSidecars(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "confighub.db")
+	parent := filepath.Join(t.TempDir(), "database")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "confighub.db")
 	for _, file := range []string{path, path + "-wal", path + "-shm"} {
 		if err := os.WriteFile(file, nil, 0o644); err != nil {
 			t.Fatal(err)
@@ -811,7 +960,7 @@ func TestConnectionsReceiveSafetyPragmasAndImmediateTransactions(t *testing.T) {
 }
 
 func TestOpenHandlesURISpecialCharactersInPath(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config hub ? #.db")
+	path := filepath.Join(t.TempDir(), "database", "config hub ? #.db")
 	store, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -824,7 +973,7 @@ func TestOpenHandlesURISpecialCharactersInPath(t *testing.T) {
 
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "confighub.db"))
+	store, err := Open(filepath.Join(t.TempDir(), "database", "confighub.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,6 +1017,26 @@ func assertFilesExactlyPrivate(t *testing.T, files ...string) {
 		}
 		if info.Mode().Perm() != 0o600 {
 			t.Fatalf("%s mode = %o, want 600", file, info.Mode().Perm())
+		}
+	}
+}
+
+func assertDatabaseDirectoryPrivateOwned(t *testing.T, path string) {
+	t.Helper()
+	var stat unix.Stat_t
+	if err := unix.Lstat(path, &stat); err != nil {
+		t.Fatal(err)
+	}
+	if !isSafeDatabaseDirectoryStat(&stat, uint32(os.Geteuid())) {
+		t.Fatalf("database directory mode=%#o uid=%d, want private directory owned by uid %d", stat.Mode, stat.Uid, os.Geteuid())
+	}
+}
+
+func assertDatabaseOpenErrorOmitsPaths(t *testing.T, err error, paths ...string) {
+	t.Helper()
+	for _, path := range paths {
+		if strings.Contains(err.Error(), path) {
+			t.Fatalf("database open error disclosed a filesystem path")
 		}
 	}
 }

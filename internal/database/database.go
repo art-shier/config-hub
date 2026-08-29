@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"path/filepath"
 
 	"modernc.org/sqlite"
@@ -48,10 +47,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve database path: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(absPath), 0o700); err != nil {
-		return nil, fmt.Errorf("create database directory: %w", err)
-	}
-	if err := ensurePrivateDatabaseFile(absPath); err != nil {
+	if err := prepareDatabasePath(absPath); err != nil {
 		return nil, err
 	}
 	if err := hardenDatabaseFiles(absPath); err != nil {
@@ -76,40 +72,6 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
-}
-
-func ensurePrivateDatabaseFile(path string) error {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return fmt.Errorf("create database file: %w", err)
-	}
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("restrict database file permissions: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close database file: %w", err)
-	}
-	return nil
-}
-
-func hardenDatabaseFiles(path string) error {
-	for _, file := range []struct {
-		path string
-		kind string
-	}{
-		{path: path, kind: "database"},
-		{path: path + "-wal", kind: "database WAL"},
-		{path: path + "-shm", kind: "database SHM"},
-	} {
-		if err := os.Chmod(file.path, 0o600); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return fmt.Errorf("restrict %s permissions: %w", file.kind, err)
-		}
-	}
-	return nil
 }
 
 func sqliteDSN(path string) string {

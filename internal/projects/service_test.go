@@ -226,7 +226,7 @@ type fixtureActors struct {
 
 func projectFixture(t *testing.T) (*Service, fixtureActors) {
 	t.Helper()
-	store, err := database.Open(filepath.Join(t.TempDir(), "projects.db"))
+	store, err := database.Open(filepath.Join(t.TempDir(), "database", "projects.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

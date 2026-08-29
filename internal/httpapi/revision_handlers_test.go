@@ -448,7 +448,7 @@ type revisionHTTPFixture struct {
 
 func newRevisionHTTPFixture(t *testing.T) *revisionHTTPFixture {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "revision-http.db")
+	path := filepath.Join(t.TempDir(), "database", "revision-http.db")
 	store, err := database.Open(path)
 	if err != nil {
 		t.Fatal(err)

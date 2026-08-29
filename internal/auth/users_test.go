@@ -421,7 +421,7 @@ func TestSyncUsersNeverRunsPasswordWorkInsideTransaction(t *testing.T) {
 
 func testStore(t *testing.T) *database.Store {
 	t.Helper()
-	store, err := database.Open(filepath.Join(t.TempDir(), "config-hub.db"))
+	store, err := database.Open(filepath.Join(t.TempDir(), "database", "config-hub.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

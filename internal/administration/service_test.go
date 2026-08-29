@@ -75,7 +75,7 @@ func (s testLifecycleStatus) LastSuccessfulUserSyncAt() time.Time { return s.las
 
 func openAdministrationStore(t *testing.T) *database.Store {
 	t.Helper()
-	store, err := database.Open(filepath.Join(t.TempDir(), "administration.db"))
+	store, err := database.Open(filepath.Join(t.TempDir(), "database", "administration.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

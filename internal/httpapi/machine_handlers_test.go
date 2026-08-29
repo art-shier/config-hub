@@ -510,7 +510,7 @@ func TestMachineHTTPCorruptSnapshotReturnsSafeInternalError(t *testing.T) {
 
 func newMachineHTTPFixture(t *testing.T) *machineHTTPFixture {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "machine-http.db")
+	path := filepath.Join(t.TempDir(), "database", "machine-http.db")
 	store, err := database.Open(path)
 	if err != nil {
 		t.Fatal(err)

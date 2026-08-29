@@ -772,7 +772,7 @@ func TestConcurrentTokenAuthenticationAndGrantReplacementIsRaceFree(t *testing.T
 
 func newMachineServiceFixture(t *testing.T) *machineServiceFixture {
 	t.Helper()
-	store, err := database.Open(filepath.Join(t.TempDir(), "machine-access.db"))
+	store, err := database.Open(filepath.Join(t.TempDir(), "database", "machine-access.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

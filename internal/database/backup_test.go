@@ -112,7 +112,7 @@ func TestBackupPublishesCompleteFileAtomicallyAndLosesDestinationRace(t *testing
 
 func TestBackupFailureCleansOnlyItsTemporaryFile(t *testing.T) {
 	dir := createSafeBackupDirectory(t)
-	sourcePath := filepath.Join(filepath.Dir(dir), "source.db")
+	sourcePath := filepath.Join(filepath.Dir(dir), "database", "source.db")
 	store, err := Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestBackupFailureCleansOnlyItsTemporaryFile(t *testing.T) {
 
 func TestBackupPublicationFailureRemovesOwnedRollbackJournalOnly(t *testing.T) {
 	dir := createSafeBackupDirectory(t)
-	sourcePath := filepath.Join(filepath.Dir(dir), "source.db")
+	sourcePath := filepath.Join(filepath.Dir(dir), "database", "source.db")
 	store, err := Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -462,7 +462,7 @@ func TestWalkDirectoryPathSyncsParentAfterMkdirCreationRace(t *testing.T) {
 
 func TestBackupParentSyncFailureAbortsWithoutPublicationOrRecursiveCleanup(t *testing.T) {
 	root := t.TempDir()
-	sourcePath := filepath.Join(root, "source.db")
+	sourcePath := filepath.Join(root, "database", "source.db")
 	store, err := Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -672,7 +672,7 @@ func TestOpenBackupSourceRejectsVersionOneSchemaMissingAnyCoreTableWithoutMutati
 	for _, missingTable := range migrationOneCoreTables {
 		t.Run(missingTable, func(t *testing.T) {
 			dir := t.TempDir()
-			sourcePath := filepath.Join(dir, "partial.db")
+			sourcePath := filepath.Join(dir, "database", "partial.db")
 			createVersionOneConfigHubFixture(t, sourcePath)
 			db, err := sql.Open(driverName, sourcePath)
 			if err != nil {
@@ -737,7 +737,7 @@ func TestOpenBackupSourceRejectsForeignMigrationLedgerWithUsersWithoutMutation(t
 
 func TestOpenBackupSourceBacksUpVersionOneSchemaWithoutMigratingOrMutatingIt(t *testing.T) {
 	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "version-one.db")
+	sourcePath := filepath.Join(dir, "database", "version-one.db")
 	createVersionOneConfigHubFixture(t, sourcePath)
 	before, err := os.ReadFile(sourcePath)
 	if err != nil {
@@ -791,7 +791,7 @@ func TestOpenBackupSourceBacksUpVersionOneSchemaWithoutMigratingOrMutatingIt(t *
 
 func TestOpenBackupSourceIncludesCommittedLiveWALData(t *testing.T) {
 	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.db")
+	sourcePath := filepath.Join(dir, "database", "source.db")
 	store, err := Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
