@@ -87,35 +87,36 @@ func TestRuntimeWorkflow(t *testing.T) {
 	}
 
 	getenv := runtimeEnvironment(fixture.url, issued.Token.Plaintext)
-	var jsonOutput, dotenvOutput, childOutput, cliDiagnostics bytes.Buffer
-	if code := cli.Execute(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
-		t.Fatalf("JSON export exit=%d diagnostics=%q", code, cliDiagnostics.String())
+	var jsonOutput, dotenvOutput, childOutput bytes.Buffer
+	var cliDiagnostics diagnosticLog
+	if code := executeCLI(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
+		t.Fatalf("JSON export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
 	}
 	var exported cli.ConfigResponse
 	decodeJSON(t, jsonOutput.Bytes(), &exported)
 	if exported.Revision != 1 || exported.Values["DATABASE_URL"] != databaseValue || exported.Values["FEATURE_FLAG"] != featureValue {
 		t.Fatalf("JSON export=%+v", exported)
 	}
-	if code := cli.Execute(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "dotenv"}, getenv, &dotenvOutput, &cliDiagnostics); code != 0 {
-		t.Fatalf("dotenv export exit=%d diagnostics=%q", code, cliDiagnostics.String())
+	if code := executeCLI(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "dotenv"}, getenv, &dotenvOutput, &cliDiagnostics); code != 0 {
+		t.Fatalf("dotenv export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
 	}
 	if !strings.Contains(dotenvOutput.String(), "DATABASE_URL=") || !strings.Contains(dotenvOutput.String(), "FEATURE_FLAG=") {
 		t.Fatalf("dotenv export omitted values: %q", dotenvOutput.String())
 	}
 
-	if code := cli.Execute(ctx, []string{"run", "--project", "shop", "--env", "production", "--", "sh", "-c", `printf '%s|%s' "$DATABASE_URL" "$FEATURE_FLAG"`}, getenv, &childOutput, &cliDiagnostics); code != 0 {
-		t.Fatalf("run exit=%d diagnostics=%q", code, cliDiagnostics.String())
+	if code := executeCLI(ctx, []string{"run", "--project", "shop", "--env", "production", "--", "sh", "-c", `printf '%s|%s' "$DATABASE_URL" "$FEATURE_FLAG"`}, getenv, &childOutput, &cliDiagnostics); code != 0 {
+		t.Fatalf("run exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
 	}
 	if childOutput.String() != databaseValue+"|"+featureValue {
 		t.Fatalf("child environment output=%q", childOutput.String())
 	}
 
-	var deniedOutput, deniedDiagnostics bytes.Buffer
-	if code := cli.Execute(ctx, []string{"export", "--project", "shop", "--env", "development", "--format", "json"}, getenv, &deniedOutput, &deniedDiagnostics); code != 1 {
-		t.Fatalf("development export exit=%d output=%q diagnostics=%q", code, deniedOutput.String(), deniedDiagnostics.String())
+	var deniedOutput bytes.Buffer
+	if code := executeCLI(ctx, []string{"export", "--project", "shop", "--env", "development", "--format", "json"}, getenv, &deniedOutput, &cliDiagnostics); code != 1 {
+		t.Fatalf("development export exit=%d output=%q diagnostics=%q", code, deniedOutput.String(), cliDiagnostics.CurrentString())
 	}
-	if !strings.Contains(deniedDiagnostics.String(), "status 403") || !strings.Contains(deniedDiagnostics.String(), "scope_denied") {
-		t.Fatalf("development denial diagnostics=%q", deniedDiagnostics.String())
+	if !strings.Contains(cliDiagnostics.CurrentString(), "status 403") || !strings.Contains(cliDiagnostics.CurrentString(), "scope_denied") {
+		t.Fatalf("development denial diagnostics=%q", cliDiagnostics.CurrentString())
 	}
 
 	revisionTwo := fixture.replaceConfig(t, session, 1, "runtime revision two", []revisions.Entry{
@@ -137,9 +138,8 @@ func TestRuntimeWorkflow(t *testing.T) {
 	}
 
 	jsonOutput.Reset()
-	cliDiagnostics.Reset()
-	if code := cli.Execute(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
-		t.Fatalf("post-rollback export exit=%d diagnostics=%q", code, cliDiagnostics.String())
+	if code := executeCLI(ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
+		t.Fatalf("post-rollback export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
 	}
 	decodeJSON(t, jsonOutput.Bytes(), &exported)
 	if exported.Revision != 3 || exported.Values["DATABASE_URL"] != databaseValue || exported.Values["FEATURE_FLAG"] != featureValue {
@@ -181,7 +181,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 	}
 
 	fixture.stop(t)
-	capturedLogs := fixture.logs.String() + cliDiagnostics.String() + deniedDiagnostics.String()
+	capturedLogs := fixture.logs.String() + cliDiagnostics.AllString()
 	for label, secret := range map[string]string{
 		"configured value":           databaseValue,
 		"revision two value":         revisionTwoValue,
@@ -219,6 +219,56 @@ type runtimeFixture struct {
 type browserSession struct {
 	cookie *http.Cookie
 	csrf   string
+}
+
+func TestDiagnosticLogRetainsEarlierCallsForLeakScan(t *testing.T) {
+	var diagnostics diagnosticLog
+	if _, err := io.WriteString(&diagnostics, "early-secret"); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics.ResetCurrent()
+	if _, err := io.WriteString(&diagnostics, "later diagnostics"); err != nil {
+		t.Fatal(err)
+	}
+	if got := diagnostics.CurrentString(); got != "later diagnostics" {
+		t.Fatalf("current diagnostics=%q", got)
+	}
+	if capturedLogs := diagnostics.AllString(); !strings.Contains(capturedLogs, "early-secret") {
+		t.Fatalf("leak scan input omitted earlier diagnostics: %q", capturedLogs)
+	}
+}
+
+type diagnosticLog struct {
+	mu      sync.Mutex
+	current bytes.Buffer
+	all     bytes.Buffer
+}
+
+func (d *diagnosticLog) Write(contents []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, err := d.all.Write(contents); err != nil {
+		return 0, err
+	}
+	return d.current.Write(contents)
+}
+
+func (d *diagnosticLog) ResetCurrent() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.current.Reset()
+}
+
+func (d *diagnosticLog) CurrentString() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.current.String()
+}
+
+func (d *diagnosticLog) AllString() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.all.String()
 }
 
 type lockedBuffer struct {
@@ -453,6 +503,11 @@ func (f *runtimeFixture) requestJSON(t *testing.T, session *browserSession, meth
 		}
 	}
 	return result
+}
+
+func executeCLI(ctx context.Context, args []string, getenv func(string) string, stdout io.Writer, diagnostics *diagnosticLog) int {
+	diagnostics.ResetCurrent()
+	return cli.Execute(ctx, args, getenv, stdout, diagnostics)
 }
 
 func runtimeEnvironment(serverURL, token string) func(string) string {
