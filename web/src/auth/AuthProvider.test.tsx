@@ -1,5 +1,5 @@
 import { StrictMode, useState } from "react";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
@@ -17,13 +17,35 @@ const adminSession = {
   expires_at: "2026-08-30T09:00:00Z",
 };
 
+const replacementSession = {
+  user: {
+    id: "user-replacement",
+    username: "grace",
+    display_name: "Grace Hopper",
+    role: "admin" as const,
+  },
+  csrf_token: "csrf-replacement-token",
+  expires_at: "2026-08-30T10:00:00Z",
+};
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
 function AuthProbe() {
   const { client, loading, login, logout, user } = useAuth();
   const [requestState, setRequestState] = useState("idle");
 
   return (
     <div>
-      <output>{loading ? "loading" : (user?.display_name ?? "signed out")}</output>
+      <output aria-label="Auth status">{loading ? "loading" : "ready"}</output>
+      <output aria-label="Current user">
+        {user?.display_name ?? "signed out"}
+      </output>
       <button
         type="button"
         onClick={() => void login("admin", "password")}
@@ -44,7 +66,18 @@ function AuthProbe() {
       >
         Load projects
       </button>
-      <output>{requestState}</output>
+      <button
+        type="button"
+        onClick={() => {
+          void client
+            .put("/projects/shop/environments/prod/config", {})
+            .catch(() => undefined)
+            .finally(() => setRequestState("saved"));
+        }}
+      >
+        Save project
+      </button>
+      <output aria-label="Request status">{requestState}</output>
     </div>
   );
 }
@@ -68,6 +101,7 @@ describe("AuthProvider", () => {
     );
 
     expect(await screen.findByText("Ada Lovelace")).toBeInTheDocument();
+    expect(screen.getByLabelText("Auth status")).toHaveTextContent("ready");
     expect(sessionRequests).toBe(1);
   });
 
@@ -98,7 +132,10 @@ describe("AuthProvider", () => {
         <AuthProbe />
       </AuthProvider>,
     );
-    expect(await screen.findByText("signed out")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByLabelText("Auth status")).toHaveTextContent("ready"),
+    );
+    expect(screen.getByLabelText("Current user")).toHaveTextContent("signed out");
 
     await userEvent.click(screen.getByRole("button", { name: "Log in probe" }));
 
@@ -129,7 +166,8 @@ describe("AuthProvider", () => {
     expect(csrfHeader).toBe("csrf-session-token");
   });
 
-  it("clears auth when an authenticated child request receives 401", async () => {
+  it("clears auth and CSRF when a current child request receives 401", async () => {
+    let mutationCSRF: string | null = "not-called";
     server.use(
       http.get("/api/v1/auth/session", () => HttpResponse.json(adminSession)),
       http.get("/api/v1/projects", () =>
@@ -145,6 +183,13 @@ describe("AuthProvider", () => {
           { status: 401 },
         ),
       ),
+      http.put(
+        "/api/v1/projects/shop/environments/prod/config",
+        ({ request }) => {
+          mutationCSRF = request.headers.get("X-CSRF-Token");
+          return HttpResponse.json({ revision: 1 });
+        },
+      ),
     );
 
     render(
@@ -158,5 +203,103 @@ describe("AuthProvider", () => {
 
     expect(await screen.findByText("signed out")).toBeInTheDocument();
     expect(screen.getByText("finished")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Save project" }));
+    await waitFor(() => expect(mutationCSRF).toBeNull());
+  });
+
+  it("ignores a stale child 401 after logout and replacement login", async () => {
+    const oldRequestStarted = createDeferred<void>();
+    const releaseOldRequest = createDeferred<void>();
+    let mutationCSRF: string | null = "not-called";
+    server.use(
+      http.get("/api/v1/auth/session", () => HttpResponse.json(adminSession)),
+      http.get("/api/v1/projects", async () => {
+        oldRequestStarted.resolve();
+        await releaseOldRequest.promise;
+        return HttpResponse.json(
+          {
+            error: {
+              code: "invalid_session",
+              message: "expired",
+              request_id: "req_old",
+              fields: {},
+            },
+          },
+          { status: 401 },
+        );
+      }),
+      http.post("/api/v1/auth/logout", () =>
+        new HttpResponse(null, { status: 204 }),
+      ),
+      http.post("/api/v1/auth/login", () =>
+        HttpResponse.json(replacementSession),
+      ),
+      http.put(
+        "/api/v1/projects/shop/environments/prod/config",
+        ({ request }) => {
+          mutationCSRF = request.headers.get("X-CSRF-Token");
+          return HttpResponse.json({ revision: 2 });
+        },
+      ),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    );
+    expect(await screen.findByText("Ada Lovelace")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Load projects" }));
+    await oldRequestStarted.promise;
+    await userEvent.click(screen.getByRole("button", { name: "Log out probe" }));
+    expect(await screen.findByText("signed out")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Log in probe" }));
+    expect(await screen.findByText("Grace Hopper")).toBeInTheDocument();
+
+    releaseOldRequest.resolve();
+    expect(await screen.findByText("finished")).toBeInTheDocument();
+    expect(screen.getByLabelText("Current user")).toHaveTextContent(
+      "Grace Hopper",
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Save project" }));
+    await waitFor(() => expect(mutationCSRF).toBe("csrf-replacement-token"));
+  });
+
+  it("ignores stale bootstrap success after a newer login under StrictMode", async () => {
+    const bootstrapStarted = createDeferred<void>();
+    const releaseBootstrap = createDeferred<void>();
+    server.use(
+      http.get("/api/v1/auth/session", async () => {
+        bootstrapStarted.resolve();
+        await releaseBootstrap.promise;
+        return HttpResponse.json(adminSession);
+      }),
+      http.post("/api/v1/auth/login", () =>
+        HttpResponse.json(replacementSession),
+      ),
+    );
+
+    render(
+      <StrictMode>
+        <AuthProvider>
+          <AuthProbe />
+        </AuthProvider>
+      </StrictMode>,
+    );
+    await bootstrapStarted.promise;
+
+    await userEvent.click(screen.getByRole("button", { name: "Log in probe" }));
+    expect(await screen.findByText("Grace Hopper")).toBeInTheDocument();
+
+    releaseBootstrap.resolve();
+    await waitFor(() =>
+      expect(screen.getByLabelText("Auth status")).toHaveTextContent("ready"),
+    );
+    expect(screen.getByLabelText("Current user")).toHaveTextContent(
+      "Grace Hopper",
+    );
   });
 });

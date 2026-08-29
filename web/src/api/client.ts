@@ -20,7 +20,9 @@ export class APIError extends Error {
 export class APIClient implements APIClientContract {
   constructor(
     private readonly getCSRFToken: () => string | null,
-    private readonly onUnauthorized: () => void = () => undefined,
+    private readonly onUnauthorized: (requestGeneration: number) => void =
+      () => undefined,
+    private readonly getRequestGeneration: () => number = () => 0,
   ) {}
 
   get<T>(path: string): Promise<T> {
@@ -44,6 +46,7 @@ export class APIClient implements APIClientContract {
     path: string,
     body?: unknown,
   ): Promise<T> {
+    const requestGeneration = this.getRequestGeneration();
     const url = safeAPIURL(path);
     const headers = new Headers({ Accept: "application/json" });
     const hasBody = method === "POST" || method === "PUT";
@@ -70,7 +73,7 @@ export class APIClient implements APIClientContract {
     if (!response.ok) {
       if (response.status === 401) {
         try {
-          this.onUnauthorized();
+          this.onUnauthorized(requestGeneration);
         } catch {
           // Authentication cleanup must not replace the typed server error.
         }

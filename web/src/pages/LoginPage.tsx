@@ -9,6 +9,7 @@ const knownDestinations = new Set([
   "/members",
   "/system",
 ]);
+const projectDestinationPattern = /^\/projects\/[a-z0-9][a-z0-9-]{0,62}$/u;
 
 interface LoginLocationState {
   from?: {
@@ -145,7 +146,8 @@ function safeDestination(state: unknown): string {
   if (
     from === undefined ||
     typeof from.pathname !== "string" ||
-    !knownDestinations.has(from.pathname)
+    (!knownDestinations.has(from.pathname) &&
+      !projectDestinationPattern.test(from.pathname))
   ) {
     return "/projects";
   }

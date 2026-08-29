@@ -184,9 +184,14 @@ describe("APIClient", () => {
       ),
     );
     const onUnauthorized = vi.fn();
-    const client = new APIClient(() => "csrf-token", onUnauthorized);
+    const client = new APIClient(
+      () => "csrf-token",
+      onUnauthorized,
+      () => 7,
+    );
 
     await expect(client.get("/projects")).rejects.toMatchObject({ status: 401 });
     expect(onUnauthorized).toHaveBeenCalledOnce();
+    expect(onUnauthorized).toHaveBeenCalledWith(7);
   });
 });

@@ -21,14 +21,26 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
+interface BootstrapRequest {
+  generation: number;
+  promise: Promise<Session>;
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const csrfTokenRef = useRef<string | null>(null);
+  const authGenerationRef = useRef(0);
   const mountedRef = useRef(false);
-  const bootstrapRequestRef = useRef<Promise<Session> | null>(null);
+  const bootstrapRequestRef = useRef<BootstrapRequest | null>(null);
 
-  const clearAuth = useCallback(() => {
+  const clearAuth = useCallback((expectedGeneration?: number) => {
+    const generation = expectedGeneration ?? authGenerationRef.current;
+    if (generation !== authGenerationRef.current) {
+      return;
+    }
+
+    authGenerationRef.current += 1;
     csrfTokenRef.current = null;
     if (mountedRef.current) {
       setUser(null);
@@ -40,32 +52,47 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clientRef.current = new APIClient(
       () => csrfTokenRef.current,
       clearAuth,
+      () => authGenerationRef.current,
     );
   }
   const client = clientRef.current;
 
-  const applySession = useCallback((session: Session) => {
-    csrfTokenRef.current = session.csrf_token;
-    if (mountedRef.current) {
+  const applySession = useCallback(
+    (session: Session, expectedGeneration: number) => {
+      if (
+        !mountedRef.current ||
+        expectedGeneration !== authGenerationRef.current
+      ) {
+        return;
+      }
+
+      authGenerationRef.current += 1;
+      csrfTokenRef.current = session.csrf_token;
       setUser(session.user);
-    }
-  }, []);
+    },
+    [],
+  );
 
   useEffect(() => {
     mountedRef.current = true;
     let active = true;
 
-    bootstrapRequestRef.current ??=
-      client.get<Session>("/auth/session");
-    void bootstrapRequestRef.current
+    if (bootstrapRequestRef.current === null) {
+      bootstrapRequestRef.current = {
+        generation: authGenerationRef.current,
+        promise: client.get<Session>("/auth/session"),
+      };
+    }
+    const bootstrapRequest = bootstrapRequestRef.current;
+    void bootstrapRequest.promise
       .then((session) => {
         if (active) {
-          applySession(session);
+          applySession(session, bootstrapRequest.generation);
         }
       })
       .catch(() => {
         if (active) {
-          clearAuth();
+          clearAuth(bootstrapRequest.generation);
         }
       })
       .finally(() => {
@@ -82,20 +109,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(
     async (username: string, password: string) => {
+      const generation = authGenerationRef.current;
       const session = await client.post<Session>("/auth/login", {
         username,
         password,
       });
-      applySession(session);
+      applySession(session, generation);
     },
     [applySession, client],
   );
 
   const logout = useCallback(async () => {
+    const generation = authGenerationRef.current;
     try {
       await client.post<void>("/auth/logout", {});
     } finally {
-      clearAuth();
+      clearAuth(generation);
     }
   }, [clearAuth, client]);
 
