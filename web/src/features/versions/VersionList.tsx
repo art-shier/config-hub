@@ -73,10 +73,14 @@ export function VersionList({
   }, [client, environmentSlug, projectSlug]);
 
   useEffect(() => {
+    rollingBackRef.current = false;
+    setRollingBack(false);
     setSelected(null);
     setDiff(null);
     setSelectedVersion(null);
     setRollbackTarget(null);
+    setRollbackMessage("");
+    setRollbackError("");
     void loadRevisions();
     return () => {
       listGenerationRef.current += 1;

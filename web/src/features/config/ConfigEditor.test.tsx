@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Link, RouterProvider, createMemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
@@ -155,6 +155,31 @@ describe("ConfigEditor", () => {
     expect(screen.getByLabelText("Change message")).toHaveAccessibleDescription("Message is required.");
     expect(screen.getByRole("alert")).toHaveTextContent("Review the marked fields");
     expect(screen.queryByText("SECRET")).not.toBeInTheDocument();
+  });
+
+  it("shows only expected top-level 422 fields inline and keeps the exact draft", async () => {
+    const api = client();
+    vi.mocked(api.put).mockRejectedValue(
+      new APIError(422, "validation_failed", "RAW ENVELOPE SECRET", "req", {
+        entries: "Combined entry content must be at most 1 byte.",
+        message: "Change message must be shorter.",
+        unexpected: "UNKNOWN FIELD SECRET",
+      }),
+    );
+    renderEditor(api);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText("Value for EMPTY"), " exact retained value ");
+    await user.type(screen.getByLabelText("Change message"), "retained message");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    const entriesEditor = await screen.findByRole("group", { name: "Configuration entries" });
+    expect(within(entriesEditor).getByText("Combined entry content must be at most 1 byte.")).toBeInTheDocument();
+    expect(entriesEditor).toHaveAccessibleDescription("Combined entry content must be at most 1 byte.");
+    expect(screen.getByLabelText("Value for EMPTY")).toHaveValue(" exact retained value ");
+    expect(screen.getByLabelText("Change message")).toHaveValue("retained message");
+    expect(screen.getByLabelText("Change message")).toHaveAccessibleDescription("Change message must be shorter.");
+    expect(screen.queryByText("RAW ENVELOPE SECRET")).not.toBeInTheDocument();
+    expect(screen.queryByText("UNKNOWN FIELD SECRET")).not.toBeInTheDocument();
   });
 
   it("installs dirty unload and router guards and supports Stay or Discard and leave", async () => {

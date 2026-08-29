@@ -41,6 +41,7 @@ export function ConfigEditor({
   const [message, setMessage] = useState("");
   const [baseRevision, setBaseRevision] = useState(revision.version);
   const [entryErrors, setEntryErrors] = useState<Record<string, EntryErrors>>({});
+  const [entriesError, setEntriesError] = useState("");
   const [messageError, setMessageError] = useState("");
   const [formError, setFormError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -85,11 +86,13 @@ export function ConfigEditor({
       const next = { ...current, [id]: { ...current[id], [field]: undefined } };
       return next;
     });
+    setEntriesError("");
     setFormError("");
   }
 
   function addEntry() {
     setDraft((current) => [...current, toDraftEntry({ key: "", value: "", service: "" })]);
+    setEntriesError("");
   }
 
   function deleteEntry(id: string) {
@@ -99,6 +102,7 @@ export function ConfigEditor({
       delete next[id];
       return next;
     });
+    setEntriesError("");
   }
 
   function requestCancel() {
@@ -121,6 +125,7 @@ export function ConfigEditor({
     }));
     const localErrors = validateEntries(draft);
     setEntryErrors(localErrors);
+    setEntriesError("");
     setMessageError("");
     setFormError("");
     if (Object.keys(localErrors).length > 0) {
@@ -147,6 +152,7 @@ export function ConfigEditor({
       if (error instanceof APIError && error.status === 422) {
         const mapped = mapServerValidation(error.fields, submittedIds);
         setEntryErrors(mapped.entryErrors);
+        setEntriesError(mapped.entriesError);
         setMessageError(mapped.messageError);
         setFormError("Review the marked fields and try again.");
       } else if (
@@ -211,7 +217,15 @@ export function ConfigEditor({
       </header>
 
       <form className="configuration-editor-form" onSubmit={(event) => void handleSubmit(event)}>
-        <div className="configuration-draft-list">
+        <div
+          className="configuration-draft-list"
+          role="group"
+          aria-label="Configuration entries"
+          aria-describedby={entriesError ? "configuration-entries-error" : undefined}
+        >
+          {entriesError ? (
+            <p className="field-error" id="configuration-entries-error">{entriesError}</p>
+          ) : null}
           {draft.map((entry, index) => (
             <DraftRow
               key={entry.id}

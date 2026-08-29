@@ -49,10 +49,15 @@ export function validateEntries(draft: DraftEntry[]): Record<string, EntryErrors
 export function mapServerValidation(
   fields: Record<string, string>,
   submittedIds: string[],
-): { entryErrors: Record<string, EntryErrors>; messageError: string } {
+): { entriesError: string; entryErrors: Record<string, EntryErrors>; messageError: string } {
+  let entriesError = "";
   const entryErrors: Record<string, EntryErrors> = {};
   let messageError = "";
   for (const [field, value] of Object.entries(fields)) {
+    if (field === "entries") {
+      entriesError = value;
+      continue;
+    }
     if (field === "message") {
       messageError = value;
       continue;
@@ -64,7 +69,7 @@ export function mapServerValidation(
       if (id) entryErrors[id] = { ...entryErrors[id], [entryField]: value };
     }
   }
-  return { entryErrors, messageError };
+  return { entriesError, entryErrors, messageError };
 }
 
 export function compareEntries(serverEntries: ConfigEntry[], localDraft: DraftEntry[]): Comparison[] {

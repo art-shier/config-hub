@@ -245,6 +245,80 @@ describe("VersionList", () => {
     expect(screen.getByRole("button", { name: "Create rollback version" })).toBeEnabled();
   });
 
+  it.each([
+    { scope: "environment", nextProject: "shop", nextEnvironment: "stage" },
+    { scope: "project", nextProject: "catalog", nextEnvironment: "prod" },
+  ])("ends an obsolete pending rollback after a $scope switch without unlocking the new operation", async ({
+    nextEnvironment,
+    nextProject,
+  }) => {
+    let rejectOldRollback!: (reason?: unknown) => void;
+    let resolveNewRollback!: (value: unknown) => void;
+    let oldRollbackSettled = false;
+    const oldRollback = new Promise<never>((_resolve, reject) => {
+      rejectOldRollback = reject;
+    });
+    void oldRollback.catch(() => {
+      oldRollbackSettled = true;
+    });
+    const newRollback = new Promise<never>((resolve) => {
+      resolveNewRollback = resolve as (value: unknown) => void;
+    });
+    const api = client();
+    const onRevisionChanged = vi.fn();
+    const nextListPath = `/projects/${nextProject}/environments/${nextEnvironment}/revisions`;
+    const oldRollbackPath = "/projects/shop/environments/prod/revisions/1/rollback";
+    const newRollbackPath = `${nextListPath}/2/rollback`;
+    vi.mocked(api.get).mockImplementation((path) => Promise.resolve({
+      revisions: path === nextListPath
+        ? [{ id: "next-r2", environment_id: "next-env", version: 2, message: "NEXT SCOPE", created_by: "lee", created_at: "2026-08-29T09:00:00Z" }]
+        : [{ id: "old-r1", environment_id: "old-env", version: 1, message: "OLD SCOPE", created_by: "ada", created_at: "2026-08-29T08:00:00Z" }],
+    }));
+    vi.mocked(api.post).mockImplementation((path) =>
+      path === oldRollbackPath ? oldRollback : newRollback,
+    );
+    const renderVersionList = (projectSlug: string, environmentSlug: string) => (
+      <StrictMode>
+        <VersionList
+          client={api}
+          projectSlug={projectSlug}
+          environmentSlug={environmentSlug}
+          canWrite
+          refreshEpoch={0}
+          onRevisionChanged={onRevisionChanged}
+        />
+      </StrictMode>
+    );
+    const view = render(renderVersionList("shop", "prod"));
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Rollback to version 1" }));
+    await user.click(screen.getByRole("button", { name: "Create rollback version" }));
+    expect(screen.getByRole("button", { name: "Creating rollback…" })).toBeDisabled();
+
+    view.rerender(renderVersionList(nextProject, nextEnvironment));
+    expect(await screen.findByText("NEXT SCOPE")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Rollback to version 2" }));
+    const nextSubmit = screen.getByRole("button", { name: "Create rollback version" });
+    expect(nextSubmit).toBeEnabled();
+    await user.click(nextSubmit);
+    expect(screen.getByRole("button", { name: "Creating rollback…" })).toBeDisabled();
+
+    rejectOldRollback(new APIError(503, "service_unavailable", "OLD SCOPE SECRET", "req", {}));
+    await waitFor(() => expect(oldRollbackSettled).toBe(true));
+    expect(screen.getByRole("button", { name: "Creating rollback…" })).toBeDisabled();
+    expect(screen.queryByText("OLD SCOPE SECRET")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    resolveNewRollback({
+      revision: { id: "next-r3", environment_id: "next-env", version: 3, message: "restore next", created_by: "ada", created_at: "2026-08-29T10:00:00Z", entries: [] },
+    });
+    await waitFor(() => expect(onRevisionChanged).toHaveBeenCalledTimes(1));
+    expect(onRevisionChanged).toHaveBeenCalledWith(expect.objectContaining({ id: "next-r3" }));
+    expect(api.post).toHaveBeenCalledWith(oldRollbackPath, { message: "" });
+    expect(api.post).toHaveBeenCalledWith(newRollbackPath, { message: "" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it("retains rollback message after a safe typed failure and hides write entry points from viewers", async () => {
     const api = client();
     vi.mocked(api.get).mockResolvedValue({
