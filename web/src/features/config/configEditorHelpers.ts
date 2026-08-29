@@ -29,6 +29,9 @@ export function sameSnapshot(draft: DraftEntry[], entries: ConfigEntry[]): boole
     .sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
   const orderedEntries = [...entries]
     .sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+  if (hasDuplicateNormalizedKey(normalizedDraft) || hasDuplicateNormalizedKey(orderedEntries)) {
+    return false;
+  }
   return normalizedDraft.length === orderedEntries.length && normalizedDraft.every((entry, index) => {
     const loaded = orderedEntries[index];
     return loaded !== undefined &&
@@ -36,6 +39,18 @@ export function sameSnapshot(draft: DraftEntry[], entries: ConfigEntry[]): boole
       entry.value === loaded.value &&
       entry.service === loaded.service;
   });
+}
+
+function hasDuplicateNormalizedKey(entries: ConfigEntry[]): boolean {
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (seen.has(key)) {
+      return true;
+    }
+    seen.add(key);
+  }
+  return false;
 }
 
 export function validateEntries(draft: DraftEntry[]): Record<string, EntryErrors> {

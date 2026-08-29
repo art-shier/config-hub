@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Link, RouterProvider, createMemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
@@ -101,6 +101,34 @@ describe("ConfigEditor", () => {
           { key: "FIRST", value: "  exact 😀\nline  ", service: "api" },
           { key: "NEW_KEY", value: "值 ", service: "worker" },
         ],
+      },
+    );
+  });
+
+  it("preserves untouched raw line endings while submitting mixed textarea edits", async () => {
+    const api = client();
+    vi.mocked(api.put).mockResolvedValue({ revision: { ...revision, version: 8 } });
+    renderEditor(api, {
+      ...revision,
+      entries: [{ key: "MIXED", value: "A\rB\r\nC\nD", service: "api" }],
+    });
+    const user = userEvent.setup();
+    const value = screen.getByLabelText("Value for MIXED");
+    expect(value).toHaveValue("A\nB\nC\nD");
+
+    fireEvent.change(value, { target: { value: ">A\nB\nC\nD" } });
+    fireEvent.change(value, { target: { value: ">A\nB!\nC\nD" } });
+    fireEvent.change(value, { target: { value: ">A\nB!\nC\nD<" } });
+    fireEvent.change(value, { target: { value: ">A\nB!C\nD<" } });
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(api.put).toHaveBeenCalledTimes(1));
+    expect(api.put).toHaveBeenCalledWith(
+      "/projects/shop/environments/prod/config",
+      {
+        base_revision: 7,
+        message: "",
+        entries: [{ key: "MIXED", value: ">A\rB!C\nD<", service: "api" }],
       },
     );
   });
@@ -360,6 +388,48 @@ describe("ConfigEditor", () => {
     await user.click(screen.getByRole("link", { name: "Project register" }));
     expect(await screen.findByRole("heading", { name: "Projects destination" })).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Leave without saving?" })).not.toBeInTheDocument();
+  });
+
+  it("remains dirty after adopting a matching server snapshot with duplicate keys", async () => {
+    const api = client();
+    vi.mocked(api.put).mockRejectedValue(
+      new APIError(409, "revision_conflict", "SECRET", "req", {}),
+    );
+    vi.mocked(api.get).mockResolvedValue({
+      revision: {
+        ...revision,
+        id: "revision-8",
+        version: 8,
+        entries: [
+          { key: "FIRST", value: "one", service: "api" },
+          { key: "FIRST", value: "two revised", service: "worker" },
+        ],
+      },
+    });
+    renderEditor(api, {
+      ...revision,
+      entries: [
+        { key: "FIRST", value: "one", service: "api" },
+        { key: "SECOND", value: "two", service: "worker" },
+      ],
+    });
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText("Value for SECOND"), " revised");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Configuration changed since you loaded it",
+    );
+
+    const secondKey = screen.getByLabelText("Key for SECOND");
+    await user.clear(secondKey);
+    await user.type(secondKey, " FIRST ");
+    await user.click(screen.getByRole("button", { name: "Refresh and compare" }));
+    await user.click(await screen.findByRole("button", { name: "Use version 8 as new base" }));
+
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    const dirtyEvent = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(dirtyEvent);
+    expect(dirtyEvent.defaultPrevented).toBe(true);
   });
 
   it("prevents double submit and keeps pending saves non-cancelable", async () => {

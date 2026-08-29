@@ -14,6 +14,7 @@ import {
   type DraftEntry,
   type EntryErrors,
 } from "./configEditorHelpers";
+import { applyTextareaValueEdit, toTextareaDisplayValue } from "./configValueEditing";
 
 interface CurrentRevisionResponse {
   revision: Revision;
@@ -440,11 +441,14 @@ function DraftRow({
         <label htmlFor={`draft-${entry.id}-value`}>Value for {label}</label>
         <textarea
           id={`draft-${entry.id}-value`}
-          value={entry.value}
+          value={toTextareaDisplayValue(entry.value)}
           disabled={disabled}
           aria-invalid={errors.value ? "true" : undefined}
           aria-describedby={errors.value ? errorId("value") : undefined}
-          onChange={(event) => onChange("value", event.currentTarget.value)}
+          onChange={(event) => onChange(
+            "value",
+            applyTextareaValueEdit(entry.value, event.currentTarget.value),
+          )}
         />
         {errors.value ? <p className="field-error" id={errorId("value")}>{errors.value}</p> : null}
       </div>
