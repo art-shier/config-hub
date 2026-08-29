@@ -8,10 +8,13 @@ const adminNavigation = [
   { to: "/members", label: "Members" },
   { to: "/system", label: "System" },
 ];
+const LOGOUT_ERROR_MESSAGE =
+  "ConfigHub couldn’t confirm sign-out. You’re still signed in. Check the server and try again.";
 
 export function AppShell() {
   const { logout, user } = useAuth();
   const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState("");
 
   if (user === null) {
     return null;
@@ -26,11 +29,14 @@ export function AppShell() {
     if (loggingOut) {
       return;
     }
+    setLogoutError("");
     setLoggingOut(true);
     try {
       await logout();
     } catch {
-      // AuthProvider clears local session state even if the server is unavailable.
+      setLogoutError(LOGOUT_ERROR_MESSAGE);
+    } finally {
+      setLoggingOut(false);
     }
   }
 
@@ -58,6 +64,16 @@ export function AppShell() {
           >
             {loggingOut ? "Signing out…" : "Sign out"}
           </button>
+          {logoutError ? (
+            <p
+              className="logout-error"
+              role="alert"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {logoutError}
+            </p>
+          ) : null}
         </div>
       </header>
       <div className="app-frame">

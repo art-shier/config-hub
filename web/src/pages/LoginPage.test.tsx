@@ -283,6 +283,53 @@ describe("authentication routes", () => {
     expect(screen.queryByRole("link", { name: "System" })).not.toBeInTheDocument();
   });
 
+  it("keeps the session visible and allows retry after logout is unconfirmed", async () => {
+    let logoutRequests = 0;
+    server.use(
+      http.get("/api/v1/auth/session", () => HttpResponse.json(adminSession)),
+      http.post("/api/v1/auth/logout", () => {
+        logoutRequests += 1;
+        if (logoutRequests === 1) {
+          return HttpResponse.json(
+            {
+              error: {
+                code: "service_unavailable",
+                message: "internal upstream SECRET",
+                request_id: "req_logout_retry",
+                fields: { csrf_token: "csrf-login-token" },
+              },
+            },
+            { status: 503 },
+          );
+        }
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+
+    renderAppAt("/projects");
+    expect(
+      await screen.findByRole("heading", { name: "Projects" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    const error = await screen.findByRole("alert");
+    expect(error).toHaveAttribute("aria-live", "polite");
+    expect(error).toHaveTextContent(
+      "ConfigHub couldn’t confirm sign-out. You’re still signed in. Check the server and try again.",
+    );
+    expect(error).not.toHaveTextContent("upstream");
+    expect(error).not.toHaveTextContent("csrf-login-token");
+    expect(screen.getByText("Ada Lovelace")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeEnabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(await screen.findByLabelText("Username")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/login");
+    expect(logoutRequests).toBe(2);
+  });
+
   it("returns to login when a current authenticated request receives 401", async () => {
     server.use(
       http.get("/api/v1/auth/session", () => HttpResponse.json(adminSession)),

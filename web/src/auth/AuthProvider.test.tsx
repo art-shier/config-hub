@@ -183,10 +183,14 @@ describe("AuthProvider", () => {
     expect(csrfHeader).toBe("csrf-session-token");
   });
 
-  it("clears auth and CSRF when logout fails without a 401", async () => {
+  it("retains auth and CSRF when logout fails but the session remains valid", async () => {
+    let sessionRequests = 0;
     let mutationCSRF: string | null = "not-called";
     server.use(
-      http.get("/api/v1/auth/session", () => HttpResponse.json(adminSession)),
+      http.get("/api/v1/auth/session", () => {
+        sessionRequests += 1;
+        return HttpResponse.json(adminSession);
+      }),
       http.post("/api/v1/auth/logout", () =>
         HttpResponse.json(
           {
@@ -209,6 +213,49 @@ describe("AuthProvider", () => {
       ),
     );
 
+    const { unmount } = render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    );
+    expect(await screen.findByText("Ada Lovelace")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Log out probe" }));
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Auth operation settlements"),
+      ).toHaveTextContent("1"),
+    );
+    expect(screen.getByLabelText("Current user")).toHaveTextContent(
+      "Ada Lovelace",
+    );
+    expect(sessionRequests).toBe(2);
+
+    await userEvent.click(screen.getByRole("button", { name: "Save project" }));
+    await waitFor(() => expect(mutationCSRF).toBe("csrf-session-token"));
+
+    unmount();
+    render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    );
+    expect(await screen.findByText("Ada Lovelace")).toBeInTheDocument();
+    expect(sessionRequests).toBe(3);
+  });
+
+  it("retains auth when logout returns content instead of no-content", async () => {
+    let sessionRequests = 0;
+    server.use(
+      http.get("/api/v1/auth/session", () => {
+        sessionRequests += 1;
+        return HttpResponse.json(adminSession);
+      }),
+      http.post("/api/v1/auth/logout", () =>
+        HttpResponse.json({ status: "not-confirmed" }),
+      ),
+    );
+
     render(
       <AuthProvider>
         <AuthProbe />
@@ -217,10 +264,107 @@ describe("AuthProvider", () => {
     expect(await screen.findByText("Ada Lovelace")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Log out probe" }));
-    expect(await screen.findByText("signed out")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Auth operation settlements"),
+      ).toHaveTextContent("1"),
+    );
+
+    expect(screen.getByLabelText("Current user")).toHaveTextContent(
+      "Ada Lovelace",
+    );
+    expect(sessionRequests).toBe(2);
+  });
+
+  it("retains known auth when logout and reconciliation are unavailable", async () => {
+    let sessionRequests = 0;
+    let mutationCSRF: string | null = "not-called";
+    server.use(
+      http.get("/api/v1/auth/session", () => {
+        sessionRequests += 1;
+        return sessionRequests === 1
+          ? HttpResponse.json(adminSession)
+          : HttpResponse.error();
+      }),
+      http.post("/api/v1/auth/logout", () => HttpResponse.error()),
+      http.put(
+        "/api/v1/projects/shop/environments/prod/config",
+        ({ request }) => {
+          mutationCSRF = request.headers.get("X-CSRF-Token");
+          return HttpResponse.json({ revision: 10 });
+        },
+      ),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    );
+    expect(await screen.findByText("Ada Lovelace")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Log out probe" }));
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Auth operation settlements"),
+      ).toHaveTextContent("1"),
+    );
+
+    expect(screen.getByLabelText("Current user")).toHaveTextContent(
+      "Ada Lovelace",
+    );
+    expect(sessionRequests).toBe(2);
 
     await userEvent.click(screen.getByRole("button", { name: "Save project" }));
-    await waitFor(() => expect(mutationCSRF).toBeNull());
+    await waitFor(() => expect(mutationCSRF).toBe("csrf-session-token"));
+  });
+
+  it("clears auth when logout reconciliation confirms an invalid session", async () => {
+    let sessionRequests = 0;
+    server.use(
+      http.get("/api/v1/auth/session", () => {
+        sessionRequests += 1;
+        if (sessionRequests === 1) {
+          return HttpResponse.json(adminSession);
+        }
+        return HttpResponse.json(
+          {
+            error: {
+              code: "invalid_session",
+              message: "signed out",
+              request_id: "req_logout_reconciled_signed_out",
+              fields: {},
+            },
+          },
+          { status: 401 },
+        );
+      }),
+      http.post("/api/v1/auth/logout", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "service_unavailable",
+              message: "outcome unavailable",
+              request_id: "req_logout_ambiguous",
+              fields: {},
+            },
+          },
+          { status: 503 },
+        ),
+      ),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    );
+    expect(await screen.findByText("Ada Lovelace")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Log out probe" }));
+
+    expect(await screen.findByText("signed out")).toBeInTheDocument();
+    expect(sessionRequests).toBe(2);
   });
 
   it("clears auth and CSRF when a current child request receives 401", async () => {

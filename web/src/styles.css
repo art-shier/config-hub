@@ -36,12 +36,10 @@
 }
 
 html {
-  min-width: 20rem;
   background: var(--canvas);
 }
 
 body {
-  min-width: 20rem;
   min-height: 100vh;
   margin: 0;
   background: var(--canvas);
@@ -392,6 +390,7 @@ a {
 
 .session-summary {
   display: grid;
+  max-width: 100%;
   min-width: 0;
   grid-template-columns: auto auto;
   align-items: center;
@@ -425,6 +424,17 @@ a {
 .quiet-button:hover:not(:disabled) {
   color: var(--ink);
   border-bottom-color: var(--copper);
+}
+
+.logout-error {
+  grid-column: 1 / -1;
+  max-width: 22rem;
+  margin: var(--space-2) 0 0;
+  color: var(--error);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 .app-frame {
@@ -565,7 +575,13 @@ a {
 
   .session-summary {
     display: flex;
+    max-width: 32rem;
+    flex-wrap: wrap;
     gap: var(--space-3);
+  }
+
+  .logout-error {
+    flex-basis: 100%;
   }
 
   .quiet-button {

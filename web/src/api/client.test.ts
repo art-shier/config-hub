@@ -91,6 +91,9 @@ describe("APIClient", () => {
       http.delete("/api/v1/projects/shop", () =>
         new HttpResponse(null, { status: 204 }),
       ),
+      http.post("/api/v1/auth/logout", () =>
+        new HttpResponse(null, { status: 205 }),
+      ),
     );
 
     const client = new APIClient(() => "csrf-token");
@@ -99,6 +102,64 @@ describe("APIClient", () => {
       client.get<{ projects: Array<{ slug: string }> }>("/projects"),
     ).resolves.toEqual({ projects: [{ slug: "shop" }] });
     await expect(client.delete("/projects/shop")).resolves.toBeUndefined();
+    await expect(
+      client.postNoContent("/auth/logout", {}),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects empty content-bearing success responses", async () => {
+    server.use(
+      http.get(
+        "/api/v1/projects",
+        () => new HttpResponse(null, { status: 200 }),
+      ),
+      http.post(
+        "/api/v1/auth/login",
+        () => new HttpResponse(null, { status: 201 }),
+      ),
+      http.put(
+        "/api/v1/projects/shop/environments/prod/config",
+        () => new HttpResponse(null, { status: 201 }),
+      ),
+    );
+
+    const client = new APIClient(() => "csrf-token");
+
+    for (const makeRequest of [
+      () => client.get<{ projects: unknown[] }>("/projects"),
+      () => client.post<{ ok: true }>("/auth/login", {}),
+      () =>
+        client.put<{ revision: number }>(
+          "/projects/shop/environments/prod/config",
+          {},
+        ),
+    ]) {
+      const request = makeRequest();
+      await expect(request).rejects.toMatchObject({
+        code: "unexpected_response",
+        message: "The server returned an unexpected response.",
+      });
+      await expect(request).rejects.toBeInstanceOf(APIError);
+    }
+  });
+
+  it("rejects representations for no-content operations", async () => {
+    server.use(
+      http.post("/api/v1/auth/logout", () => HttpResponse.json({ ok: true })),
+      http.delete("/api/v1/projects/shop", () =>
+        HttpResponse.json({ deleted: true }),
+      ),
+    );
+
+    const client = new APIClient(() => "csrf-token");
+
+    await expect(client.postNoContent("/auth/logout", {})).rejects.toMatchObject(
+      { status: 200, code: "unexpected_response" },
+    );
+    await expect(client.delete("/projects/shop")).rejects.toMatchObject({
+      status: 200,
+      code: "unexpected_response",
+    });
   });
 
   it.each([
@@ -106,16 +167,48 @@ describe("APIClient", () => {
     "//attacker.example/steal",
     "/../auth/session",
     "/%2e%2e/auth/session",
+    "/projects%2Fadmin",
+    "/projects%5Cadmin",
     "/projects\\..\\auth/session",
     "/projects#outside",
+    "/projects\u0000outside",
   ])("rejects unsafe API path %s before fetching", async (path) => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     const client = new APIClient(() => null);
 
-    await expect(client.get(path)).rejects.toThrow("safe relative API path");
-    expect(fetchSpy).not.toHaveBeenCalled();
+    try {
+      await expect(client.get(path)).rejects.toThrow("safe relative API path");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
 
-    fetchSpy.mockRestore();
+  it("keeps a safe query inside the API boundary", async () => {
+    let requestURL = "not-called";
+    server.use(
+      http.get("/api/v1/projects", ({ request }) => {
+        requestURL = request.url;
+        return HttpResponse.json({ projects: [] });
+      }),
+    );
+
+    const client = new APIClient(() => null);
+
+    await expect(
+      client.get("/projects?environment=prod&limit=20"),
+    ).resolves.toEqual({ projects: [] });
+    expect(new URL(requestURL).search).toBe("?environment=prod&limit=20");
+  });
+
+  it("propagates a network failure without inventing response data", async () => {
+    server.use(
+      http.get("/api/v1/projects", () => HttpResponse.error()),
+    );
+
+    const client = new APIClient(() => null);
+
+    await expect(client.get("/projects")).rejects.toBeInstanceOf(TypeError);
   });
 
   it("turns malformed error responses into safe typed errors", async () => {
@@ -183,14 +276,20 @@ describe("APIClient", () => {
         ),
       ),
     );
-    const onUnauthorized = vi.fn();
+    const onUnauthorized = vi.fn(() => {
+      throw new Error("authentication callback detail");
+    });
     const client = new APIClient(
       () => "csrf-token",
       onUnauthorized,
       () => 7,
     );
 
-    await expect(client.get("/projects")).rejects.toMatchObject({ status: 401 });
+    await expect(client.get("/projects")).rejects.toMatchObject({
+      status: 401,
+      code: "invalid_session",
+      message: "expired",
+    });
     expect(onUnauthorized).toHaveBeenCalledOnce();
     expect(onUnauthorized).toHaveBeenCalledWith(7);
   });

@@ -33,18 +33,23 @@ export class APIClient implements APIClientContract {
     return this.request<T>("POST", path, body);
   }
 
+  postNoContent(path: string, body: unknown): Promise<void> {
+    return this.request<void>("POST", path, body, true);
+  }
+
   put<T>(path: string, body: unknown): Promise<T> {
     return this.request<T>("PUT", path, body);
   }
 
   async delete(path: string): Promise<void> {
-    await this.request<void>("DELETE", path);
+    await this.request<void>("DELETE", path, undefined, true);
   }
 
   private async request<T>(
     method: "GET" | "POST" | "PUT" | "DELETE",
     path: string,
     body?: unknown,
+    expectsNoContent = false,
   ): Promise<T> {
     const requestGeneration = this.getRequestGeneration();
     const url = safeAPIURL(path);
@@ -68,7 +73,8 @@ export class APIClient implements APIClientContract {
       redirect: "error",
       body: hasBody ? JSON.stringify(body) : undefined,
     });
-    const responseText = response.status === 204 ? "" : await response.text();
+    const hasNoContent = response.status === 204 || response.status === 205;
+    const responseText = hasNoContent ? "" : await response.text();
 
     if (!response.ok) {
       if (response.status === 401) {
@@ -81,8 +87,14 @@ export class APIClient implements APIClientContract {
       throw toAPIError(response.status, responseText);
     }
 
-    if (responseText === "") {
+    if (hasNoContent) {
       return undefined as T;
+    }
+    if (expectsNoContent) {
+      throw unexpectedResponse(response.status);
+    }
+    if (responseText === "") {
+      throw unexpectedResponse(response.status);
     }
 
     try {
@@ -98,6 +110,7 @@ function safeAPIURL(path: string): string {
     !path.startsWith("/") ||
     path.startsWith("//") ||
     path.includes("#") ||
+    /%(?:2f|5c)/iu.test(path) ||
     /[\\\u0000-\u001f\u007f]/u.test(path)
   ) {
     throw new TypeError("Expected a safe relative API path.");

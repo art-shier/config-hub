@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { APIClient } from "../api/client";
+import { APIClient, APIError } from "../api/client";
 import type { Session, User } from "../api/types";
 
 interface AuthContextValue {
@@ -30,6 +30,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const csrfTokenRef = useRef<string | null>(null);
+  // Auth mutations run FIFO. The latest operation epoch alone owns visible UI,
+  // request generations gate ordinary 401 cleanup, and stale reconciliation may
+  // update only internal CSRF state before handing the queue to its next mutation.
   const operationEpochRef = useRef(0);
   const requestGenerationRef = useRef(0);
   const authTransitionPendingRef = useRef(false);
@@ -75,6 +78,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (mountedRef.current) {
       setUser(null);
     }
+  }, []);
+
+  const preserveAuthForOperation = useCallback((expectedEpoch: number) => {
+    if (expectedEpoch !== operationEpochRef.current) {
+      return;
+    }
+
+    authTransitionPendingRef.current = false;
+    requestGenerationRef.current += 1;
   }, []);
 
   const finishLoading = useCallback((expectedEpoch: number) => {
@@ -140,6 +152,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     },
     [applySession, clearAuthForOperation],
+  );
+
+  const reconcileLogoutSession = useCallback(
+    async (expectedEpoch: number) => {
+      const reconciliationClient = new APIClient(() => csrfTokenRef.current);
+      try {
+        const session = await reconciliationClient.get<Session>("/auth/session");
+        csrfTokenRef.current = session.csrf_token;
+        applySession(session, expectedEpoch);
+        return false;
+      } catch (error) {
+        if (isInvalidSession(error)) {
+          csrfTokenRef.current = null;
+          clearAuthForOperation(expectedEpoch);
+          return true;
+        }
+        preserveAuthForOperation(expectedEpoch);
+        return false;
+      }
+    },
+    [applySession, clearAuthForOperation, preserveAuthForOperation],
   );
 
   useEffect(() => {
@@ -220,11 +253,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await enqueueAuthMutation(async () => {
         const operationClient = new APIClient(() => csrfTokenRef.current);
         try {
-          await operationClient.post<void>("/auth/logout", {});
-          csrfTokenRef.current = null;
-        } finally {
-          clearAuthForOperation(epoch);
+          await operationClient.postNoContent("/auth/logout", {});
+        } catch (error) {
+          if (isInvalidSession(error)) {
+            csrfTokenRef.current = null;
+            clearAuthForOperation(epoch);
+            return;
+          }
+          if (await reconcileLogoutSession(epoch)) {
+            return;
+          }
+          throw error;
         }
+        csrfTokenRef.current = null;
+        clearAuthForOperation(epoch);
       });
     } finally {
       finishLoading(epoch);
@@ -234,6 +276,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearAuthForOperation,
     enqueueAuthMutation,
     finishLoading,
+    reconcileLogoutSession,
   ]);
 
   const value = useMemo<AuthContextValue>(
@@ -250,4 +293,12 @@ export function useAuth(): AuthContextValue {
     throw new Error("useAuth must be used within AuthProvider");
   }
   return context;
+}
+
+function isInvalidSession(error: unknown): boolean {
+  return (
+    error instanceof APIError &&
+    error.status === 401 &&
+    error.code === "invalid_session"
+  );
 }
