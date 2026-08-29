@@ -60,6 +60,48 @@ function renderEditor(
   return { api, onCancel, onSaved, router };
 }
 
+function dispatchTextareaEdit(
+  textarea: HTMLTextAreaElement,
+  {
+    data,
+    inputType,
+    nextDisplayValue,
+    nextSelection,
+    selectionEnd,
+    selectionStart,
+  }: {
+    data: string | null;
+    inputType: string;
+    nextDisplayValue: string;
+    nextSelection: number;
+    selectionStart: number;
+    selectionEnd: number;
+  },
+) {
+  textarea.focus();
+  textarea.setSelectionRange(selectionStart, selectionEnd);
+  fireEvent(textarea, new InputEvent("beforeinput", {
+    bubbles: true,
+    cancelable: true,
+    data,
+    inputType,
+  }));
+  const valueSetter = Object.getOwnPropertyDescriptor(
+    HTMLTextAreaElement.prototype,
+    "value",
+  )?.set;
+  if (valueSetter === undefined) {
+    throw new Error("Expected the native textarea value setter.");
+  }
+  valueSetter.call(textarea, nextDisplayValue);
+  textarea.setSelectionRange(nextSelection, nextSelection);
+  fireEvent(textarea, new InputEvent("input", {
+    bubbles: true,
+    data,
+    inputType,
+  }));
+}
+
 describe("ConfigEditor", () => {
   it("starts from the exact loaded snapshot", () => {
     renderEditor();
@@ -105,21 +147,49 @@ describe("ConfigEditor", () => {
     );
   });
 
-  it("preserves untouched raw line endings while submitting mixed textarea edits", async () => {
+  it("uses the selected adjacent newline when submitting mixed textarea edits", async () => {
     const api = client();
     vi.mocked(api.put).mockResolvedValue({ revision: { ...revision, version: 8 } });
     renderEditor(api, {
       ...revision,
-      entries: [{ key: "MIXED", value: "A\rB\r\nC\nD", service: "api" }],
+      entries: [{ key: "MIXED", value: "A\rB\r\r\nC\nD", service: "api" }],
     });
     const user = userEvent.setup();
-    const value = screen.getByLabelText("Value for MIXED");
-    expect(value).toHaveValue("A\nB\nC\nD");
+    const value = screen.getByLabelText<HTMLTextAreaElement>("Value for MIXED");
+    expect(value).toHaveValue("A\nB\n\nC\nD");
 
-    fireEvent.change(value, { target: { value: ">A\nB\nC\nD" } });
-    fireEvent.change(value, { target: { value: ">A\nB!\nC\nD" } });
-    fireEvent.change(value, { target: { value: ">A\nB!\nC\nD<" } });
-    fireEvent.change(value, { target: { value: ">A\nB!C\nD<" } });
+    dispatchTextareaEdit(value, {
+      data: ">",
+      inputType: "insertText",
+      nextDisplayValue: ">A\nB\n\nC\nD",
+      selectionStart: 0,
+      selectionEnd: 0,
+      nextSelection: 1,
+    });
+    dispatchTextareaEdit(value, {
+      data: "!",
+      inputType: "insertText",
+      nextDisplayValue: ">A\nB!\n\nC\nD",
+      selectionStart: 4,
+      selectionEnd: 4,
+      nextSelection: 5,
+    });
+    dispatchTextareaEdit(value, {
+      data: "<",
+      inputType: "insertText",
+      nextDisplayValue: ">A\nB!\n\nC\nD<",
+      selectionStart: 10,
+      selectionEnd: 10,
+      nextSelection: 11,
+    });
+    dispatchTextareaEdit(value, {
+      data: null,
+      inputType: "deleteContentForward",
+      nextDisplayValue: ">A\nB!\nC\nD<",
+      selectionStart: 5,
+      selectionEnd: 5,
+      nextSelection: 5,
+    });
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() => expect(api.put).toHaveBeenCalledTimes(1));
@@ -128,8 +198,26 @@ describe("ConfigEditor", () => {
       {
         base_revision: 7,
         message: "",
-        entries: [{ key: "MIXED", value: ">A\rB!C\nD<", service: "api" }],
+        entries: [{ key: "MIXED", value: ">A\rB!\r\nC\nD<", service: "api" }],
       },
+    );
+  });
+
+  it("rejects and announces an untracked edit that could corrupt raw line endings", () => {
+    renderEditor(client(), {
+      ...revision,
+      entries: [{ key: "MIXED", value: "A\rB", service: "api" }],
+    });
+    const value = screen.getByLabelText<HTMLTextAreaElement>("Value for MIXED");
+
+    fireEvent.change(value, { target: { value: "A\n!B" } });
+
+    expect(value).toHaveValue("A\nB");
+    expect(value).toHaveAccessibleDescription(
+      "That edit wasn’t applied because the browser did not provide a reliable text range. The original line endings are unchanged.",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "That edit wasn’t applied because the browser did not provide a reliable text range.",
     );
   });
 

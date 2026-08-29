@@ -14,13 +14,20 @@ import {
   type DraftEntry,
   type EntryErrors,
 } from "./configEditorHelpers";
-import { applyTextareaValueEdit, toTextareaDisplayValue } from "./configValueEditing";
+import {
+  applyTextareaValueEdit,
+  toTextareaDisplayValue,
+  type TextareaEditMetadata,
+} from "./configValueEditing";
 
 interface CurrentRevisionResponse {
   revision: Revision;
 }
 
 type ConflictState = "none" | "needs-refresh" | "refreshing" | "ready" | "refresh-error";
+
+const unsupportedValueEditMessage =
+  "That edit wasn’t applied because the browser did not provide a reliable text range. The original line endings are unchanged.";
 
 export function ConfigEditor({
   client,
@@ -419,6 +426,36 @@ function DraftRow({
 }) {
   const label = entry.key.trim() || "new entry";
   const errorId = (field: keyof ConfigEntry) => `draft-${entry.id}-${field}-error`;
+  const valueEditNoticeId = `draft-${entry.id}-value-edit-notice`;
+  const [valueEditNotice, setValueEditNotice] = useState("");
+  const pendingValueEditRef = useRef<(
+    Pick<TextareaEditMetadata, "inputType" | "selectionStart" | "selectionEnd"> & {
+      rawValue: string;
+    }
+  ) | null>(null);
+  const valueTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const latestRawValueRef = useRef(entry.value);
+  latestRawValueRef.current = entry.value;
+  useEffect(() => {
+    const textarea = valueTextareaRef.current;
+    if (textarea === null) {
+      return;
+    }
+    const captureValueEdit = (event: InputEvent) => {
+      pendingValueEditRef.current = {
+        inputType: event.inputType,
+        selectionStart: textarea.selectionStart,
+        selectionEnd: textarea.selectionEnd,
+        rawValue: latestRawValueRef.current,
+      };
+    };
+    textarea.addEventListener("beforeinput", captureValueEdit);
+    return () => textarea.removeEventListener("beforeinput", captureValueEdit);
+  }, []);
+  const valueDescription = [
+    errors.value ? errorId("value") : "",
+    valueEditNotice ? valueEditNoticeId : "",
+  ].filter(Boolean).join(" ") || undefined;
   return (
     <fieldset className="configuration-draft-row">
       <legend>Entry {index + 1}</legend>
@@ -440,17 +477,45 @@ function DraftRow({
       <div className="form-field draft-value-field">
         <label htmlFor={`draft-${entry.id}-value`}>Value for {label}</label>
         <textarea
+          ref={valueTextareaRef}
           id={`draft-${entry.id}-value`}
           value={toTextareaDisplayValue(entry.value)}
           disabled={disabled}
           aria-invalid={errors.value ? "true" : undefined}
-          aria-describedby={errors.value ? errorId("value") : undefined}
-          onChange={(event) => onChange(
-            "value",
-            applyTextareaValueEdit(entry.value, event.currentTarget.value),
-          )}
+          aria-describedby={valueDescription}
+          onBlur={() => {
+            pendingValueEditRef.current = null;
+          }}
+          onChange={(event) => {
+            const pending = pendingValueEditRef.current;
+            pendingValueEditRef.current = null;
+            const result = applyTextareaValueEdit(
+              entry.value,
+              event.currentTarget.value,
+              pending !== null && pending.rawValue === entry.value
+                ? {
+                    inputType: pending.inputType,
+                    selectionStart: pending.selectionStart,
+                    selectionEnd: pending.selectionEnd,
+                    nextSelectionStart: event.currentTarget.selectionStart,
+                    nextSelectionEnd: event.currentTarget.selectionEnd,
+                  }
+                : null,
+            );
+            if (result.kind === "unsupported") {
+              setValueEditNotice(unsupportedValueEditMessage);
+              return;
+            }
+            setValueEditNotice("");
+            onChange("value", result.value);
+          }}
         />
         {errors.value ? <p className="field-error" id={errorId("value")}>{errors.value}</p> : null}
+        {valueEditNotice ? (
+          <p className="field-error" id={valueEditNoticeId} role="alert">
+            {valueEditNotice}
+          </p>
+        ) : null}
       </div>
       <div className="form-field draft-service-field">
         <label htmlFor={`draft-${entry.id}-service`}>Service for {label}</label>
