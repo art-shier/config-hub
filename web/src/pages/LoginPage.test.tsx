@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { delay, http, HttpResponse } from "msw";
@@ -12,6 +13,8 @@ import { App } from "../app/App";
 import { AuthProvider } from "../auth/AuthProvider";
 import { server } from "../test/setup";
 import { LoginPage } from "./LoginPage";
+
+const styles = readFileSync("src/styles.css", "utf8");
 
 const adminSession = {
   user: {
@@ -357,5 +360,19 @@ describe("authentication routes", () => {
 
     expect(await screen.findByLabelText("Username")).toBeInTheDocument();
     expect(window.location.pathname).toBe("/login");
+  });
+});
+
+describe("responsive authentication styles", () => {
+  it("does not force narrow text-zoomed viewports wider than the page", () => {
+    expect(styles).toContain(":root");
+    expect(styles).not.toMatch(/\bhtml\s*\{[^}]*\bmin-width\s*:/u);
+    expect(styles).not.toMatch(/\bbody\s*\{[^}]*\bmin-width\s*:/u);
+  });
+
+  it("wraps logout feedback within the session summary", () => {
+    expect(styles).toMatch(
+      /\.logout-error\s*\{[^}]*\boverflow-wrap\s*:\s*anywhere/u,
+    );
   });
 });
