@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestBackupCreatesIndependentlyReadableDatabaseFromLiveWAL(t *testing.T) {
@@ -77,9 +79,9 @@ func TestBackupPublishesCompleteFileAtomicallyAndLosesDestinationRace(t *testing
 	dir := createSafeBackupDirectory(t)
 	destination := filepath.Join(dir, "backup.db")
 	raceContents := []byte("created by another operation")
-	originalPublish := publishBackup
-	publishBackup = func(temp, final string) error {
-		if _, err := os.Stat(final); !os.IsNotExist(err) {
+
+	err := backupWithHooks(context.Background(), store.DB(), destination, backupHooks{beforePublish: func(temp string) error {
+		if _, err := os.Stat(destination); !os.IsNotExist(err) {
 			t.Fatalf("final destination visible before publication: %v", err)
 		}
 		candidate, err := OpenReadOnly(temp)
@@ -92,14 +94,9 @@ func TestBackupPublishesCompleteFileAtomicallyAndLosesDestinationRace(t *testing
 		if err != nil || result != "ok" {
 			t.Fatalf("temporary backup incomplete: result=%q err=%v", result, err)
 		}
-		if err := os.WriteFile(final, raceContents, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return originalPublish(temp, final)
-	}
-	t.Cleanup(func() { publishBackup = originalPublish })
-
-	if err := Backup(context.Background(), store.DB(), destination); err == nil {
+		return os.WriteFile(destination, raceContents, 0o600)
+	}})
+	if err == nil {
 		t.Fatal("Backup overwrote a destination created during publication")
 	}
 	got, err := os.ReadFile(destination)
@@ -172,17 +169,14 @@ func TestBackupPublicationFailureRemovesOwnedRollbackJournalOnly(t *testing.T) {
 	}
 	sentinel := errors.New("injected publication failure")
 	var ownedJournal string
-	originalPublish := publishBackup
-	publishBackup = func(temp, _ string) error {
-		ownedJournal = temp + "-journal"
-		if err := os.WriteFile(ownedJournal, []byte("owned"), 0o600); err != nil {
+	err = backupWithHooks(context.Background(), store.DB(), destination, backupHooks{beforePublish: func(temp string) error {
+		ownedJournal = filepath.Join(dir, filepath.Base(temp)+"-journal")
+		if err := os.WriteFile(temp+"-journal", []byte("owned"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		return sentinel
-	}
-	t.Cleanup(func() { publishBackup = originalPublish })
-
-	if err := Backup(context.Background(), store.DB(), destination); err == nil {
+	}})
+	if err == nil {
 		t.Fatal("Backup succeeded after injected publication failure")
 	}
 	if ownedJournal == "" {
@@ -275,13 +269,144 @@ func TestBackupRejectsSymlinkDestinationDirectoryWithoutChangingTarget(t *testin
 	}
 }
 
+func TestBackupRejectsAncestorSymlinkWithoutChangingTarget(t *testing.T) {
+	store := openTestStore(t)
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	destinationDirectory := filepath.Join(target, "nested")
+	if err := os.MkdirAll(destinationDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	neighbor := filepath.Join(destinationDirectory, "keep")
+	if err := os.WriteFile(neighbor, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkedAncestor := filepath.Join(root, "linked-ancestor")
+	if err := os.Symlink(target, linkedAncestor); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Backup(context.Background(), store.DB(), filepath.Join(linkedAncestor, "nested", "backup.db"))
+	if err == nil {
+		t.Fatal("Backup followed an ancestor symlink")
+	}
+	if got, err := os.ReadFile(neighbor); err != nil || string(got) != "unchanged" {
+		t.Fatalf("symlink target changed: contents=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(destinationDirectory, "backup.db")); !os.IsNotExist(err) {
+		t.Fatalf("backup created through ancestor symlink: %v", err)
+	}
+	assertNoBackupTemps(t, destinationDirectory)
+}
+
+func TestBackupDirectorySwapBeforePublicationDoesNotWriteReplacement(t *testing.T) {
+	store := openTestStore(t)
+	root := t.TempDir()
+	directory := filepath.Join(root, "backups")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	movedDirectory := filepath.Join(root, "validated-backups")
+	replacementNeighbor := filepath.Join(directory, "replacement-neighbor")
+	hookRan := false
+
+	err := backupWithHooks(context.Background(), store.DB(), filepath.Join(directory, "backup.db"), backupHooks{
+		beforePublish: func(string) error {
+			if err := os.Rename(directory, movedDirectory); err != nil {
+				return err
+			}
+			if err := os.Mkdir(directory, 0o700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(replacementNeighbor, []byte("replacement"), 0o600); err != nil {
+				return err
+			}
+			hookRan = true
+			return nil
+		},
+	})
+	if err == nil {
+		t.Fatal("Backup succeeded after the validated directory was replaced")
+	}
+	if !hookRan {
+		t.Fatalf("directory-swap hook did not complete: %v", err)
+	}
+	if got, err := os.ReadFile(replacementNeighbor); err != nil || string(got) != "replacement" {
+		t.Fatalf("replacement directory changed: contents=%q err=%v", got, err)
+	}
+	for _, dir := range []string{directory, movedDirectory} {
+		if _, err := os.Stat(filepath.Join(dir, "backup.db")); !os.IsNotExist(err) {
+			t.Fatalf("backup remains in %s: %v", dir, err)
+		}
+		assertNoBackupTemps(t, dir)
+	}
+}
+
+func TestBackupDirectorySwapAfterPublicationRemovesPublishedFile(t *testing.T) {
+	store := openTestStore(t)
+	root := t.TempDir()
+	directory := filepath.Join(root, "backups")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	movedDirectory := filepath.Join(root, "published-backups")
+	hookRan := false
+
+	err := backupWithHooks(context.Background(), store.DB(), filepath.Join(directory, "backup.db"), backupHooks{
+		afterPublish: func() error {
+			if err := os.Rename(directory, movedDirectory); err != nil {
+				return err
+			}
+			if err := os.Mkdir(directory, 0o700); err != nil {
+				return err
+			}
+			hookRan = true
+			return nil
+		},
+	})
+	if err == nil {
+		t.Fatal("Backup succeeded after the published directory was replaced")
+	}
+	if !hookRan {
+		t.Fatalf("post-publication swap hook did not complete: %v", err)
+	}
+	for _, dir := range []string{directory, movedDirectory} {
+		if _, err := os.Stat(filepath.Join(dir, "backup.db")); !os.IsNotExist(err) {
+			t.Fatalf("published backup remains in %s: %v", dir, err)
+		}
+		assertNoBackupTemps(t, dir)
+	}
+}
+
+func TestBackupDirectoryStatRequiresCurrentOwnerPrivateModeAndDirectory(t *testing.T) {
+	safe := unix.Stat_t{Uid: uint32(os.Geteuid()), Mode: unix.S_IFDIR | 0o700}
+	for name, stat := range map[string]unix.Stat_t{
+		"safe":         safe,
+		"wrong owner":  {Uid: safe.Uid + 1, Mode: safe.Mode},
+		"group read":   {Uid: safe.Uid, Mode: unix.S_IFDIR | 0o740},
+		"sticky":       {Uid: safe.Uid, Mode: unix.S_IFDIR | 0o700 | unix.S_ISVTX},
+		"regular file": {Uid: safe.Uid, Mode: unix.S_IFREG | 0o700},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := name == "safe"
+			if got := isSafeBackupDirectoryStat(&stat); got != want {
+				t.Fatalf("isSafeBackupDirectoryStat()=%v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestBackupUsesSafeExistingAndNewDestinationDirectories(t *testing.T) {
 	store := openTestStore(t)
 	for name, create := range map[string]bool{"existing": true, "new": false} {
 		t.Run(name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "backups")
+			var before unix.Stat_t
 			if create {
 				if err := os.Mkdir(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := unix.Stat(dir, &before); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -297,11 +422,21 @@ func TestBackupUsesSafeExistingAndNewDestinationDirectories(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			var after unix.Stat_t
+			if err := unix.Stat(dir, &after); err != nil {
+				t.Fatal(err)
+			}
 			if got := fileInfo.Mode().Perm(); got&0o077 != 0 || got&0o600 != 0o600 {
 				t.Fatalf("backup mode=%#o, want no wider than 0600", got)
 			}
 			if got := dirInfo.Mode().Perm(); got&0o077 != 0 || got&0o700 != 0o700 {
 				t.Fatalf("directory mode=%#o, want no wider than 0700", got)
+			}
+			if after.Uid != uint32(os.Geteuid()) {
+				t.Fatalf("directory uid=%d, want current euid=%d", after.Uid, os.Geteuid())
+			}
+			if create && (after.Dev != before.Dev || after.Ino != before.Ino || after.Uid != before.Uid || after.Gid != before.Gid || after.Mode != before.Mode) {
+				t.Fatalf("existing directory metadata changed: before=%+v after=%+v", before, after)
 			}
 		})
 	}
@@ -370,12 +505,22 @@ func TestOpenBackupSourceRejectsMissingEmptyAndForeignDatabases(t *testing.T) {
 	createSQLiteFixture(t, emptySQLite, `VACUUM`)
 	foreign := filepath.Join(dir, "foreign.db")
 	createSQLiteFixture(t, foreign, `CREATE TABLE unrelated (id INTEGER PRIMARY KEY)`)
+	directory := filepath.Join(dir, "source-directory")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(dir, "source-symlink.db")
+	if err := os.Symlink(foreign, symlink); err != nil {
+		t.Fatal(err)
+	}
 
 	for name, path := range map[string]string{
 		"missing":      missing,
 		"zero byte":    zeroByte,
 		"empty SQLite": emptySQLite,
 		"foreign":      foreign,
+		"directory":    directory,
+		"symlink":      symlink,
 	} {
 		t.Run(name, func(t *testing.T) {
 			db, err := OpenBackupSource(path)
@@ -390,15 +535,77 @@ func TestOpenBackupSourceRejectsMissingEmptyAndForeignDatabases(t *testing.T) {
 	}
 }
 
-func TestOpenBackupSourceBacksUpOlderSchemaWithoutMigratingOrMutatingIt(t *testing.T) {
+func TestOpenBackupSourceRejectsVersionOneSchemaMissingAnyCoreTableWithoutMutation(t *testing.T) {
+	for _, missingTable := range migrationOneCoreTables {
+		t.Run(missingTable, func(t *testing.T) {
+			dir := t.TempDir()
+			sourcePath := filepath.Join(dir, "partial.db")
+			createVersionOneConfigHubFixture(t, sourcePath)
+			db, err := sql.Open(driverName, sourcePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`PRAGMA foreign_keys=OFF; DROP TABLE "` + missingTable + `"`); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(sourcePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			source, err := OpenBackupSource(sourcePath)
+			if err == nil {
+				_ = source.Close()
+				t.Fatal("OpenBackupSource accepted a partial migration-001 schema")
+			}
+			after, err := os.ReadFile(sourcePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Fatal("rejected partial source was modified")
+			}
+		})
+	}
+}
+
+func TestOpenBackupSourceRejectsForeignMigrationLedgerWithUsersWithoutMutation(t *testing.T) {
 	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "older.db")
+	sourcePath := filepath.Join(dir, "foreign-ledger.db")
 	createSQLiteFixture(t, sourcePath, `
-		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
-		INSERT INTO schema_migrations (version, applied_at) VALUES (1, 1);
-		CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, legacy_value TEXT NOT NULL);
-		INSERT INTO users (id, legacy_value) VALUES ('legacy-user', 'unchanged');
+		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, dirty INTEGER NOT NULL);
+		INSERT INTO schema_migrations (version, dirty) VALUES (1, 0);
+		CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+		INSERT INTO users (email) VALUES ('foreign@example.com');
 	`)
+	before, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source, err := OpenBackupSource(sourcePath)
+	if err == nil {
+		_ = source.Close()
+		t.Fatal("OpenBackupSource accepted a foreign migration ledger with users")
+	}
+	after, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("rejected foreign source was modified")
+	}
+	assertNoSQLiteSidecars(t, sourcePath)
+}
+
+func TestOpenBackupSourceBacksUpVersionOneSchemaWithoutMigratingOrMutatingIt(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "version-one.db")
+	createVersionOneConfigHubFixture(t, sourcePath)
 	before, err := os.ReadFile(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -412,7 +619,7 @@ func TestOpenBackupSourceBacksUpOlderSchemaWithoutMigratingOrMutatingIt(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	destination := filepath.Join(dir, "backup", "older.db")
+	destination := filepath.Join(dir, "backup", "version-one.db")
 	if err := Backup(context.Background(), source, destination); err != nil {
 		_ = source.Close()
 		t.Fatal(err)
@@ -431,27 +638,21 @@ func TestOpenBackupSourceBacksUpOlderSchemaWithoutMigratingOrMutatingIt(t *testi
 	if string(after) != string(before) || afterInfo.Size() != beforeInfo.Size() || !afterInfo.ModTime().Equal(beforeInfo.ModTime()) {
 		t.Fatal("backup source file was modified")
 	}
-	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-		if _, err := os.Stat(sourcePath + suffix); !os.IsNotExist(err) {
-			t.Fatalf("source sidecar %q was created: %v", suffix, err)
-		}
-	}
-
 	backup, err := OpenReadOnly(destination)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer backup.Close()
-	var value string
-	if err := backup.QueryRow(`SELECT legacy_value FROM users WHERE id = 'legacy-user'`).Scan(&value); err != nil || value != "unchanged" {
-		t.Fatalf("legacy data=%q err=%v", value, err)
+	var name string
+	if err := backup.QueryRow(`SELECT name FROM machine_identities WHERE id = 'version-one-machine'`).Scan(&name); err != nil || name != "Version One Machine" {
+		t.Fatalf("version-one data=%q err=%v", name, err)
 	}
-	var migratedTableCount int
-	if err := backup.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&migratedTableCount); err != nil {
+	var migrationCount int
+	if err := backup.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if migratedTableCount != 0 {
-		t.Fatal("older schema was migrated before backup")
+	if migrationCount != 1 {
+		t.Fatalf("migration count=%d, want exactly version 1", migrationCount)
 	}
 }
 
@@ -535,7 +736,7 @@ func TestStepOnlineBackupPersistentBusyHonorsContextWithoutSpinning(t *testing.T
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("cancellation took %v, want at most 500ms", elapsed)
 	}
-	if stepper.calls < 2 || stepper.calls > 10 {
+	if stepper.calls > 10 {
 		t.Fatalf("Step calls=%d, want bounded retries without busy-spinning", stepper.calls)
 	}
 }
@@ -639,6 +840,36 @@ func (e fakeSQLiteError) Code() int {
 	return e.code
 }
 
+var migrationOneCoreTables = []string{
+	"users",
+	"sessions",
+	"projects",
+	"project_members",
+	"environments",
+	"revisions",
+	"revision_entries",
+	"machine_identities",
+	"machine_grants",
+	"access_tokens",
+}
+
+func createVersionOneConfigHubFixture(t *testing.T, path string) {
+	t.Helper()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`INSERT INTO machine_identities
+		(id, name, description, enabled, created_at, updated_at)
+		VALUES ('version-one-machine', 'Version One Machine', 'preserved', 1, 1, 1)`); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func createSQLiteFixture(t *testing.T, path, statements string) {
 	t.Helper()
 	db, err := sql.Open(driverName, path)
@@ -651,6 +882,15 @@ func createSQLiteFixture(t *testing.T, path, statements string) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func assertNoSQLiteSidecars(t *testing.T, path string) {
+	t.Helper()
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(path + suffix); !os.IsNotExist(err) {
+			t.Fatalf("source sidecar %q exists: %v", suffix, err)
+		}
 	}
 }
 

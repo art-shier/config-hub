@@ -249,7 +249,7 @@ func TestBackupCommandRejectsMissingAndForeignSourcesWithoutCreatingOrMigrating(
 	})
 }
 
-func TestBackupCommandPreservesOlderSourceAndDoesNotStartConfiguredListener(t *testing.T) {
+func TestBackupCommandPreservesVersionOneSourceAndDoesNotStartConfiguredListener(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -260,27 +260,24 @@ func TestBackupCommandPreservesOlderSourceAndDoesNotStartConfiguredListener(t *t
 	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", sourcePath)
+	store, err := database.Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`
-		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
-		INSERT INTO schema_migrations VALUES (1, 1);
-		CREATE TABLE users (id TEXT PRIMARY KEY, legacy_value TEXT NOT NULL);
-		INSERT INTO users VALUES ('legacy', 'preserved');
-	`); err != nil {
-		_ = db.Close()
+	if _, err := store.DB().Exec(`INSERT INTO machine_identities
+		(id, name, description, enabled, created_at, updated_at)
+		VALUES ('version-one-command', 'Version One Command', 'preserved', 1, 1, 1)`); err != nil {
+		_ = store.Close()
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	before, err := os.ReadFile(sourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := filepath.Join(t.TempDir(), "backups", "older.db")
+	output := filepath.Join(t.TempDir(), "backups", "version-one.db")
 	if code := runCommand(context.Background(), []string{"backup", "--config", configPath, "--output", output}, io.Discard); code != 0 {
 		t.Fatalf("exit=%d", code)
 	}
@@ -296,9 +293,9 @@ func TestBackupCommandPreservesOlderSourceAndDoesNotStartConfiguredListener(t *t
 		t.Fatal(err)
 	}
 	defer backup.Close()
-	var value string
-	if err := backup.QueryRow(`SELECT legacy_value FROM users WHERE id='legacy'`).Scan(&value); err != nil || value != "preserved" {
-		t.Fatalf("legacy value=%q err=%v", value, err)
+	var description string
+	if err := backup.QueryRow(`SELECT description FROM machine_identities WHERE id='version-one-command'`).Scan(&description); err != nil || description != "preserved" {
+		t.Fatalf("version-one description=%q err=%v", description, err)
 	}
 }
 

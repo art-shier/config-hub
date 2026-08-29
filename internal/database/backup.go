@@ -10,12 +10,12 @@ import (
 	"path/filepath"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"modernc.org/sqlite"
 )
 
 const (
-	backupTempPattern       = ".confighub-backup-*.tmp"
+	backupTempPrefix        = ".confighub-backup-"
+	backupTempSuffix        = ".tmp"
 	backupStepPages         = 128
 	backupStepRetryWindow   = 5 * time.Second
 	backupStepRetryInterval = 25 * time.Millisecond
@@ -34,11 +34,18 @@ type sqliteCodedError interface {
 	Code() int
 }
 
-var publishBackup = renameNoReplace
+type backupHooks struct {
+	beforePublish func(string) error
+	afterPublish  func() error
+}
 
 // Backup creates a consistent SQLite backup and atomically publishes it at
 // destination. An existing destination is never overwritten.
 func Backup(ctx context.Context, source *sql.DB, destination string) error {
+	return backupWithHooks(ctx, source, destination, backupHooks{})
+}
+
+func backupWithHooks(ctx context.Context, source *sql.DB, destination string, hooks backupHooks) error {
 	if ctx == nil {
 		return errors.New("backup context is nil")
 	}
@@ -53,32 +60,39 @@ func Backup(ctx context.Context, source *sql.DB, destination string) error {
 	if err != nil {
 		return errors.New("resolve backup destination")
 	}
-	if _, err := os.Lstat(finalPath); err == nil {
-		return errors.New("backup destination already exists")
-	} else if !os.IsNotExist(err) {
-		return errors.New("inspect backup destination")
+	finalName := filepath.Base(finalPath)
+	if !isBackupBasename(finalName) {
+		return errors.New("invalid backup destination")
 	}
-	directory := filepath.Dir(finalPath)
-	if err := prepareBackupDirectory(directory); err != nil {
+	directory, err := openBackupDirectory(filepath.Dir(finalPath), true)
+	if err != nil {
 		return err
 	}
+	defer directory.close()
 
-	temporary, err := os.CreateTemp(directory, backupTempPattern)
-	if err != nil {
-		return errors.New("create temporary backup")
+	if !directory.matchesRequestedPath() {
+		return errors.New("backup directory identity changed")
 	}
-	temporaryPath := temporary.Name()
-	if err := temporary.Close(); err != nil {
-		_ = os.Remove(temporaryPath)
-		return errors.New("close temporary backup")
-	}
-	published := false
-	defer func() {
-		if !published {
-			for _, path := range []string{temporaryPath, temporaryPath + "-wal", temporaryPath + "-shm", temporaryPath + "-journal"} {
-				_ = os.Remove(path)
-			}
+	if err := directory.ensureNameAbsent(finalName); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return errors.New("backup destination already exists")
 		}
+		return errors.New("inspect backup destination")
+	}
+	temporaryName, temporaryPath, err := directory.createTemporary()
+	if err != nil {
+		return err
+	}
+	published, completed := false, false
+	defer func() {
+		if completed {
+			return
+		}
+		directory.cleanupTemporary(temporaryName)
+		if published {
+			_ = directory.unlink(finalName)
+		}
+		_ = directory.sync()
 	}()
 
 	if err := copyOnline(ctx, source, temporaryPath); err != nil {
@@ -87,25 +101,42 @@ func Backup(ctx context.Context, source *sql.DB, destination string) error {
 	if err := normalizeAndVerifyBackup(ctx, temporaryPath); err != nil {
 		return err
 	}
-	if err := os.Chmod(temporaryPath, 0o600); err != nil {
-		return errors.New("restrict backup permissions")
+	if err := directory.cleanupTemporarySidecars(temporaryName); err != nil {
+		return errors.New("clean backup sidecars")
 	}
-	if err := syncFile(temporaryPath); err != nil {
+	if err := directory.syncFile(temporaryName); err != nil {
 		return err
 	}
-	if err := syncDirectory(directory); err != nil {
+	if err := directory.sync(); err != nil {
 		return err
 	}
-	if err := publishBackup(temporaryPath, finalPath); err != nil {
+	if hooks.beforePublish != nil {
+		if err := hooks.beforePublish(temporaryPath); err != nil {
+			return errors.New("run backup publication hook")
+		}
+	}
+	if !directory.matchesRequestedPath() {
+		return errors.New("backup directory identity changed")
+	}
+	if err := directory.publish(temporaryName, finalName); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return errors.New("backup destination already exists")
 		}
 		return errors.New("publish backup")
 	}
 	published = true
-	if err := syncDirectory(directory); err != nil {
+	if hooks.afterPublish != nil {
+		if err := hooks.afterPublish(); err != nil {
+			return errors.New("run post-publication hook")
+		}
+	}
+	if !directory.matchesRequestedPath() {
+		return errors.New("backup directory identity changed after publication")
+	}
+	if err := directory.sync(); err != nil {
 		return errors.New("sync published backup directory")
 	}
+	completed = true
 	return nil
 }
 
@@ -122,14 +153,26 @@ func OpenBackupSource(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	var appliedMigrations int
-	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE version >= 1`).Scan(&appliedMigrations); err != nil || appliedMigrations < 1 {
+	var coreTables int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master
+		WHERE type = 'table' AND name IN (
+			'schema_migrations',
+			'users',
+			'sessions',
+			'projects',
+			'project_members',
+			'environments',
+			'revisions',
+			'revision_entries',
+			'machine_identities',
+			'machine_grants',
+			'access_tokens'
+		)`).Scan(&coreTables); err != nil || coreTables != 11 {
 		_ = db.Close()
 		return nil, errors.New("backup source is not a ConfigHub database")
 	}
-	var coreTables int
-	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master
-		WHERE type = 'table' AND name IN ('users', 'projects', 'environments', 'revisions')`).Scan(&coreTables); err != nil || coreTables < 1 {
+	var migrationOneApplied int
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE version = 1`).Scan(&migrationOneApplied); err != nil || migrationOneApplied != 1 {
 		_ = db.Close()
 		return nil, errors.New("backup source is not a ConfigHub database")
 	}
@@ -166,32 +209,6 @@ func openExistingReadOnly(path string, rejectEmpty bool) (*sql.DB, error) {
 		return nil, errors.New("validate read-only database")
 	}
 	return db, nil
-}
-
-func prepareBackupDirectory(path string) error {
-	info, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			return errors.New("create backup directory")
-		}
-		info, err = os.Lstat(path)
-	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("inspect backup directory")
-	}
-	if info.Mode().Perm()&0o077 != 0 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
-		return errors.New("backup directory permissions are unsafe")
-	}
-	directoryFD, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return errors.New("verify backup directory")
-	}
-	defer unix.Close(directoryFD)
-	var stat unix.Stat_t
-	if err := unix.Fstat(directoryFD, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&(unix.S_IRWXG|unix.S_IRWXO|unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0 {
-		return errors.New("verify backup directory")
-	}
-	return nil
 }
 
 func copyOnline(ctx context.Context, source *sql.DB, destination string) error {
@@ -299,34 +316,6 @@ func normalizeAndVerifyBackup(ctx context.Context, path string) error {
 		return errors.New("backup integrity check failed")
 	}
 	return nil
-}
-
-func syncFile(path string) error {
-	file, err := os.OpenFile(path, os.O_RDONLY, 0)
-	if err != nil {
-		return errors.New("open backup for synchronization")
-	}
-	defer file.Close()
-	if err := file.Sync(); err != nil {
-		return errors.New("synchronize backup")
-	}
-	return nil
-}
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return errors.New("open backup directory for synchronization")
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return errors.New("synchronize backup directory")
-	}
-	return nil
-}
-
-func renameNoReplace(oldPath, newPath string) error {
-	return unix.Renameat2(unix.AT_FDCWD, oldPath, unix.AT_FDCWD, newPath, unix.RENAME_NOREPLACE)
 }
 
 func safeBackupError(operation string, err error) error {
