@@ -13,6 +13,9 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"confighub.local/internal/config"
+	"confighub.local/internal/database"
 )
 
 func TestNewHTTPServerAppliesTimeouts(t *testing.T) {
@@ -88,7 +91,7 @@ func TestRunJoinAndCloseWaitsForLifecycleAndReloadLoop(t *testing.T) {
 	})
 }
 
-func TestRunCommandMapsUsageConfigAndUnavailableBackupExitCodes(t *testing.T) {
+func TestRunCommandMapsUsageConfigAndBackupExitCodes(t *testing.T) {
 	if code := runCommand(context.Background(), nil, new(bytes.Buffer)); code != 2 {
 		t.Fatalf("empty command exit=%d", code)
 	}
@@ -102,13 +105,87 @@ func TestRunCommandMapsUsageConfigAndUnavailableBackupExitCodes(t *testing.T) {
 	}
 
 	configPath := writeCommandConfig(t, "users: []\n")
+	source, err := database.Open(filepath.Join(filepath.Dir(configPath), "data", "confighub.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB().Exec(`INSERT INTO machine_identities
+		(id, name, enabled, created_at, updated_at)
+		VALUES ('backup-command', 'backup command', 1, 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
 	logs.Reset()
 	output := filepath.Join(t.TempDir(), "private-backup.db")
-	if code := runCommand(context.Background(), []string{"backup", "--config", configPath, "--output", output}, logs); code != 1 {
-		t.Fatalf("unavailable backup exit=%d logs=%s", code, logs.String())
+	if code := runCommand(context.Background(), []string{"backup", "--config", configPath, "--output", output}, logs); code != 0 {
+		t.Fatalf("backup exit=%d logs=%s", code, logs.String())
 	}
-	if !strings.Contains(logs.String(), "backup is not available") || strings.Contains(logs.String(), configPath) || strings.Contains(logs.String(), output) {
-		t.Fatalf("unsafe or unclear backup error: %s", logs.String())
+	backup, err := database.OpenReadOnly(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	var count int
+	if err := backup.QueryRow(`SELECT count(*) FROM machine_identities WHERE id = 'backup-command'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("backup row count=%d err=%v", count, err)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("successful backup wrote unexpected logs: %s", logs.String())
+	}
+
+	logs.Reset()
+	if code := runCommand(context.Background(), []string{"backup", "--config", configPath, "--output", output}, logs); code != 1 {
+		t.Fatalf("existing backup exit=%d logs=%s", code, logs.String())
+	}
+	if !strings.Contains(logs.String(), "backup failed") || strings.Contains(logs.String(), configPath) || strings.Contains(logs.String(), output) {
+		t.Fatalf("unsafe or unclear backup failure: %s", logs.String())
+	}
+}
+
+func TestBackupCommandParsesAndDelegatesValidatedConfiguration(t *testing.T) {
+	configPath := writeCommandConfig(t, "users: []\n")
+	output := filepath.Join(t.TempDir(), "delegated.db")
+	original := runBackup
+	defer func() { runBackup = original }()
+	called := false
+	runBackup = func(ctx context.Context, cfg config.Config, gotOutput string) error {
+		called = true
+		if ctx == nil {
+			t.Fatal("nil context")
+		}
+		if cfg.Database.Path != filepath.Join(filepath.Dir(configPath), "data", "confighub.db") {
+			t.Fatalf("database path=%q", cfg.Database.Path)
+		}
+		if gotOutput != output {
+			t.Fatalf("output=%q want %q", gotOutput, output)
+		}
+		return nil
+	}
+	if code := runCommand(context.Background(), []string{"backup", "--output", output, "--config", configPath}, io.Discard); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if !called {
+		t.Fatal("backup operation was not called")
+	}
+}
+
+func TestBackupCommandRejectsIncompleteAndUnexpectedArguments(t *testing.T) {
+	for _, args := range [][]string{
+		{"backup"},
+		{"backup", "--config", "config.yaml"},
+		{"backup", "--output", "backup.db"},
+		{"backup", "--config", "config.yaml", "--output", "backup.db", "extra"},
+		{"backup", "--unknown"},
+	} {
+		logs := new(bytes.Buffer)
+		if code := runCommand(context.Background(), args, logs); code != 2 {
+			t.Errorf("args=%q exit=%d logs=%s", args, code, logs.String())
+		}
+		if !strings.Contains(logs.String(), "confighub-server backup") {
+			t.Errorf("args=%q missing usage: %s", args, logs.String())
+		}
 	}
 }
 

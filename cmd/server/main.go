@@ -29,10 +29,10 @@ import (
 )
 
 var (
-	errUsage             = errors.New("invalid command usage")
-	errConfiguration     = errors.New("invalid configuration")
-	errRuntime           = errors.New("server runtime failure")
-	errBackupUnavailable = errors.New("backup is not available in this build")
+	errUsage         = errors.New("invalid command usage")
+	errConfiguration = errors.New("invalid configuration")
+	errRuntime       = errors.New("server runtime failure")
+	errBackup        = errors.New("backup failure")
 )
 
 const (
@@ -44,8 +44,14 @@ const (
 
 type backupOperation func(context.Context, config.Config, string) error
 
-var runBackup backupOperation = func(context.Context, config.Config, string) error {
-	return errBackupUnavailable
+var runBackup backupOperation = func(ctx context.Context, cfg config.Config, output string) error {
+	store, err := database.Open(cfg.Database.Path)
+	if err != nil {
+		return err
+	}
+	backupErr := database.Backup(ctx, store.DB(), output)
+	closeErr := store.Close()
+	return errors.Join(backupErr, closeErr)
 }
 
 func main() {
@@ -88,8 +94,8 @@ func runCommand(ctx context.Context, args []string, stderr io.Writer) int {
 	case errors.Is(err, errConfiguration):
 		fmt.Fprintln(stderr, "confighub-server: invalid configuration")
 		return 2
-	case errors.Is(err, errBackupUnavailable):
-		fmt.Fprintln(stderr, "confighub-server: backup is not available in this build")
+	case errors.Is(err, errBackup):
+		fmt.Fprintln(stderr, "confighub-server: backup failed")
 		return 1
 	default:
 		fmt.Fprintln(stderr, "confighub-server: server runtime failure")
@@ -238,10 +244,7 @@ func backup(ctx context.Context, configPath, output string) error {
 		return errConfiguration
 	}
 	if err := runBackup(ctx, cfg, output); err != nil {
-		if errors.Is(err, errBackupUnavailable) {
-			return errBackupUnavailable
-		}
-		return errRuntime
+		return errBackup
 	}
 	return nil
 }

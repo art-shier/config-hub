@@ -2,6 +2,9 @@
 
 # Go
 /bin/
+/dist/
+/backups/
+/.confighub-backup-*.tmp*
 
 # Node and Vite
 web/node_modules/
