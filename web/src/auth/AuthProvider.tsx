@@ -129,15 +129,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const reconcileSession = useCallback(
     async (expectedEpoch: number) => {
-      if (expectedEpoch !== operationEpochRef.current) {
-        return;
-      }
-
       const reconciliationClient = new APIClient(() => csrfTokenRef.current);
       try {
         const session = await reconciliationClient.get<Session>("/auth/session");
+        csrfTokenRef.current = session.csrf_token;
         applySession(session, expectedEpoch);
       } catch {
+        csrfTokenRef.current = null;
         clearAuthForOperation(expectedEpoch);
       }
     },

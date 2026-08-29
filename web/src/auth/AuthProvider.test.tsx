@@ -677,6 +677,98 @@ describe("AuthProvider", () => {
     expect(screen.queryByText("Grace Hopper")).not.toBeInTheDocument();
   });
 
+  it("reconciles a malformed login before releasing a queued logout", async () => {
+    const loginStarted = createDeferred<void>();
+    const releaseLogin = createDeferred<void>();
+    let serverSession: typeof adminSession | typeof replacementSession | null =
+      adminSession;
+    let sessionRequests = 0;
+    let logoutRequests = 0;
+    let logoutCSRF: string | null = "not-called";
+    server.use(
+      http.get("/api/v1/auth/session", () => {
+        sessionRequests += 1;
+        if (serverSession === null) {
+          return HttpResponse.json(
+            {
+              error: {
+                code: "invalid_session",
+                message: "signed out",
+                request_id: "req_after_malformed_login_logout",
+                fields: {},
+              },
+            },
+            { status: 401 },
+          );
+        }
+        return HttpResponse.json(serverSession);
+      }),
+      http.post("/api/v1/auth/login", async () => {
+        loginStarted.resolve();
+        await releaseLogin.promise;
+        serverSession = replacementSession;
+        return new HttpResponse("not-json", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+      http.post("/api/v1/auth/logout", ({ request }) => {
+        logoutRequests += 1;
+        logoutCSRF = request.headers.get("X-CSRF-Token");
+        if (logoutCSRF === replacementSession.csrf_token) {
+          serverSession = null;
+          return new HttpResponse(null, { status: 204 });
+        }
+        return HttpResponse.json(
+          {
+            error: {
+              code: "invalid_csrf_token",
+              message: "invalid CSRF token",
+              request_id: "req_stale_csrf_after_malformed_login",
+              fields: {},
+            },
+          },
+          { status: 403 },
+        );
+      }),
+    );
+
+    const { unmount } = render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    );
+    expect(await screen.findByText("Ada Lovelace")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Log in probe" }));
+    await loginStarted.promise;
+    await userEvent.click(screen.getByRole("button", { name: "Log out probe" }));
+    expect(logoutRequests).toBe(0);
+
+    releaseLogin.resolve();
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Auth operation settlements"),
+      ).toHaveTextContent("2"),
+    );
+
+    expect(logoutCSRF).toBe("csrf-replacement-token");
+    expect(screen.getByLabelText("Current user")).toHaveTextContent("signed out");
+    expect(sessionRequests).toBe(2);
+
+    unmount();
+    render(
+      <AuthProvider>
+        <AuthProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Auth status")).toHaveTextContent("ready"),
+    );
+    expect(screen.getByLabelText("Current user")).toHaveTextContent("signed out");
+    expect(sessionRequests).toBe(3);
+  });
+
   it("reconciles the first login session when a later queued login is rejected", async () => {
     const firstLoginStarted = createDeferred<void>();
     const releaseFirstLogin = createDeferred<void>();
