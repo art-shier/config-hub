@@ -1,19 +1,26 @@
 # Copy this file to config.yaml and restrict it with: chmod 600 config.yaml
+# Relative paths below are resolved from config.yaml's directory.
 server:
+  # Keep the Go service on loopback; an existing HTTPS reverse proxy exposes it.
   listen: 127.0.0.1:8080
+  # This must exactly match the browser-visible HTTPS origin.
   public_url: https://config.example.com
+  # Only list the reverse proxy source networks you operate.
   trusted_proxy_cidrs:
     - 127.0.0.1/32
     - ::1/128
 
 database:
+  # Run exactly one ConfigHub server against this local-disk SQLite file.
   path: ../data/confighub.db
 
 auth:
+  # users.yaml contains plaintext passwords; both auth files must stay at 0600.
   users_file: ./users.yaml
-  # session.key is a secret and must also have permissions no broader than 0600.
+  # Generate with: umask 077; openssl rand -base64 48 > session.key
   session_key_file: ./session.key
   session_ttl: 24h
 
 backup:
+  # Backups contain plaintext configuration; keep this directory at 0700.
   directory: ../backups

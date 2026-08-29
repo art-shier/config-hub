@@ -1,4 +1,6 @@
 # Copy this file to users.yaml, set its permissions to 0600, and never commit it.
+# Passwords are deliberately plaintext in this file; replace every example value.
+# This file is the only account source. Reload changes with SIGHUP; Web cannot edit it.
 users:
   - username: admin
     display_name: Administrator

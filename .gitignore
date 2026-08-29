@@ -19,3 +19,4 @@ web/dist/
 internal/webui/dist/*
 !internal/webui/dist/bootstrap.txt
 *.tsbuildinfo
+/output/playwright/
