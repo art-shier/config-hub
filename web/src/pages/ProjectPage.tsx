@@ -4,10 +4,13 @@ import { APIError } from "../api/client";
 import type {
   Environment as ProjectEnvironment,
   ProjectDetail,
+  Revision,
 } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
 import { ModalDialog } from "../components/ModalDialog";
+import { ConfigTable } from "../features/config/ConfigTable";
 import { ProjectMembers } from "../features/members/ProjectMembers";
+import { VersionList } from "../features/versions/VersionList";
 
 interface ProjectDetailResponse {
   project: ProjectDetail;
@@ -36,6 +39,7 @@ export function ProjectPage() {
   const [failure, setFailure] = useState<LoadFailure>(null);
   const [loadAnnouncement, setLoadAnnouncement] = useState("Loading project…");
   const [creatingEnvironment, setCreatingEnvironment] = useState(false);
+  const [revisionRefreshEpoch, setRevisionRefreshEpoch] = useState(0);
   const newEnvironmentButtonRef = useRef<HTMLButtonElement>(null);
   const loadGenerationRef = useRef(0);
 
@@ -126,6 +130,18 @@ export function ProjectPage() {
     );
   }
 
+  function handleRevisionChanged(revision: Revision) {
+    setProject((current) => current === null ? current : {
+      ...current,
+      environments: current.environments.map((environment) =>
+        environment.slug === selectedEnvironment
+          ? { ...environment, current_revision_id: revision.id || null }
+          : environment,
+      ),
+    });
+    setRevisionRefreshEpoch((current) => current + 1);
+  }
+
   if (loading) {
     return (
       <section className="resource-page">
@@ -161,6 +177,7 @@ export function ProjectPage() {
   }
 
   const canManage = user?.role === "admin" && project.permission === "admin";
+  const canWrite = project.permission === "admin" || project.permission === "editor";
   const selectedEnvironmentRecord = project.environments.find(
     (environment) => environment.slug === selectedEnvironment,
   );
@@ -324,23 +341,23 @@ export function ProjectPage() {
           hidden={activeTab !== tab.id}
         >
           {activeTab === tab.id && tab.id === "configuration" ? (
-            <TaskPlaceholder
-              title="Configuration"
-              detail={
-                selectedEnvironmentRecord
-                  ? `Configuration editing for ${selectedEnvironmentRecord.name} arrives in Task 14.`
-                  : "Create an environment before editing configuration in Task 14."
-              }
+            <ConfigTable
+              client={client}
+              projectSlug={project.slug}
+              environmentSlug={selectedEnvironmentRecord?.slug ?? ""}
+              canWrite={canWrite}
+              refreshEpoch={revisionRefreshEpoch}
+              onRevisionChanged={handleRevisionChanged}
             />
           ) : null}
           {activeTab === tab.id && tab.id === "versions" ? (
-            <TaskPlaceholder
-              title="Versions"
-              detail={
-                selectedEnvironmentRecord
-                  ? `Version history arrives in Task 14 for ${selectedEnvironmentRecord.name}.`
-                  : "Version history arrives in Task 14 after an environment is created."
-              }
+            <VersionList
+              client={client}
+              projectSlug={project.slug}
+              environmentSlug={selectedEnvironmentRecord?.slug ?? ""}
+              canWrite={canWrite}
+              refreshEpoch={revisionRefreshEpoch}
+              onRevisionChanged={handleRevisionChanged}
             />
           ) : null}
           {activeTab === tab.id && tab.id === "members" ? (
@@ -509,16 +526,6 @@ function CreateEnvironmentDialog({
         </button>
       </form>
     </ModalDialog>
-  );
-}
-
-function TaskPlaceholder({ detail, title }: { detail: string; title: string }) {
-  return (
-    <div className="task-placeholder">
-      <p className="section-index">Selected environment</p>
-      <h2>{title}</h2>
-      <p>{detail}</p>
-    </div>
   );
 }
 

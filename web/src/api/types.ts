@@ -44,6 +44,42 @@ export interface ProjectDetail extends Project {
   environments: Environment[];
 }
 
+export interface ConfigEntry {
+  key: string;
+  value: string;
+  service: string;
+}
+
+export interface RevisionSummary {
+  id: string;
+  environment_id: string;
+  message: string;
+  created_by: string;
+  version: number;
+  created_at: string;
+}
+
+export interface Revision extends RevisionSummary {
+  entries: ConfigEntry[];
+}
+
+export type ChangeKind = "added" | "changed" | "deleted";
+
+export interface RevisionChange {
+  key: string;
+  kind: ChangeKind;
+  before: string;
+  after: string;
+  before_service: string;
+  after_service: string;
+}
+
+export interface DiffResult {
+  before_revision: number;
+  after_revision: number;
+  changes: RevisionChange[];
+}
+
 export type MemberPermission = "viewer" | "editor";
 
 export interface MemberGrant {

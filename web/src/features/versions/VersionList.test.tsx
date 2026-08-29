@@ -1,0 +1,303 @@
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
+import { useState } from "react";
+import { describe, expect, it, vi } from "vitest";
+import { APIError } from "../../api/client";
+import type { APIClientContract } from "../../api/types";
+import { VersionList } from "./VersionList";
+
+function client(): APIClientContract {
+  return {
+    get: vi.fn(),
+    post: vi.fn(),
+    postNoContent: vi.fn(),
+    put: vi.fn(),
+    putNoContent: vi.fn(),
+    delete: vi.fn(),
+  };
+}
+
+describe("VersionList", () => {
+  it("does not load history before an environment is available", () => {
+    const api = client();
+    render(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug=""
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Choose an environment" })).toBeInTheDocument();
+    expect(api.get).not.toHaveBeenCalled();
+  });
+
+  it("loads encoded history and renders revision metadata", async () => {
+    const api = client();
+    vi.mocked(api.get).mockResolvedValue({
+      revisions: [
+        {
+          id: "revision-2",
+          environment_id: "env-prod",
+          version: 2,
+          message: "发布 中文 😀",
+          created_by: "ada",
+          created_at: "2026-08-29T08:00:00Z",
+        },
+      ],
+    });
+    render(
+      <StrictMode>
+        <VersionList
+          client={api}
+          projectSlug="shop/intl"
+          environmentSlug="prod west"
+          canWrite
+          refreshEpoch={0}
+          onRevisionChanged={vi.fn()}
+        />
+      </StrictMode>,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Loading version history");
+    const item = await screen.findByRole("article", { name: "Version 2" });
+    expect(within(item).getByText("发布 中文 😀")).toBeInTheDocument();
+    expect(within(item).getByText("ada")).toBeInTheDocument();
+    expect(within(item).getByText(/2026/u)).toBeInTheDocument();
+    await waitFor(() => expect(api.get).toHaveBeenCalledWith(
+      "/projects/shop%2Fintl/environments/prod%20west/revisions",
+    ));
+  });
+
+  it("shows empty history after a focusable retry", async () => {
+    const api = client();
+    vi.mocked(api.get)
+      .mockRejectedValueOnce(new Error("SECRET history"))
+      .mockResolvedValueOnce({ revisions: [] });
+    render(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+    const user = userEvent.setup();
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    retry.focus();
+    expect(retry).toHaveFocus();
+    expect(screen.queryByText(/SECRET/u)).not.toBeInTheDocument();
+    await user.click(retry);
+    expect(await screen.findByRole("heading", { name: "No versions yet" })).toBeInTheDocument();
+  });
+
+  it("loads version detail and a full selected-to-current diff with absent distinct from empty", async () => {
+    const api = client();
+    vi.mocked(api.get).mockImplementation((path) => {
+      if (path.endsWith("/revisions")) {
+        return Promise.resolve({
+          revisions: [
+            { id: "r2", environment_id: "env", version: 2, message: "current", created_by: "ada", created_at: "2026-08-29T08:00:00Z" },
+            { id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" },
+          ],
+        });
+      }
+      if (path.endsWith("/1/diff")) {
+        return Promise.resolve({
+          before_revision: 1,
+          after_revision: 2,
+          changes: [
+            { key: "ADDED_EMPTY", kind: "added", before: "", after: "", before_service: "", after_service: "api" },
+            { key: "CHANGED", kind: "changed", before: "before  ", after: "after\n完整 😀", before_service: "api", after_service: "worker" },
+            { key: "DELETED_EMPTY", kind: "deleted", before: "", after: "", before_service: "", after_service: "" },
+          ],
+        });
+      }
+      return Promise.resolve({
+        revision: {
+          id: "r1",
+          environment_id: "env",
+          version: 1,
+          message: "first",
+          created_by: "lee",
+          created_at: "2026-08-28T08:00:00Z",
+          entries: [{ key: "CHANGED", value: "before  ", service: "api" }],
+        },
+      });
+    });
+    render(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "View version 1" }));
+
+    expect(await screen.findByRole("heading", { name: "Version 1 to current version 2" })).toBeInTheDocument();
+    expect(screen.getByText("first", { selector: ".selected-revision-message" })).toBeInTheDocument();
+    expect(screen.getByTestId("diff-before-CHANGED").textContent).toBe("before  ");
+    expect(screen.getByTestId("diff-after-CHANGED").textContent).toBe("after\n完整 😀");
+    expect(screen.getByTestId("diff-before-service-CHANGED").textContent).toContain("api");
+    expect(screen.getByTestId("diff-after-service-CHANGED").textContent).toContain("worker");
+    expect(screen.getByTestId("diff-before-ADDED_EMPTY")).toHaveTextContent("Absent");
+    expect(screen.getByTestId("diff-after-ADDED_EMPTY")).toHaveTextContent("Empty string");
+    expect(screen.getByTestId("diff-before-DELETED_EMPTY")).toHaveTextContent("Empty string");
+    expect(screen.getByTestId("diff-after-DELETED_EMPTY")).toHaveTextContent("Absent");
+    expect(api.get).toHaveBeenCalledWith("/projects/shop/environments/prod/revisions/1");
+    expect(api.get).toHaveBeenCalledWith("/projects/shop/environments/prod/revisions/1/diff");
+  });
+
+  it("confirms rollback creates a new version, prevents double submit, and refreshes history", async () => {
+    let resolveRollback!: (value: unknown) => void;
+    const api = client();
+    const onRevisionChanged = vi.fn();
+    vi.mocked(api.get).mockResolvedValue({
+      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" }],
+    });
+    vi.mocked(api.post).mockReturnValue(new Promise<never>((resolve) => {
+      resolveRollback = resolve as (value: unknown) => void;
+    }));
+    render(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={onRevisionChanged}
+      />,
+    );
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Rollback to version 1" }));
+    const dialog = screen.getByRole("dialog", { name: "Rollback to version 1?" });
+    expect(within(dialog).getByText(/rollback creates a new current version/iu)).toBeInTheDocument();
+    await user.type(within(dialog).getByLabelText("Rollback message"), "restore known values");
+    await user.dblClick(within(dialog).getByRole("button", { name: "Create rollback version" }));
+
+    expect(api.post).toHaveBeenCalledTimes(1);
+    expect(api.post).toHaveBeenCalledWith(
+      "/projects/shop/environments/prod/revisions/1/rollback",
+      { message: "restore known values" },
+    );
+    expect(within(dialog).getByRole("button", { name: "Creating rollback…" })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toBeDisabled();
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Rollback to version 1?" })).toBeInTheDocument();
+    resolveRollback({
+      revision: {
+        id: "r3", environment_id: "env", version: 3, message: "restore known values", created_by: "ada", created_at: "2026-08-29T09:00:00Z", entries: [],
+      },
+    });
+    await waitFor(() => expect(onRevisionChanged).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.get).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("fully resets rollback state when the shared refresh epoch changes during success", async () => {
+    let resolveRefresh!: (value: unknown) => void;
+    let historyRequests = 0;
+    const api = client();
+    const history = {
+      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" }],
+    };
+    vi.mocked(api.get).mockImplementation(() => {
+      historyRequests += 1;
+      if (historyRequests === 1) return Promise.resolve(history);
+      return new Promise<never>((resolve) => {
+        resolveRefresh = resolve as (value: unknown) => void;
+      });
+    });
+    vi.mocked(api.post).mockResolvedValue({
+      revision: { id: "r2", environment_id: "env", version: 2, message: "restore", created_by: "ada", created_at: "2026-08-29T09:00:00Z", entries: [] },
+    });
+    function Harness() {
+      const [epoch, setEpoch] = useState(0);
+      return (
+        <VersionList
+          client={api}
+          projectSlug="shop"
+          environmentSlug="prod"
+          canWrite
+          refreshEpoch={epoch}
+          onRevisionChanged={() => setEpoch((current) => current + 1)}
+        />
+      );
+    }
+    render(<Harness />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Rollback to version 1" }));
+    await user.click(screen.getByRole("button", { name: "Create rollback version" }));
+    await waitFor(() => expect(historyRequests).toBeGreaterThan(1));
+    resolveRefresh(history);
+    await user.click(await screen.findByRole("button", { name: "Rollback to version 1" }));
+
+    expect(screen.getByRole("button", { name: "Create rollback version" })).toBeEnabled();
+  });
+
+  it("retains rollback message after a safe typed failure and hides write entry points from viewers", async () => {
+    const api = client();
+    vi.mocked(api.get).mockResolvedValue({
+      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" }],
+    });
+    vi.mocked(api.post).mockRejectedValue(new APIError(503, "service_unavailable", "SECRET", "req", {}));
+    const view = render(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Rollback to version 1" }));
+    await user.type(screen.getByLabelText("Rollback message"), "keep this message");
+    await user.click(screen.getByRole("button", { name: "Create rollback version" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("couldn’t create the rollback version");
+    expect(screen.getByLabelText("Rollback message")).toHaveValue("keep this message");
+    expect(screen.queryByText("SECRET")).not.toBeInTheDocument();
+
+    view.rerender(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite={false}
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("button", { name: /Rollback to version/u })).not.toBeInTheDocument();
+  });
+
+  it("discards stale list responses when the environment changes", async () => {
+    let resolveProd!: (value: unknown) => void;
+    const api = client();
+    vi.mocked(api.get).mockImplementation((path) => {
+      if (path.includes("/prod/")) return new Promise<never>((resolve) => {
+        resolveProd = resolve as (value: unknown) => void;
+      });
+      return Promise.resolve({ revisions: [{ id: "stage", environment_id: "stage", version: 4, message: "STAGE HISTORY", created_by: "lee", created_at: "2026-08-29T08:00:00Z" }] });
+    });
+    const props = { client: api, projectSlug: "shop", canWrite: true, refreshEpoch: 0, onRevisionChanged: vi.fn() };
+    const view = render(<VersionList {...props} environmentSlug="prod" />);
+    view.rerender(<VersionList {...props} environmentSlug="stage" />);
+    expect(await screen.findByText("STAGE HISTORY")).toBeInTheDocument();
+    resolveProd({ revisions: [{ id: "prod", environment_id: "prod", version: 9, message: "STALE PROD", created_by: "ada", created_at: "2026-08-29T08:00:00Z" }] });
+    await waitFor(() => expect(screen.queryByText("STALE PROD")).not.toBeInTheDocument());
+  });
+});

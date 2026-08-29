@@ -62,6 +62,24 @@ function mockProjectPage(
         },
       }),
     ),
+    http.get("/api/v1/projects/shop/environments/:environment/config", ({ params }) =>
+      HttpResponse.json({
+        revision: {
+          id: params.environment === "prod" ? "revision-7" : "",
+          environment_id: `env-${String(params.environment)}`,
+          message: params.environment === "prod" ? "current values" : "",
+          created_by: "user-admin",
+          version: params.environment === "prod" ? 7 : 0,
+          created_at: "2026-08-29T08:00:00Z",
+          entries: params.environment === "prod"
+            ? [{ key: "API_URL", value: "https://example.test", service: "api" }]
+            : [],
+        },
+      }),
+    ),
+    http.get("/api/v1/projects/shop/environments/:environment/revisions", () =>
+      HttpResponse.json({ revisions: [] }),
+    ),
   );
 }
 
@@ -184,7 +202,7 @@ describe("ProjectPage", () => {
       "aria-selected",
       "true",
     );
-    expect(screen.getByText(/Version history arrives in Task 14/u)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "No versions yet" })).toBeInTheDocument();
   });
 
   it("renders the current grant register on the Members tab", async () => {
@@ -229,6 +247,100 @@ describe("ProjectPage", () => {
     expect(screen.queryByRole("button", { name: "Add member" })).not.toBeInTheDocument();
     },
   );
+
+  it.each([
+    ["viewer", false],
+    ["editor", true],
+    ["admin", true],
+  ] as const)("applies %s configuration write access", async (permission, canWrite) => {
+    mockProjectPage(permission === "admin" ? "admin" : "member", permission);
+    renderAppAt("/projects/shop");
+
+    expect(await screen.findByText("API_URL")).toBeInTheDocument();
+    const edit = screen.queryByRole("button", { name: "Edit configuration" });
+    if (canWrite) expect(edit).toBeInTheDocument();
+    else expect(edit).not.toBeInTheDocument();
+  });
+
+  it("blocks environment and tab query navigation while a configuration draft is dirty", async () => {
+    mockProjectPage("admin", "admin");
+    renderAppAt("/projects/shop?environment=prod");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Edit configuration" }));
+    await user.type(screen.getByLabelText("Value for API_URL"), " draft");
+
+    await user.selectOptions(screen.getByLabelText("Active environment"), "stage");
+    expect(screen.getByRole("dialog", { name: "Leave without saving?" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Stay" }));
+    expect(window.location.search).toBe("?environment=prod");
+    expect(screen.getByLabelText("Value for API_URL")).toHaveValue("https://example.test draft");
+
+    await user.click(screen.getByRole("tab", { name: "Versions" }));
+    expect(screen.getByRole("dialog", { name: "Leave without saving?" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Discard and leave" }));
+    expect(await screen.findByRole("heading", { name: "No versions yet" })).toBeInTheDocument();
+    expect(window.location.search).toBe("?environment=prod&tab=versions");
+  });
+
+  it("saves one batch and refreshes version history through the shared epoch", async () => {
+    mockProjectPage("admin", "admin");
+    let historyRequests = 0;
+    let body: unknown;
+    server.use(
+      http.put("/api/v1/projects/shop/environments/prod/config", async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json({
+          revision: {
+            id: "revision-8",
+            environment_id: "env-prod",
+            message: "update URL",
+            created_by: "user-admin",
+            version: 8,
+            created_at: "2026-08-29T09:00:00Z",
+            entries: [{ key: "API_URL", value: "https://next.test", service: "api" }],
+          },
+        }, { status: 201 });
+      }),
+      http.get("/api/v1/projects/shop/environments/prod/revisions", () => {
+        historyRequests += 1;
+        return HttpResponse.json({
+          revisions: [{ id: "revision-8", environment_id: "env-prod", message: "update URL", created_by: "user-admin", version: 8, created_at: "2026-08-29T09:00:00Z" }],
+        });
+      }),
+    );
+    renderAppAt("/projects/shop");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Edit configuration" }));
+    await user.clear(screen.getByLabelText("Value for API_URL"));
+    await user.type(screen.getByLabelText("Value for API_URL"), "https://next.test");
+    await user.type(screen.getByLabelText("Change message"), "update URL");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(await screen.findByTestId("configuration-value-API_URL")).toHaveTextContent("https://next.test");
+    expect(body).toEqual({
+      base_revision: 7,
+      message: "update URL",
+      entries: [{ key: "API_URL", value: "https://next.test", service: "api" }],
+    });
+    await user.click(screen.getByRole("tab", { name: "Versions" }));
+    expect(await screen.findByText("update URL")).toBeInTheDocument();
+    expect(historyRequests).toBeGreaterThan(0);
+  });
+
+  it("does not request revision APIs when the project has no environments", async () => {
+    mockProjectPage("admin", "admin", []);
+    let revisionRequests = 0;
+    server.use(
+      http.get("/api/v1/projects/shop/environments/:environment/config", () => {
+        revisionRequests += 1;
+        return HttpResponse.json({});
+      }),
+    );
+    renderAppAt("/projects/shop");
+
+    expect(await screen.findByRole("heading", { name: "Choose an environment" })).toBeInTheDocument();
+    expect(revisionRequests).toBe(0);
+  });
 
   it("lets an admin create an environment with inline validation and retained draft", async () => {
     mockProjectPage("admin", "admin");

@@ -1,11 +1,13 @@
 import {
-  BrowserRouter,
   Navigate,
   Outlet,
   Route,
+  RouterProvider,
   Routes,
+  createBrowserRouter,
   useLocation,
 } from "react-router-dom";
+import { useEffect, useRef } from "react";
 import { AuthProvider, useAuth } from "../auth/AuthProvider";
 import { LoginPage } from "../pages/LoginPage";
 import { ProjectPage } from "../pages/ProjectPage";
@@ -13,63 +15,86 @@ import { ProjectsPage } from "../pages/ProjectsPage";
 import { AppShell } from "./AppShell";
 
 export function App() {
+  const routerRef = useRef<ReturnType<typeof createBrowserRouter> | null>(null);
+  const mountedRef = useRef(false);
+  if (routerRef.current === null) {
+    routerRef.current = createBrowserRouter([
+      { path: "*", element: <AppRoutes /> },
+    ]);
+  }
+  const router = routerRef.current;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      queueMicrotask(() => {
+        if (!mountedRef.current) {
+          router.dispose();
+        }
+      });
+    };
+  }, [router]);
+
+  return <RouterProvider router={router} />;
+}
+
+function AppRoutes() {
   return (
-    <BrowserRouter>
-      <AuthProvider>
-        <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route element={<RequireSession />}>
-            <Route element={<AppShell />}>
-              <Route index element={<Navigate to="/projects" replace />} />
-              <Route path="/projects" element={<ProjectsPage />} />
-              <Route path="/projects/:project" element={<ProjectPage />} />
-              <Route element={<RequireAdmin />}>
-                <Route
-                  path="/machine-access"
-                  element={
-                    <PlaceholderPage
-                      eyebrow="Scoped credentials"
-                      title="Machine Access"
-                      description="Machine identities and token controls will appear here."
-                    />
-                  }
-                />
-                <Route
-                  path="/members"
-                  element={
-                    <PlaceholderPage
-                      eyebrow="Team permissions"
-                      title="Members"
-                      description="Project membership controls will appear here."
-                    />
-                  }
-                />
-                <Route
-                  path="/system"
-                  element={
-                    <PlaceholderPage
-                      eyebrow="Service status"
-                      title="System"
-                      description="Operational status will appear here."
-                    />
-                  }
-                />
-              </Route>
+    <AuthProvider>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route element={<RequireSession />}>
+          <Route element={<AppShell />}>
+            <Route index element={<Navigate to="/projects" replace />} />
+            <Route path="/projects" element={<ProjectsPage />} />
+            <Route path="/projects/:project" element={<ProjectPage />} />
+            <Route element={<RequireAdmin />}>
               <Route
-                path="*"
+                path="/machine-access"
                 element={
                   <PlaceholderPage
-                    eyebrow="Navigation"
-                    title="Page not found"
-                    description="This address does not match a ConfigHub page."
+                    eyebrow="Scoped credentials"
+                    title="Machine Access"
+                    description="Machine identities and token controls will appear here."
+                  />
+                }
+              />
+              <Route
+                path="/members"
+                element={
+                  <PlaceholderPage
+                    eyebrow="Team permissions"
+                    title="Members"
+                    description="Project membership controls will appear here."
+                  />
+                }
+              />
+              <Route
+                path="/system"
+                element={
+                  <PlaceholderPage
+                    eyebrow="Service status"
+                    title="System"
+                    description="Operational status will appear here."
                   />
                 }
               />
             </Route>
+            <Route
+              path="*"
+              element={
+                <PlaceholderPage
+                  eyebrow="Navigation"
+                  title="Page not found"
+                  description="This address does not match a ConfigHub page."
+                />
+              }
+            />
           </Route>
-        </Routes>
-      </AuthProvider>
-    </BrowserRouter>
+        </Route>
+      </Routes>
+    </AuthProvider>
   );
 }
 
