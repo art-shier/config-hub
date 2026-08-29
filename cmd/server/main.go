@@ -45,12 +45,12 @@ const (
 type backupOperation func(context.Context, config.Config, string) error
 
 var runBackup backupOperation = func(ctx context.Context, cfg config.Config, output string) error {
-	store, err := database.Open(cfg.Database.Path)
+	source, err := database.OpenBackupSource(cfg.Database.Path)
 	if err != nil {
 		return err
 	}
-	backupErr := database.Backup(ctx, store.DB(), output)
-	closeErr := store.Close()
+	backupErr := database.Backup(ctx, source, output)
+	closeErr := source.Close()
 	return errors.Join(backupErr, closeErr)
 }
 

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBackupCreatesIndependentlyReadableDatabaseFromLiveWAL(t *testing.T) {
@@ -27,7 +28,7 @@ func TestBackupCreatesIndependentlyReadableDatabaseFromLiveWAL(t *testing.T) {
 		t.Fatalf("source has no live WAL writes: info=%v err=%v", walInfo, err)
 	}
 
-	destination := filepath.Join(t.TempDir(), "backup.db")
+	destination := filepath.Join(t.TempDir(), "backups", "backup.db")
 	if err := Backup(context.Background(), store.DB(), destination); err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +74,7 @@ func TestBackupRejectsExistingDestinationWithoutAlteringIt(t *testing.T) {
 
 func TestBackupPublishesCompleteFileAtomicallyAndLosesDestinationRace(t *testing.T) {
 	store := openTestStore(t)
-	dir := t.TempDir()
+	dir := createSafeBackupDirectory(t)
 	destination := filepath.Join(dir, "backup.db")
 	raceContents := []byte("created by another operation")
 	originalPublish := publishBackup
@@ -112,8 +113,8 @@ func TestBackupPublishesCompleteFileAtomicallyAndLosesDestinationRace(t *testing
 }
 
 func TestBackupFailureCleansOnlyItsTemporaryFile(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.db")
+	dir := createSafeBackupDirectory(t)
+	sourcePath := filepath.Join(filepath.Dir(dir), "source.db")
 	store, err := Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -157,8 +158,8 @@ func TestBackupFailureCleansOnlyItsTemporaryFile(t *testing.T) {
 }
 
 func TestBackupPublicationFailureRemovesOwnedRollbackJournalOnly(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.db")
+	dir := createSafeBackupDirectory(t)
+	sourcePath := filepath.Join(filepath.Dir(dir), "source.db")
 	store, err := Open(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -201,32 +202,108 @@ func TestBackupPublicationFailureRemovesOwnedRollbackJournalOnly(t *testing.T) {
 	}
 }
 
-func TestBackupRestrictsDestinationAndDirectoryPermissions(t *testing.T) {
+func TestBackupRejectsUnsafeExistingDestinationDirectoryWithoutChangingIt(t *testing.T) {
 	store := openTestStore(t)
-	dir := filepath.Join(t.TempDir(), "backups")
-	if err := os.Mkdir(dir, 0o777); err != nil {
+	for name, mode := range map[string]os.FileMode{
+		"world readable": 0o755,
+		"sticky":         0o700 | os.ModeSticky,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "backups")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, mode); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			destination := filepath.Join(dir, "backup.db")
+			if err := Backup(context.Background(), store.DB(), destination); err == nil {
+				t.Fatal("Backup succeeded with an unsafe destination directory")
+			}
+			after, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Mode() != before.Mode() {
+				t.Fatalf("directory mode changed: before=%v after=%v", before.Mode(), after.Mode())
+			}
+			if _, err := os.Stat(destination); !os.IsNotExist(err) {
+				t.Fatalf("destination exists after rejection: %v", err)
+			}
+		})
+	}
+}
+
+func TestBackupRejectsSymlinkDestinationDirectoryWithoutChangingTarget(t *testing.T) {
+	store := openTestStore(t)
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o777); err != nil {
+	neighbor := filepath.Join(target, "keep")
+	if err := os.WriteFile(neighbor, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	destination := filepath.Join(dir, "backup.db")
-	if err := Backup(context.Background(), store.DB(), destination); err != nil {
+	linked := filepath.Join(root, "linked")
+	if err := os.Symlink(target, linked); err != nil {
 		t.Fatal(err)
 	}
-	fileInfo, err := os.Stat(destination)
+	before, err := os.Lstat(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dirInfo, err := os.Stat(dir)
+	if err := Backup(context.Background(), store.DB(), filepath.Join(linked, "backup.db")); err == nil {
+		t.Fatal("Backup followed a symlinked destination directory")
+	}
+	after, err := os.Lstat(target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := fileInfo.Mode().Perm(); got&0o077 != 0 || got&0o600 != 0o600 {
-		t.Fatalf("backup mode=%#o, want no wider than 0600", got)
+	if after.Mode() != before.Mode() {
+		t.Fatalf("symlink target mode changed: before=%v after=%v", before.Mode(), after.Mode())
 	}
-	if got := dirInfo.Mode().Perm(); got&0o077 != 0 || got&0o700 != 0o700 {
-		t.Fatalf("directory mode=%#o, want no wider than 0700", got)
+	if got, err := os.ReadFile(neighbor); err != nil || string(got) != "unchanged" {
+		t.Fatalf("symlink target contents changed: contents=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "backup.db")); !os.IsNotExist(err) {
+		t.Fatalf("backup created through symlink: %v", err)
+	}
+}
+
+func TestBackupUsesSafeExistingAndNewDestinationDirectories(t *testing.T) {
+	store := openTestStore(t)
+	for name, create := range map[string]bool{"existing": true, "new": false} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "backups")
+			if create {
+				if err := os.Mkdir(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			destination := filepath.Join(dir, "backup.db")
+			if err := Backup(context.Background(), store.DB(), destination); err != nil {
+				t.Fatal(err)
+			}
+			fileInfo, err := os.Stat(destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dirInfo, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := fileInfo.Mode().Perm(); got&0o077 != 0 || got&0o600 != 0o600 {
+				t.Fatalf("backup mode=%#o, want no wider than 0600", got)
+			}
+			if got := dirInfo.Mode().Perm(); got&0o077 != 0 || got&0o700 != 0o700 {
+				t.Fatalf("directory mode=%#o, want no wider than 0700", got)
+			}
+		})
 	}
 }
 
@@ -280,6 +357,310 @@ func TestOpenReadOnlyRejectsMissingAndInvalidFilesWithoutCreatingThem(t *testing
 		_ = db.Close()
 		t.Fatal("OpenReadOnly opened an invalid database")
 	}
+}
+
+func TestOpenBackupSourceRejectsMissingEmptyAndForeignDatabases(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.db")
+	zeroByte := filepath.Join(dir, "zero.db")
+	if err := os.WriteFile(zeroByte, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	emptySQLite := filepath.Join(dir, "empty-sqlite.db")
+	createSQLiteFixture(t, emptySQLite, `VACUUM`)
+	foreign := filepath.Join(dir, "foreign.db")
+	createSQLiteFixture(t, foreign, `CREATE TABLE unrelated (id INTEGER PRIMARY KEY)`)
+
+	for name, path := range map[string]string{
+		"missing":      missing,
+		"zero byte":    zeroByte,
+		"empty SQLite": emptySQLite,
+		"foreign":      foreign,
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, err := OpenBackupSource(path)
+			if err == nil {
+				_ = db.Close()
+				t.Fatal("OpenBackupSource succeeded")
+			}
+		})
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("missing source was created: %v", err)
+	}
+}
+
+func TestOpenBackupSourceBacksUpOlderSchemaWithoutMigratingOrMutatingIt(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "older.db")
+	createSQLiteFixture(t, sourcePath, `
+		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+		INSERT INTO schema_migrations (version, applied_at) VALUES (1, 1);
+		CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, legacy_value TEXT NOT NULL);
+		INSERT INTO users (id, legacy_value) VALUES ('legacy-user', 'unchanged');
+	`)
+	before, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source, err := OpenBackupSource(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(dir, "backup", "older.db")
+	if err := Backup(context.Background(), source, destination); err != nil {
+		_ = source.Close()
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) || afterInfo.Size() != beforeInfo.Size() || !afterInfo.ModTime().Equal(beforeInfo.ModTime()) {
+		t.Fatal("backup source file was modified")
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(sourcePath + suffix); !os.IsNotExist(err) {
+			t.Fatalf("source sidecar %q was created: %v", suffix, err)
+		}
+	}
+
+	backup, err := OpenReadOnly(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	var value string
+	if err := backup.QueryRow(`SELECT legacy_value FROM users WHERE id = 'legacy-user'`).Scan(&value); err != nil || value != "unchanged" {
+		t.Fatalf("legacy data=%q err=%v", value, err)
+	}
+	var migratedTableCount int
+	if err := backup.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&migratedTableCount); err != nil {
+		t.Fatal(err)
+	}
+	if migratedTableCount != 0 {
+		t.Fatal("older schema was migrated before backup")
+	}
+}
+
+func TestOpenBackupSourceIncludesCommittedLiveWALData(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.db")
+	store, err := Open(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.DB().Exec(`INSERT INTO machine_identities
+		(id, name, enabled, created_at, updated_at)
+		VALUES ('source-opener-wal', 'source opener WAL', 1, 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	walInfo, err := os.Stat(sourcePath + "-wal")
+	if err != nil || walInfo.Size() == 0 {
+		t.Fatalf("source has no live WAL: info=%v err=%v", walInfo, err)
+	}
+
+	source, err := OpenBackupSource(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	destination := filepath.Join(dir, "backup", "wal.db")
+	if err := Backup(context.Background(), source, destination); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := OpenReadOnly(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	var count int
+	if err := backup.QueryRow(`SELECT count(*) FROM machine_identities WHERE id='source-opener-wal'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("live WAL row count=%d err=%v", count, err)
+	}
+}
+
+func TestStepOnlineBackupRetriesBusyAndLockedUntilComplete(t *testing.T) {
+	stepper := &fakeBackupStepper{results: []backupStepResult{
+		{err: fakeSQLiteError{code: 5}},
+		{err: fakeSQLiteError{code: 6}},
+		{more: true},
+		{more: false},
+	}}
+
+	if err := stepOnlineBackup(context.Background(), stepper, 100*time.Millisecond, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if stepper.calls != 4 {
+		t.Fatalf("Step calls=%d, want 4", stepper.calls)
+	}
+}
+
+func TestStepOnlineBackupReturnsNonRetryableErrorImmediately(t *testing.T) {
+	sentinel := errors.New("non-retryable")
+	stepper := &fakeBackupStepper{results: []backupStepResult{{err: sentinel}}}
+
+	err := stepOnlineBackup(context.Background(), stepper, time.Second, 200*time.Millisecond)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error=%v, want %v", err, sentinel)
+	}
+	if stepper.calls != 1 {
+		t.Fatalf("Step calls=%d, want 1", stepper.calls)
+	}
+}
+
+func TestStepOnlineBackupPersistentBusyHonorsContextWithoutSpinning(t *testing.T) {
+	stepper := &fakeBackupStepper{persistentErr: fakeSQLiteError{code: 5}}
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+
+	err := stepOnlineBackup(ctx, stepper, time.Second, 10*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("cancellation took %v, want at most 500ms", elapsed)
+	}
+	if stepper.calls < 2 || stepper.calls > 10 {
+		t.Fatalf("Step calls=%d, want bounded retries without busy-spinning", stepper.calls)
+	}
+}
+
+func TestStepOnlineBackupPersistentLockedStopsAtRetryWindow(t *testing.T) {
+	want := fakeSQLiteError{code: 6}
+	stepper := &fakeBackupStepper{persistentErr: want}
+	started := time.Now()
+
+	err := stepOnlineBackup(context.Background(), stepper, 25*time.Millisecond, 5*time.Millisecond)
+	if !errors.Is(err, want) {
+		t.Fatalf("error=%v, want SQLite locked error", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("retry window took %v, want at most 500ms", elapsed)
+	}
+	if stepper.calls < 2 || stepper.calls > 10 {
+		t.Fatalf("Step calls=%d, want bounded retries", stepper.calls)
+	}
+}
+
+func TestBackupPersistentExclusiveContentionHonorsContextAndCleansArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.db")
+	createSQLiteFixture(t, sourcePath, `
+		PRAGMA journal_mode=DELETE;
+		CREATE TABLE values_to_backup (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+		INSERT INTO values_to_backup (value) VALUES ('committed');
+	`)
+	source, err := OpenReadOnly(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	locker, err := sql.Open(driverName, sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	lockConn, err := locker.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Close()
+	if _, err := lockConn.ExecContext(context.Background(), `PRAGMA busy_timeout=0`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockConn.ExecContext(context.Background(), `BEGIN EXCLUSIVE`); err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.ExecContext(context.Background(), `ROLLBACK`)
+	if _, err := lockConn.ExecContext(context.Background(), `INSERT INTO values_to_backup (value) VALUES ('uncommitted')`); err != nil {
+		t.Fatal(err)
+	}
+
+	backupDir := filepath.Join(dir, "backups")
+	destination := filepath.Join(backupDir, "backup.db")
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	err = Backup(ctx, source, destination)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Backup error=%v, want context deadline exceeded", err)
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination exists after contention: %v", err)
+	}
+	assertNoBackupTemps(t, backupDir)
+}
+
+type backupStepResult struct {
+	more bool
+	err  error
+}
+
+type fakeBackupStepper struct {
+	results       []backupStepResult
+	persistentErr error
+	calls         int
+}
+
+func (f *fakeBackupStepper) Step(int32) (bool, error) {
+	f.calls++
+	if len(f.results) == 0 {
+		return false, f.persistentErr
+	}
+	result := f.results[0]
+	f.results = f.results[1:]
+	return result.more, result.err
+}
+
+type fakeSQLiteError struct {
+	code int
+}
+
+func (e fakeSQLiteError) Error() string {
+	return "fake SQLite contention"
+}
+
+func (e fakeSQLiteError) Code() int {
+	return e.code
+}
+
+func createSQLiteFixture(t *testing.T, path, statements string) {
+	t.Helper()
+	db, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(statements); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createSafeBackupDirectory(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "backups")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func assertNoBackupTemps(t *testing.T, dir string) {

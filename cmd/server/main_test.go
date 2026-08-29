@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -118,7 +120,7 @@ func TestRunCommandMapsUsageConfigAndBackupExitCodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs.Reset()
-	output := filepath.Join(t.TempDir(), "private-backup.db")
+	output := filepath.Join(t.TempDir(), "backups", "private-backup.db")
 	if code := runCommand(context.Background(), []string{"backup", "--config", configPath, "--output", output}, logs); code != 0 {
 		t.Fatalf("backup exit=%d logs=%s", code, logs.String())
 	}
@@ -186,6 +188,117 @@ func TestBackupCommandRejectsIncompleteAndUnexpectedArguments(t *testing.T) {
 		if !strings.Contains(logs.String(), "confighub-server backup") {
 			t.Errorf("args=%q missing usage: %s", args, logs.String())
 		}
+	}
+}
+
+func TestBackupCommandRejectsMissingAndForeignSourcesWithoutCreatingOrMigrating(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		configPath := writeCommandConfig(t, "users: []\n")
+		sourcePath := filepath.Join(filepath.Dir(configPath), "data", "confighub.db")
+		output := filepath.Join(t.TempDir(), "backup.db")
+		logs := new(bytes.Buffer)
+		if code := runCommand(context.Background(), []string{"backup", "--config", configPath, "--output", output}, logs); code != 1 {
+			t.Fatalf("exit=%d logs=%s", code, logs.String())
+		}
+		if _, err := os.Stat(sourcePath); !os.IsNotExist(err) {
+			t.Fatalf("missing source was created: %v", err)
+		}
+		if _, err := os.Stat(output); !os.IsNotExist(err) {
+			t.Fatalf("backup destination was created: %v", err)
+		}
+		if strings.Contains(logs.String(), sourcePath) || strings.Contains(logs.String(), output) {
+			t.Fatalf("backup failure leaked paths: %s", logs.String())
+		}
+	})
+
+	t.Run("foreign SQLite", func(t *testing.T) {
+		configPath := writeCommandConfig(t, "users: []\n")
+		sourcePath := filepath.Join(filepath.Dir(configPath), "data", "confighub.db")
+		if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", sourcePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`CREATE TABLE unrelated (value TEXT); INSERT INTO unrelated VALUES ('preserve')`); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(sourcePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		output := filepath.Join(t.TempDir(), "backup.db")
+		if code := runCommand(context.Background(), []string{"backup", "--config", configPath, "--output", output}, io.Discard); code != 1 {
+			t.Fatalf("exit=%d", code)
+		}
+		after, err := os.ReadFile(sourcePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(after) != string(before) {
+			t.Fatal("foreign source was migrated or modified")
+		}
+		if _, err := os.Stat(output); !os.IsNotExist(err) {
+			t.Fatalf("backup destination was created: %v", err)
+		}
+	})
+}
+
+func TestBackupCommandPreservesOlderSourceAndDoesNotStartConfiguredListener(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	configPath := writeCommandConfigWithListen(t, "users: []\n", listener.Addr().String())
+	sourcePath := filepath.Join(filepath.Dir(configPath), "data", "confighub.db")
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+		INSERT INTO schema_migrations VALUES (1, 1);
+		CREATE TABLE users (id TEXT PRIMARY KEY, legacy_value TEXT NOT NULL);
+		INSERT INTO users VALUES ('legacy', 'preserved');
+	`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "backups", "older.db")
+	if code := runCommand(context.Background(), []string{"backup", "--config", configPath, "--output", output}, io.Discard); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	after, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("older source was modified")
+	}
+	backup, err := database.OpenReadOnly(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	var value string
+	if err := backup.QueryRow(`SELECT legacy_value FROM users WHERE id='legacy'`).Scan(&value); err != nil || value != "preserved" {
+		t.Fatalf("legacy value=%q err=%v", value, err)
 	}
 }
 
@@ -264,11 +377,19 @@ func channelIsClosed(channel <-chan struct{}) bool {
 }
 
 func writeCommandConfigWithPublicURL(t *testing.T, users, publicURL string) string {
+	return writeCommandConfigWithOptions(t, users, publicURL, "127.0.0.1:8080")
+}
+
+func writeCommandConfigWithListen(t *testing.T, users, listen string) string {
+	return writeCommandConfigWithOptions(t, users, "https://config.example.com", listen)
+}
+
+func writeCommandConfigWithOptions(t *testing.T, users, publicURL, listen string) string {
 	t.Helper()
 	dir := t.TempDir()
 	writeCommandFile(t, filepath.Join(dir, "users.yaml"), users)
 	writeCommandFile(t, filepath.Join(dir, "session.key"), "01234567890123456789012345678901\n")
-	config := "server:\n  listen: 127.0.0.1:8080\n  public_url: " + publicURL + "\n" +
+	config := "server:\n  listen: " + listen + "\n  public_url: " + publicURL + "\n" +
 		"database:\n  path: ./data/confighub.db\n" +
 		"auth:\n  users_file: ./users.yaml\n  session_key_file: ./session.key\n  session_ttl: 1h\n" +
 		"backup:\n  directory: ./backups\n"

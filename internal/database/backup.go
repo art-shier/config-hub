@@ -8,15 +8,30 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"modernc.org/sqlite"
 )
 
-const backupTempPattern = ".confighub-backup-*.tmp"
+const (
+	backupTempPattern       = ".confighub-backup-*.tmp"
+	backupStepPages         = 128
+	backupStepRetryWindow   = 5 * time.Second
+	backupStepRetryInterval = 25 * time.Millisecond
+)
 
 type sqliteBackuper interface {
 	NewBackup(string) (*sqlite.Backup, error)
+}
+
+type backupStepper interface {
+	Step(int32) (bool, error)
+}
+
+type sqliteCodedError interface {
+	error
+	Code() int
 }
 
 var publishBackup = renameNoReplace
@@ -97,6 +112,31 @@ func Backup(ctx context.Context, source *sql.DB, destination string) error {
 // OpenReadOnly opens an existing SQLite database without migrating or
 // otherwise modifying it.
 func OpenReadOnly(path string) (*sql.DB, error) {
+	return openExistingReadOnly(path, false)
+}
+
+// OpenBackupSource opens an existing ConfigHub SQLite database without
+// creating files or applying migrations. Committed WAL state remains visible.
+func OpenBackupSource(path string) (*sql.DB, error) {
+	db, err := openExistingReadOnly(path, true)
+	if err != nil {
+		return nil, err
+	}
+	var appliedMigrations int
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE version >= 1`).Scan(&appliedMigrations); err != nil || appliedMigrations < 1 {
+		_ = db.Close()
+		return nil, errors.New("backup source is not a ConfigHub database")
+	}
+	var coreTables int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master
+		WHERE type = 'table' AND name IN ('users', 'projects', 'environments', 'revisions')`).Scan(&coreTables); err != nil || coreTables < 1 {
+		_ = db.Close()
+		return nil, errors.New("backup source is not a ConfigHub database")
+	}
+	return db, nil
+}
+
+func openExistingReadOnly(path string, rejectEmpty bool) (*sql.DB, error) {
 	if path == "" {
 		return nil, errors.New("read-only database path is empty")
 	}
@@ -104,12 +144,15 @@ func OpenReadOnly(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, errors.New("resolve read-only database path")
 	}
-	info, err := os.Stat(absPath)
+	info, err := os.Lstat(absPath)
 	if err != nil {
 		return nil, errors.New("read-only database is unavailable")
 	}
 	if !info.Mode().IsRegular() {
 		return nil, errors.New("read-only database is not a regular file")
+	}
+	if rejectEmpty && info.Size() == 0 {
+		return nil, errors.New("backup source is empty")
 	}
 
 	dsn := sqliteFileDSN(absPath, true)
@@ -126,17 +169,27 @@ func OpenReadOnly(path string) (*sql.DB, error) {
 }
 
 func prepareBackupDirectory(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return errors.New("create backup directory")
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return errors.New("create backup directory")
+		}
+		info, err = os.Lstat(path)
 	}
-	info, err := os.Stat(path)
-	if err != nil || !info.IsDir() {
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("inspect backup directory")
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		if err := os.Chmod(path, 0o700); err != nil {
-			return errors.New("restrict backup directory permissions")
-		}
+	if info.Mode().Perm()&0o077 != 0 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+		return errors.New("backup directory permissions are unsafe")
+	}
+	directoryFD, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return errors.New("verify backup directory")
+	}
+	defer unix.Close(directoryFD)
+	var stat unix.Stat_t
+	if err := unix.Fstat(directoryFD, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&(unix.S_IRWXG|unix.S_IRWXO|unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0 {
+		return errors.New("verify backup directory")
 	}
 	return nil
 }
@@ -163,17 +216,8 @@ func copyOnline(ctx context.Context, source *sql.DB, destination string) error {
 				_ = backup.Finish()
 			}
 		}()
-		for {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			more, err := backup.Step(128)
-			if err != nil {
-				return err
-			}
-			if !more {
-				break
-			}
+		if err := stepOnlineBackup(ctx, backup, backupStepRetryWindow, backupStepRetryInterval); err != nil {
+			return err
 		}
 		finished = true
 		return backup.Finish()
@@ -182,6 +226,56 @@ func copyOnline(ctx context.Context, source *sql.DB, destination string) error {
 		return safeBackupError("create online backup", err)
 	}
 	return nil
+}
+
+func stepOnlineBackup(ctx context.Context, backup backupStepper, retryWindow, retryInterval time.Duration) error {
+	var retryDeadline time.Time
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		more, err := backup.Step(backupStepPages)
+		if err == nil {
+			if !more {
+				return nil
+			}
+			continue
+		}
+		if !isSQLiteBusyOrLocked(err) {
+			return err
+		}
+		if retryDeadline.IsZero() {
+			retryDeadline = time.Now().Add(retryWindow)
+		}
+		remaining := time.Until(retryDeadline)
+		if remaining <= 0 {
+			return err
+		}
+		delay := retryInterval
+		if delay <= 0 || delay > remaining {
+			delay = remaining
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isSQLiteBusyOrLocked(err error) bool {
+	var sqliteErr sqliteCodedError
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	switch sqliteErr.Code() & 0xff {
+	case 5, 6:
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeAndVerifyBackup(ctx context.Context, path string) error {
