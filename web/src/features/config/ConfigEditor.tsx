@@ -31,6 +31,7 @@ const unsupportedValueEditMessage =
 
 export function ConfigEditor({
   client,
+  editingUnavailable = false,
   environmentSlug,
   onCancel,
   onSaved,
@@ -38,6 +39,7 @@ export function ConfigEditor({
   revision,
 }: {
   client: APIClientContract;
+  editingUnavailable?: boolean;
   projectSlug: string;
   environmentSlug: string;
   revision: Revision;
@@ -236,7 +238,12 @@ export function ConfigEditor({
   const leaveDialogOpen = navigationBlocked || confirmCancel;
 
   return (
-    <section className="configuration-editor" aria-labelledby="configuration-editor-title">
+    <>
+    <section
+      className="configuration-editor"
+      aria-labelledby="configuration-editor-title"
+      hidden={editingUnavailable}
+    >
       <header className="section-heading configuration-heading">
         <div>
           <p className="section-index">Draft register / Base version {baseRevision}</p>
@@ -365,6 +372,7 @@ export function ConfigEditor({
           </div>
         </ModalDialog>
       ) : null}
+    </section>
 
       {leaveDialogOpen ? (
         <ModalDialog
@@ -405,7 +413,7 @@ export function ConfigEditor({
           </div>
         </ModalDialog>
       ) : null}
-    </section>
+    </>
   );
 }
 

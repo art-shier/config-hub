@@ -1,9 +1,9 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { delay, http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../app/App";
-import { APIClient } from "../api/client";
+import { APIClient, APIError } from "../api/client";
 import { server } from "../test/setup";
 import { IssueTokenDialog } from "./MachineAccessPage";
 
@@ -97,14 +97,14 @@ function renderAdminAt(path = "/machine-access") {
   return render(<App />);
 }
 
-function apiError(status: number, code: string) {
+function apiError(status: number, code: string, fields: Record<string, string> = {}) {
   return HttpResponse.json(
     {
       error: {
         code,
         message: "remote SECRET detail",
         request_id: "req-machine",
-        fields: {},
+        fields,
       },
     },
     { status },
@@ -188,6 +188,82 @@ describe("MachineAccessPage", () => {
 
     expect(await screen.findByRole("heading", { name: "stage-ci" })).toBeInTheDocument();
     expect(requestBody).toEqual({ name: "stage-ci", description: "Staging delivery", enabled: true });
+  });
+
+  it("enforces identity UTF-8 byte boundaries without rejecting exact-limit CJK values", async () => {
+    mockMachinePage({ tokens: [] });
+    const exactName = `${"界".repeat(42)}ab`;
+    const exactDescription = `${"界".repeat(340)}abcd`;
+    const submittedName = `\u0085${exactName}\u0085`;
+    const submittedDescription = `\u0085${exactDescription}\u0085`;
+    const created = { ...identity, id: "machine-boundary", name: exactName, description: exactDescription };
+    let requests = 0;
+    let requestBody: unknown;
+    server.use(
+      http.post("/api/v1/machine-identities", async ({ request }) => {
+        requests += 1;
+        requestBody = await request.json();
+        return HttpResponse.json({ identity: created }, { status: 201 });
+      }),
+      http.get("/api/v1/machine-identities/machine-boundary", () =>
+        HttpResponse.json({ identity: { ...created, grants: [], tokens: [] } }),
+      ),
+    );
+    renderAdminAt();
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "New identity" }));
+    let dialog = screen.getByRole("dialog", { name: "New machine identity" });
+    fireEvent.change(within(dialog).getByLabelText("Machine name"), { target: { value: submittedName } });
+    fireEvent.change(within(dialog).getByLabelText("Description"), { target: { value: submittedDescription } });
+    expect(within(dialog).getByLabelText("Machine name")).toHaveAccessibleDescription(/128 bytes.*limit: 128 bytes/iu);
+    expect(within(dialog).getByLabelText("Description")).toHaveAccessibleDescription(/1024 bytes.*limit: 1024 bytes/iu);
+    await user.click(within(dialog).getByRole("button", { name: "Create identity" }));
+
+    await waitFor(() => expect(requests).toBe(1));
+    expect(requestBody).toEqual({ name: submittedName, description: submittedDescription, enabled: true });
+
+    await user.click(screen.getByRole("button", { name: "New identity" }));
+    dialog = screen.getByRole("dialog", { name: "New machine identity" });
+    const name = within(dialog).getByLabelText("Machine name");
+    const description = within(dialog).getByLabelText("Description");
+    fireEvent.change(name, { target: { value: "界".repeat(43) } });
+    fireEvent.change(description, { target: { value: "界".repeat(342) } });
+    await user.click(within(dialog).getByRole("button", { name: "Create identity" }));
+
+    expect(requests).toBe(1);
+    expect(name).toHaveValue("界".repeat(43));
+    expect(name).toHaveAttribute("aria-invalid", "true");
+    expect(name).toHaveAttribute("aria-describedby", "machine-name-help machine-name-error");
+    expect(description).toHaveAttribute("aria-invalid", "true");
+    expect(description).toHaveAttribute("aria-describedby", "machine-description-help machine-description-error");
+  });
+
+  it("maps create identity name and description field errors without losing input", async () => {
+    mockMachinePage({ tokens: [] });
+    server.use(
+      http.post("/api/v1/machine-identities", () => apiError(422, "validation_failed", {
+        name: "The service rejected this machine name.",
+        description: "The service rejected this description.",
+      })),
+    );
+    renderAdminAt();
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "New identity" }));
+    const dialog = screen.getByRole("dialog", { name: "New machine identity" });
+    const name = within(dialog).getByLabelText("Machine name");
+    const description = within(dialog).getByLabelText("Description");
+    await user.type(name, "build-ci");
+    await user.type(description, "retained description");
+    await user.click(within(dialog).getByRole("button", { name: "Create identity" }));
+
+    expect(await within(dialog).findByText("The service rejected this machine name.")).toBeInTheDocument();
+    expect(name).toHaveValue("build-ci");
+    expect(description).toHaveValue("retained description");
+    expect(name).toHaveAttribute("aria-describedby", "machine-name-help machine-name-error");
+    expect(description).toHaveAttribute("aria-describedby", "machine-description-help machine-description-error");
+    expect(screen.queryByText("remote SECRET detail")).not.toBeInTheDocument();
   });
 
   it("does not offer an invalid grant when a project has no environments", async () => {
@@ -285,6 +361,51 @@ describe("MachineAccessPage", () => {
     expect(onIssued.mock.calls[0][0]).not.toHaveProperty("plaintext");
   });
 
+  it("validates Token UTF-8 bytes and expiry, then associates server field errors", async () => {
+    const client = new APIClient(() => "csrf-admin");
+    const post = vi.spyOn(client, "post").mockRejectedValue(
+      new APIError(422, "validation_failed", "remote SECRET detail", "req-token", {
+        name: "The service rejected this Token name.",
+        expires_at: "The service rejected this expiry.",
+      }),
+    );
+    render(
+      <IssueTokenDialog
+        client={client}
+        identityID="machine-ci"
+        onClose={vi.fn()}
+        onIssued={vi.fn()}
+      />,
+    );
+    const user = userEvent.setup();
+    const name = screen.getByLabelText("Token name");
+    const expiry = screen.getByLabelText("Expires at");
+
+    fireEvent.change(expiry, { target: { value: "2000-01-01T00:00" } });
+    await user.click(screen.getByRole("button", { name: "Issue Token" }));
+    expect(post).not.toHaveBeenCalled();
+    expect(expiry).toHaveAttribute("aria-invalid", "true");
+    expect(expiry).toHaveAttribute("aria-describedby", "token-expiry-error");
+
+    fireEvent.change(expiry, { target: { value: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 16) } });
+    fireEvent.change(name, { target: { value: "界".repeat(43) } });
+    await user.click(screen.getByRole("button", { name: "Issue Token" }));
+    expect(post).not.toHaveBeenCalled();
+    expect(name).toHaveAttribute("aria-invalid", "true");
+    expect(name).toHaveAttribute("aria-describedby", "token-name-help token-name-error");
+
+    const exactName = `${"界".repeat(42)}ab`;
+    fireEvent.change(name, { target: { value: exactName } });
+    expect(name).toHaveAccessibleDescription(/128 bytes.*limit: 128 bytes/iu);
+    await user.click(screen.getByRole("button", { name: "Issue Token" }));
+
+    expect(await screen.findByText("The service rejected this Token name.")).toBeInTheDocument();
+    expect(name).toHaveValue(exactName);
+    expect(name).toHaveAttribute("aria-describedby", "token-name-help token-name-error");
+    expect(expiry).toHaveAttribute("aria-describedby", "token-expiry-error");
+    expect(screen.queryByText("remote SECRET detail")).not.toBeInTheDocument();
+  });
+
   it("keeps the only plaintext copy when clipboard access fails", async () => {
     mockMachinePage({ tokens: [] });
     server.use(
@@ -372,5 +493,40 @@ describe("MachineAccessPage", () => {
     expect(description).toHaveValue("部署身份 🚀");
     expect(screen.queryByText("remote SECRET detail")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Machine name")).not.toBeInTheDocument();
+  });
+
+  it("validates edited description bytes and associates the server description error", async () => {
+    mockMachinePage({ tokens: [] });
+    let requests = 0;
+    server.use(
+      http.put("/api/v1/machine-identities/machine-ci", () => {
+        requests += 1;
+        return apiError(422, "validation_failed", {
+          description: "The service rejected this edited description.",
+        });
+      }),
+    );
+    renderAdminAt();
+    const user = userEvent.setup();
+    const description = await screen.findByLabelText("Description");
+
+    fireEvent.change(description, { target: { value: "界".repeat(342) } });
+    await user.click(screen.getByRole("button", { name: "Save identity" }));
+    expect(requests).toBe(0);
+    expect(description).toHaveAttribute("aria-invalid", "true");
+    expect(description).toHaveAttribute(
+      "aria-describedby",
+      "machine-description-machine-ci-help machine-description-machine-ci-error",
+    );
+
+    const exactDescription = `${"界".repeat(340)}abcd`;
+    fireEvent.change(description, { target: { value: exactDescription } });
+    await user.click(screen.getByRole("button", { name: "Save identity" }));
+
+    expect(await screen.findByText("The service rejected this edited description.")).toBeInTheDocument();
+    expect(requests).toBe(1);
+    expect(description).toHaveValue(exactDescription);
+    expect(description).toHaveAccessibleDescription(/1024 bytes.*The service rejected this edited description/iu);
+    expect(screen.queryByText("remote SECRET detail")).not.toBeInTheDocument();
   });
 });

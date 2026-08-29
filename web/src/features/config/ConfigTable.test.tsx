@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode, useState } from "react";
 import { RouterProvider, createMemoryRouter } from "react-router-dom";
@@ -123,6 +123,93 @@ describe("ConfigTable", () => {
     expect(await screen.findByTestId("configuration-value-DATABASE_URL")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Edit configuration" })).not.toBeInTheDocument();
     expect(screen.getByText(/desktop viewport is required to edit/iu)).toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
+  it("retains the exact dirty draft and leave protection across a live desktop boundary", async () => {
+    let matches = false;
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      get matches() {
+        return matches;
+      },
+      media: query,
+      onchange: null,
+      addEventListener: (_type: string, listener: () => void) => listeners.add(listener),
+      removeEventListener: (_type: string, listener: () => void) => listeners.delete(listener),
+      addListener: (listener: () => void) => listeners.add(listener),
+      removeListener: (listener: () => void) => listeners.delete(listener),
+      dispatchEvent: vi.fn(),
+    }));
+    const setMobile = (next: boolean) => {
+      matches = next;
+      act(() => listeners.forEach((listener) => listener()));
+    };
+    const api = client();
+    const loaded = {
+      id: "revision-7",
+      environment_id: "env-prod",
+      message: "current",
+      created_by: "user-admin",
+      version: 7,
+      created_at: "2026-08-29T08:00:00Z",
+      entries: [{ key: "MIXED", value: "A\r\nB\rC\n", service: "api" }],
+    };
+    vi.mocked(api.get).mockResolvedValue({ revision: loaded });
+    vi.mocked(api.put).mockResolvedValue({
+      revision: { ...loaded, id: "revision-8", version: 8 },
+    });
+    const router = createMemoryRouter([
+      {
+        path: "/",
+        element: (
+          <>
+            <a href="/elsewhere" onClick={(event) => {
+              event.preventDefault();
+              void router.navigate("/elsewhere");
+            }}>Elsewhere</a>
+            <ConfigTable
+              client={api}
+              projectSlug="shop"
+              environmentSlug="prod"
+              canWrite
+              refreshEpoch={0}
+              onRevisionChanged={vi.fn()}
+            />
+          </>
+        ),
+      },
+      { path: "/elsewhere", element: <h1>Elsewhere</h1> },
+    ]);
+    render(<RouterProvider router={router} />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "Edit configuration" }));
+    await user.type(screen.getByLabelText("Service for MIXED"), " worker");
+    await user.type(screen.getByLabelText("Change message"), "retain exact draft");
+
+    setMobile(true);
+    expect(screen.queryByRole("heading", { name: "Edit configuration" })).not.toBeInTheDocument();
+    expect(screen.getByText(/desktop viewport is required to edit/iu)).toBeInTheDocument();
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("link", { name: "Elsewhere" }));
+    expect(screen.getByRole("dialog", { name: "Leave without saving?" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Stay" }));
+
+    setMobile(false);
+    expect(screen.getByLabelText("Value for MIXED")).toHaveValue("A\nB\nC\n");
+    expect(screen.getByLabelText("Service for MIXED")).toHaveValue("api worker");
+    expect(screen.getByLabelText("Change message")).toHaveValue("retain exact draft");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(api.put).toHaveBeenCalledWith(
+      "/projects/shop/environments/prod/config",
+      {
+        base_revision: 7,
+        message: "retain exact draft",
+        entries: [{ key: "MIXED", value: "A\r\nB\rC\n", service: "api worker" }],
+      },
+    ));
     vi.unstubAllGlobals();
   });
 

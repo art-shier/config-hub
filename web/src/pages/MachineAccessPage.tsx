@@ -208,6 +208,7 @@ function IdentityPanel({
   const [environmentID, setEnvironmentID] = useState("");
   const [identityMessage, setIdentityMessage] = useState("");
   const [identityError, setIdentityError] = useState("");
+  const [identityFieldErrors, setIdentityFieldErrors] = useState<Record<string, string>>({});
   const [grantMessage, setGrantMessage] = useState("");
   const [grantError, setGrantError] = useState("");
   const [savingIdentity, setSavingIdentity] = useState(false);
@@ -268,6 +269,13 @@ function IdentityPanel({
     if (detail === null || identitySavingRef.current) {
       return;
     }
+    const descriptionError = validateDescription(description);
+    setIdentityFieldErrors(descriptionError ? { description: descriptionError } : {});
+    if (descriptionError) {
+      setIdentityError("Review the marked field and try again.");
+      setIdentityMessage("");
+      return;
+    }
     identitySavingRef.current = true;
     setSavingIdentity(true);
     setIdentityError("");
@@ -283,10 +291,21 @@ function IdentityPanel({
       setDetail((current) => current === null ? current : { ...current, ...response.identity });
       setDescription(response.identity.description);
       setEnabled(response.identity.enabled);
+      setIdentityFieldErrors({});
       onIdentityChanged(response.identity);
       setIdentityMessage("Identity saved.");
-    } catch {
-      setIdentityError("We couldn’t save the identity. Your changes are still here; check the service and try again.");
+    } catch (caught) {
+      if (caught instanceof APIError && caught.status === 422) {
+        const mapped = mapFieldErrors(caught.fields, ["description"]);
+        setIdentityFieldErrors(mapped.fields);
+        setIdentityError(
+          Object.keys(mapped.fields).length > 0 && !mapped.hasUnknown
+            ? "Review the marked field and try again."
+            : "We couldn’t save the identity. Your changes are still here; check the service and try again.",
+        );
+      } else {
+        setIdentityError("We couldn’t save the identity. Your changes are still here; check the service and try again.");
+      }
     } finally {
       identitySavingRef.current = false;
       setSavingIdentity(false);
@@ -357,7 +376,29 @@ function IdentityPanel({
         </div>
         <div className="form-field">
           <label htmlFor={`machine-description-${identityID}`}>Description</label>
-          <textarea id={`machine-description-${identityID}`} maxLength={1024} value={description} disabled={savingIdentity} onChange={(event) => setDescription(event.currentTarget.value)} />
+          <textarea
+            id={`machine-description-${identityID}`}
+            value={description}
+            disabled={savingIdentity}
+            aria-invalid={identityFieldErrors.description ? "true" : undefined}
+            aria-describedby={fieldDescription(
+              `machine-description-${identityID}-help`,
+              identityFieldErrors.description ? `machine-description-${identityID}-error` : undefined,
+            )}
+            onChange={(event) => {
+              setDescription(event.currentTarget.value);
+              setIdentityFieldErrors((current) => withoutField(current, "description"));
+              setIdentityError("");
+            }}
+          />
+          <p className="field-help" id={`machine-description-${identityID}-help`}>
+            {byteLimitHelp(description, machineDescriptionLimit)}
+          </p>
+          {identityFieldErrors.description ? (
+            <p className="field-error" id={`machine-description-${identityID}-error`}>
+              {identityFieldErrors.description}
+            </p>
+          ) : null}
         </div>
         <label className="checkbox-field">
           <input type="checkbox" checked={enabled} disabled={savingIdentity} onChange={(event) => setEnabled(event.currentTarget.checked)} />
@@ -501,6 +542,12 @@ function CreateIdentityDialog({ client, onClose, onCreated }: { client: APIClien
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (submittingRef.current) return;
+    const localErrors = validateIdentity(name, description);
+    setFieldErrors(localErrors);
+    if (Object.keys(localErrors).length > 0) {
+      setError("Review the marked fields and try again.");
+      return;
+    }
     submittingRef.current = true;
     setSubmitting(true);
     setError("");
@@ -510,8 +557,17 @@ function CreateIdentityDialog({ client, onClose, onCreated }: { client: APIClien
       if (!isIdentityResponse(response)) throw new Error("invalid identity response");
       onCreated(response.identity);
     } catch (caught) {
-      if (caught instanceof APIError && caught.status === 422) setFieldErrors(caught.fields);
-      setError("The identity couldn’t be created. Review the fields and try again.");
+      if (caught instanceof APIError && caught.status === 422) {
+        const mapped = mapFieldErrors(caught.fields, ["name", "description"]);
+        setFieldErrors(mapped.fields);
+        setError(
+          Object.keys(mapped.fields).length > 0 && !mapped.hasUnknown
+            ? "The identity couldn’t be created. Review the marked fields and try again."
+            : "The identity couldn’t be created. Your values are still here; try again.",
+        );
+      } else {
+        setError("The identity couldn’t be created. Your values are still here; try again.");
+      }
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
@@ -521,9 +577,43 @@ function CreateIdentityDialog({ client, onClose, onCreated }: { client: APIClien
   return (
     <ModalDialog labelledBy="create-identity-title" describedBy="create-identity-description" initialFocusRef={nameRef} closeDisabled={submitting} onRequestClose={onClose}>
       <header className="dialog-heading"><div><p className="section-index">Machine access / New</p><h2 id="create-identity-title">New machine identity</h2><p id="create-identity-description">Create the durable identity before assigning grants or Tokens.</p></div></header>
-      <form className="resource-form" onSubmit={(event) => void submit(event)}>
-        <div className="form-field"><label htmlFor="machine-name">Machine name</label><input ref={nameRef} id="machine-name" required maxLength={128} value={name} disabled={submitting} aria-invalid={fieldErrors.name ? "true" : undefined} onChange={(event) => setName(event.currentTarget.value)} />{fieldErrors.name ? <p className="field-error">{fieldErrors.name}</p> : null}</div>
-        <div className="form-field"><label htmlFor="machine-description">Description</label><textarea id="machine-description" maxLength={1024} value={description} disabled={submitting} onChange={(event) => setDescription(event.currentTarget.value)} /></div>
+      <form className="resource-form" noValidate onSubmit={(event) => void submit(event)}>
+        <div className="form-field">
+          <label htmlFor="machine-name">Machine name</label>
+          <input
+            ref={nameRef}
+            id="machine-name"
+            required
+            value={name}
+            disabled={submitting}
+            aria-invalid={fieldErrors.name ? "true" : undefined}
+            aria-describedby={fieldDescription("machine-name-help", fieldErrors.name ? "machine-name-error" : undefined)}
+            onChange={(event) => {
+              setName(event.currentTarget.value);
+              setFieldErrors((current) => withoutField(current, "name"));
+              setError("");
+            }}
+          />
+          <p className="field-help" id="machine-name-help">{byteLimitHelp(name, machineNameLimit)}</p>
+          {fieldErrors.name ? <p className="field-error" id="machine-name-error">{fieldErrors.name}</p> : null}
+        </div>
+        <div className="form-field">
+          <label htmlFor="machine-description">Description</label>
+          <textarea
+            id="machine-description"
+            value={description}
+            disabled={submitting}
+            aria-invalid={fieldErrors.description ? "true" : undefined}
+            aria-describedby={fieldDescription("machine-description-help", fieldErrors.description ? "machine-description-error" : undefined)}
+            onChange={(event) => {
+              setDescription(event.currentTarget.value);
+              setFieldErrors((current) => withoutField(current, "description"));
+              setError("");
+            }}
+          />
+          <p className="field-help" id="machine-description-help">{byteLimitHelp(description, machineDescriptionLimit)}</p>
+          {fieldErrors.description ? <p className="field-error" id="machine-description-error">{fieldErrors.description}</p> : null}
+        </div>
         <label className="checkbox-field"><input type="checkbox" checked={enabled} disabled={submitting} onChange={(event) => setEnabled(event.currentTarget.checked)} /><span>Enabled</span></label>
         {error ? <p role="alert">{error}</p> : null}
         <div className="dialog-actions"><button className="text-button" type="button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" type="submit" disabled={submitting}>{submitting ? "Creating identity…" : "Create identity"}</button></div>
@@ -538,6 +628,7 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
   const [issued, setIssued] = useState<IssuedMachineToken | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [copyError, setCopyError] = useState("");
   const nameRef = useRef<HTMLInputElement>(null);
   const submittingRef = useRef(false);
@@ -549,8 +640,14 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
     event.preventDefault();
     if (submittingRef.current) return;
     const expiry = new Date(expiresAt);
-    if (!expiresAt || Number.isNaN(expiry.valueOf()) || expiry <= new Date() || expiry > new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)) {
-      setError("Choose an expiry in the future, no more than one year from now.");
+    const localErrors: Record<string, string> = {};
+    const nameError = validateName(name, "Token name");
+    const expiryError = validateExpiry(expiresAt, expiry);
+    if (nameError) localErrors.name = nameError;
+    if (expiryError) localErrors.expires_at = expiryError;
+    setFieldErrors(localErrors);
+    if (Object.keys(localErrors).length > 0) {
+      setError("Review the marked fields and try again.");
       return;
     }
     submittingRef.current = true;
@@ -563,8 +660,20 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
         setIssued(response.token);
         onIssued(metadataFromIssuedToken(response.token));
       }
-    } catch {
-      if (activeRef.current) setError("The Token couldn’t be issued. Your values are still here; check the expiry and try again.");
+    } catch (caught) {
+      if (activeRef.current) {
+        if (caught instanceof APIError && caught.status === 422) {
+          const mapped = mapFieldErrors(caught.fields, ["name", "expires_at"]);
+          setFieldErrors(mapped.fields);
+          setError(
+            Object.keys(mapped.fields).length > 0 && !mapped.hasUnknown
+              ? "The Token couldn’t be issued. Review the marked fields and try again."
+              : "The Token couldn’t be issued. Your values are still here; try again.",
+          );
+        } else {
+          setError("The Token couldn’t be issued. Your values are still here; try again.");
+        }
+      }
     } finally {
       submittingRef.current = false;
       if (activeRef.current) setSubmitting(false);
@@ -586,9 +695,44 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
     <ModalDialog labelledBy="issue-token-title" describedBy="issue-token-description" initialFocusRef={issued === null ? nameRef : undefined} closeDisabled={submitting} onRequestClose={onClose}>
       <header className="dialog-heading"><div><p className="section-index">Machine access / One-time value</p><h2 id="issue-token-title">Issue Token</h2><p id="issue-token-description">After this dialog closes, ConfigHub cannot show the plaintext again.</p></div></header>
       {issued === null ? (
-        <form className="resource-form" onSubmit={(event) => void submit(event)}>
-          <div className="form-field"><label htmlFor="token-name">Token name</label><input ref={nameRef} id="token-name" required maxLength={128} value={name} disabled={submitting} onChange={(event) => setName(event.currentTarget.value)} /></div>
-          <div className="form-field"><label htmlFor="token-expiry">Expires at</label><input id="token-expiry" type="datetime-local" required value={expiresAt} disabled={submitting} onChange={(event) => setExpiresAt(event.currentTarget.value)} /></div>
+        <form className="resource-form" noValidate onSubmit={(event) => void submit(event)}>
+          <div className="form-field">
+            <label htmlFor="token-name">Token name</label>
+            <input
+              ref={nameRef}
+              id="token-name"
+              required
+              value={name}
+              disabled={submitting}
+              aria-invalid={fieldErrors.name ? "true" : undefined}
+              aria-describedby={fieldDescription("token-name-help", fieldErrors.name ? "token-name-error" : undefined)}
+              onChange={(event) => {
+                setName(event.currentTarget.value);
+                setFieldErrors((current) => withoutField(current, "name"));
+                setError("");
+              }}
+            />
+            <p className="field-help" id="token-name-help">{byteLimitHelp(name, machineNameLimit)}</p>
+            {fieldErrors.name ? <p className="field-error" id="token-name-error">{fieldErrors.name}</p> : null}
+          </div>
+          <div className="form-field">
+            <label htmlFor="token-expiry">Expires at</label>
+            <input
+              id="token-expiry"
+              type="datetime-local"
+              required
+              value={expiresAt}
+              disabled={submitting}
+              aria-invalid={fieldErrors.expires_at ? "true" : undefined}
+              aria-describedby={fieldErrors.expires_at ? "token-expiry-error" : undefined}
+              onChange={(event) => {
+                setExpiresAt(event.currentTarget.value);
+                setFieldErrors((current) => withoutField(current, "expires_at"));
+                setError("");
+              }}
+            />
+            {fieldErrors.expires_at ? <p className="field-error" id="token-expiry-error">{fieldErrors.expires_at}</p> : null}
+          </div>
           {error ? <p role="alert">{error}</p> : null}
           <div className="dialog-actions"><button className="text-button" type="button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" type="submit" disabled={submitting}>{submitting ? "Issuing Token…" : "Issue Token"}</button></div>
         </form>
@@ -659,6 +803,86 @@ function RevokeTokenDialog({ client, identityID, token, onClose, onRevoked }: { 
       <div className="dialog-actions"><button ref={cancelRef} className="text-button" type="button" disabled={submitting} onClick={onClose}>Cancel</button><button className="danger-button" type="button" disabled={submitting} onClick={() => void revoke()}>{submitting ? "Revoking…" : "Revoke Token"}</button></div>
     </ModalDialog>
   );
+}
+
+const machineNameLimit = 128;
+const machineDescriptionLimit = 1024;
+const maxTokenLifetimeMilliseconds = 365 * 24 * 60 * 60 * 1000;
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(trimGoSpace(value)).byteLength;
+}
+
+const goSpaceEdges = /^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
+
+function trimGoSpace(value: string): string {
+  return value.replace(goSpaceEdges, "");
+}
+
+function byteLimitHelp(value: string, limit: number): string {
+  return `UTF-8 size after trimming: ${utf8ByteLength(value)} bytes. Limit: ${limit} bytes.`;
+}
+
+function validateName(value: string, label: string): string {
+  const bytes = utf8ByteLength(value);
+  if (trimGoSpace(value) === "") {
+    return `${label} is required.`;
+  }
+  return bytes > machineNameLimit
+    ? `${label} must be between 1 and ${machineNameLimit} UTF-8 bytes after trimming.`
+    : "";
+}
+
+function validateDescription(value: string): string {
+  return utf8ByteLength(value) > machineDescriptionLimit
+    ? `Description must be at most ${machineDescriptionLimit} UTF-8 bytes after trimming.`
+    : "";
+}
+
+function validateIdentity(name: string, description: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const nameError = validateName(name, "Machine name");
+  const descriptionError = validateDescription(description);
+  if (nameError) fields.name = nameError;
+  if (descriptionError) fields.description = descriptionError;
+  return fields;
+}
+
+function validateExpiry(value: string, expiry: Date): string {
+  const now = Date.now();
+  return !value || Number.isNaN(expiry.valueOf()) || expiry.valueOf() <= now || expiry.valueOf() > now + maxTokenLifetimeMilliseconds
+    ? "Choose an expiry in the future, no more than one year from now."
+    : "";
+}
+
+function fieldDescription(helpID: string, errorID?: string): string {
+  return errorID ? `${helpID} ${errorID}` : helpID;
+}
+
+function withoutField(fields: Record<string, string>, field: string): Record<string, string> {
+  if (!(field in fields)) {
+    return fields;
+  }
+  const next = { ...fields };
+  delete next[field];
+  return next;
+}
+
+function mapFieldErrors(
+  fields: Record<string, string>,
+  allowed: readonly string[],
+): { fields: Record<string, string>; hasUnknown: boolean } {
+  const mapped: Record<string, string> = {};
+  const allowedFields = new Set(allowed);
+  let hasUnknown = false;
+  for (const [field, message] of Object.entries(fields)) {
+    if (allowedFields.has(field) && message.trim() !== "") {
+      mapped[field] = message;
+    } else {
+      hasUnknown = true;
+    }
+  }
+  return { fields: mapped, hasUnknown };
 }
 
 function grantLabel(projects: ProjectOption[], grant: MachineEnvironmentGrant): string {

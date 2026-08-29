@@ -128,13 +128,13 @@ export function ConfigTable({
     );
   }
 
-  if (editing && canEdit) {
-    return (
+  const editor = editing ? (
       <ConfigEditor
         client={client}
         projectSlug={projectSlug}
         environmentSlug={environmentSlug}
         revision={revision}
+        editingUnavailable={requiresDesktop}
         onCancel={() => {
           focusTargetRef.current = "edit";
           setEditing(false);
@@ -148,10 +148,9 @@ export function ConfigTable({
           onRevisionChanged(saved);
         }}
       />
-    );
-  }
+  ) : null;
 
-  return (
+  const register = (
     <section className="configuration-register" aria-labelledby="configuration-title">
       <header className="section-heading configuration-heading">
         <div>
@@ -177,7 +176,11 @@ export function ConfigTable({
       </header>
 
       {canWrite && requiresDesktop ? (
-        <p className="desktop-edit-note">A desktop viewport is required to edit configuration. Values and revision history remain available here.</p>
+        <p className="desktop-edit-note">
+          {editing
+            ? "A desktop viewport is required to edit configuration. Your unsaved draft is retained and will return unchanged when desktop editing is available. Values and revision history remain available here."
+            : "A desktop viewport is required to edit configuration. Values and revision history remain available here."}
+        </p>
       ) : null}
 
       {revision.entries.length === 0 ? (
@@ -230,6 +233,17 @@ export function ConfigTable({
       )}
     </section>
   );
+
+  if (editing) {
+    return (
+      <>
+        {editor}
+        {requiresDesktop ? register : null}
+      </>
+    );
+  }
+
+  return register;
 }
 
 function configPath(projectSlug: string, environmentSlug: string): string {
