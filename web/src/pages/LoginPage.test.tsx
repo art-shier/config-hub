@@ -316,8 +316,10 @@ describe("authentication routes", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
 
-    const error = await screen.findByRole("alert");
+    const error = await screen.findByRole("status");
     expect(error).toHaveAttribute("aria-live", "polite");
+    expect(error).toHaveAttribute("aria-atomic", "true");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(error).toHaveTextContent(
       "ConfigHub couldn’t confirm sign-out. You’re still signed in. Check the server and try again.",
     );
@@ -332,6 +334,67 @@ describe("authentication routes", () => {
     expect(window.location.pathname).toBe("/login");
     expect(logoutRequests).toBe(2);
   });
+
+  it.each([
+    {
+      outcome: "a malformed 401",
+      respond: () =>
+        new HttpResponse("<html>logout upstream SECRET</html>", {
+          status: 401,
+          headers: { "Content-Type": "text/html" },
+        }),
+    },
+    {
+      outcome: "a non-invalid-session 401",
+      respond: () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "permission_denied",
+              message: "logout policy SECRET",
+              request_id: "req_logout_permission",
+              fields: { csrf_token: "csrf-body-secret" },
+            },
+          },
+          { status: 401 },
+        ),
+    },
+    {
+      outcome: "an empty 200",
+      respond: () => new HttpResponse(null, { status: 200 }),
+    },
+  ])(
+    "reconciles $outcome instead of treating logout as confirmed",
+    async ({ respond }) => {
+      let sessionRequests = 0;
+      server.use(
+        http.get("/api/v1/auth/session", () => {
+          sessionRequests += 1;
+          return HttpResponse.json(adminSession);
+        }),
+        http.post("/api/v1/auth/logout", respond),
+      );
+
+      renderAppAt("/projects");
+      expect(
+        await screen.findByRole("heading", { name: "Projects" }),
+      ).toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+      const status = await screen.findByRole("status");
+      expect(status).toHaveTextContent(
+        "ConfigHub couldn’t confirm sign-out. You’re still signed in. Check the server and try again.",
+      );
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(document.body).not.toHaveTextContent("SECRET");
+      expect(document.body).not.toHaveTextContent("csrf-body-secret");
+      expect(screen.getByText("Ada Lovelace")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Sign out" })).toBeEnabled();
+      expect(window.location.pathname).toBe("/projects");
+      expect(sessionRequests).toBe(2);
+    },
+  );
 
   it("returns to login when a current authenticated request receives 401", async () => {
     server.use(

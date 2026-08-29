@@ -83,29 +83,42 @@ describe("APIClient", () => {
     expect(csrfHeader).toBeNull();
   });
 
-  it("handles JSON and no-content success responses", async () => {
+  it("handles JSON success responses", async () => {
     server.use(
       http.get("/api/v1/projects", () =>
         HttpResponse.json({ projects: [{ slug: "shop" }] }),
       ),
-      http.delete("/api/v1/projects/shop", () =>
-        new HttpResponse(null, { status: 204 }),
-      ),
-      http.post("/api/v1/auth/logout", () =>
-        new HttpResponse(null, { status: 205 }),
-      ),
     );
 
-    const client = new APIClient(() => "csrf-token");
+    const client = new APIClient(() => null);
 
     await expect(
       client.get<{ projects: Array<{ slug: string }> }>("/projects"),
     ).resolves.toEqual({ projects: [{ slug: "shop" }] });
-    await expect(client.delete("/projects/shop")).resolves.toBeUndefined();
-    await expect(
-      client.postNoContent("/auth/logout", {}),
-    ).resolves.toBeUndefined();
   });
+
+  it.each([204, 205])(
+    "accepts explicit %i responses for no-content methods",
+    async (status) => {
+      server.use(
+        http.delete(
+          "/api/v1/projects/shop",
+          () => new HttpResponse(null, { status }),
+        ),
+        http.post(
+          "/api/v1/auth/logout",
+          () => new HttpResponse(null, { status }),
+        ),
+      );
+
+      const client = new APIClient(() => "csrf-token");
+
+      await expect(client.delete("/projects/shop")).resolves.toBeUndefined();
+      await expect(
+        client.postNoContent("/auth/logout", {}),
+      ).resolves.toBeUndefined();
+    },
+  );
 
   it("rejects empty content-bearing success responses", async () => {
     server.use(
@@ -143,6 +156,57 @@ describe("APIClient", () => {
     }
   });
 
+  it.each([
+    ["GET", 204],
+    ["GET", 205],
+    ["POST", 204],
+    ["POST", 205],
+    ["PUT", 204],
+    ["PUT", 205],
+  ] as const)(
+    "rejects %s %i no-content responses for required-content methods",
+    async (method, status) => {
+      let request: Promise<unknown>;
+      const client = new APIClient(() => "csrf-token");
+
+      if (method === "GET") {
+        server.use(
+          http.get(
+            "/api/v1/projects",
+            () => new HttpResponse(null, { status }),
+          ),
+        );
+        request = client.get<{ projects: unknown[] }>("/projects");
+      } else if (method === "POST") {
+        server.use(
+          http.post(
+            "/api/v1/auth/login",
+            () => new HttpResponse(null, { status }),
+          ),
+        );
+        request = client.post<{ ok: true }>("/auth/login", {});
+      } else {
+        server.use(
+          http.put(
+            "/api/v1/projects/shop/environments/prod/config",
+            () => new HttpResponse(null, { status }),
+          ),
+        );
+        request = client.put<{ revision: number }>(
+          "/projects/shop/environments/prod/config",
+          {},
+        );
+      }
+
+      await expect(request).rejects.toMatchObject({
+        status,
+        code: "unexpected_response",
+        message: "The server returned an unexpected response.",
+      });
+      await expect(request).rejects.toBeInstanceOf(APIError);
+    },
+  );
+
   it("rejects representations for no-content operations", async () => {
     server.use(
       http.post("/api/v1/auth/logout", () => HttpResponse.json({ ok: true })),
@@ -160,6 +224,58 @@ describe("APIClient", () => {
       status: 200,
       code: "unexpected_response",
     });
+  });
+
+  it("rejects empty content-bearing success for no-content operations", async () => {
+    server.use(
+      http.post(
+        "/api/v1/auth/logout",
+        () => new HttpResponse(null, { status: 200 }),
+      ),
+      http.delete(
+        "/api/v1/projects/shop",
+        () => new HttpResponse(null, { status: 200 }),
+      ),
+    );
+
+    const client = new APIClient(() => "csrf-token");
+
+    await expect(client.postNoContent("/auth/logout", {})).rejects.toMatchObject(
+      { status: 200, code: "unexpected_response" },
+    );
+    await expect(client.delete("/projects/shop")).rejects.toMatchObject({
+      status: 200,
+      code: "unexpected_response",
+    });
+  });
+
+  it("preserves typed non-2xx errors for no-content operations", async () => {
+    server.use(
+      http.post("/api/v1/auth/logout", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "forbidden",
+              message: "logout forbidden",
+              request_id: "req_logout_forbidden",
+              fields: {},
+            },
+          },
+          { status: 403 },
+        ),
+      ),
+    );
+
+    const client = new APIClient(() => "csrf-token");
+
+    await expect(client.postNoContent("/auth/logout", {})).rejects.toMatchObject(
+      {
+        status: 403,
+        code: "forbidden",
+        message: "logout forbidden",
+        requestId: "req_logout_forbidden",
+      },
+    );
   });
 
   it.each([

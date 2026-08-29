@@ -67,7 +67,7 @@ export function AppShell() {
           {logoutError ? (
             <p
               className="logout-error"
-              role="alert"
+              role="status"
               aria-live="polite"
               aria-atomic="true"
             >

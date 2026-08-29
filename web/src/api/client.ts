@@ -3,6 +3,8 @@ import type { APIClientContract, APIErrorEnvelope } from "./types";
 const API_PREFIX = "/api/v1";
 const UNEXPECTED_RESPONSE_MESSAGE =
   "The server returned an unexpected response.";
+type HTTPMethod = "GET" | "POST" | "PUT" | "DELETE";
+type ResponseContract = "content" | "no-content";
 
 export class APIError extends Error {
   constructor(
@@ -26,31 +28,43 @@ export class APIClient implements APIClientContract {
   ) {}
 
   get<T>(path: string): Promise<T> {
-    return this.request<T>("GET", path);
+    return this.request<T>("GET", path, undefined, "content");
   }
 
   post<T>(path: string, body: unknown): Promise<T> {
-    return this.request<T>("POST", path, body);
+    return this.request<T>("POST", path, body, "content");
   }
 
-  postNoContent(path: string, body: unknown): Promise<void> {
-    return this.request<void>("POST", path, body, true);
+  postNoContent(path: string, body?: unknown): Promise<void> {
+    return this.request("POST", path, body, "no-content");
   }
 
   put<T>(path: string, body: unknown): Promise<T> {
-    return this.request<T>("PUT", path, body);
+    return this.request<T>("PUT", path, body, "content");
   }
 
-  async delete(path: string): Promise<void> {
-    await this.request<void>("DELETE", path, undefined, true);
+  delete(path: string): Promise<void> {
+    return this.request("DELETE", path, undefined, "no-content");
   }
 
-  private async request<T>(
-    method: "GET" | "POST" | "PUT" | "DELETE",
+  private request<T>(
+    method: HTTPMethod,
     path: string,
-    body?: unknown,
-    expectsNoContent = false,
-  ): Promise<T> {
+    body: unknown,
+    responseContract: "content",
+  ): Promise<T>;
+  private request(
+    method: HTTPMethod,
+    path: string,
+    body: unknown,
+    responseContract: "no-content",
+  ): Promise<void>;
+  private async request<T>(
+    method: HTTPMethod,
+    path: string,
+    body: unknown,
+    responseContract: ResponseContract,
+  ): Promise<T | void> {
     const requestGeneration = this.getRequestGeneration();
     const url = safeAPIURL(path);
     const headers = new Headers({ Accept: "application/json" });
@@ -87,13 +101,13 @@ export class APIClient implements APIClientContract {
       throw toAPIError(response.status, responseText);
     }
 
-    if (hasNoContent) {
-      return undefined as T;
+    if (responseContract === "no-content") {
+      if (!hasNoContent) {
+        throw unexpectedResponse(response.status);
+      }
+      return;
     }
-    if (expectsNoContent) {
-      throw unexpectedResponse(response.status);
-    }
-    if (responseText === "") {
+    if (hasNoContent || responseText === "") {
       throw unexpectedResponse(response.status);
     }
 
