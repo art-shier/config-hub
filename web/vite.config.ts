@@ -14,7 +14,7 @@ export default defineConfig(({ mode }) => {
       emptyOutDir: true,
     },
     test: {
-      include: ["src/**/*.test.{ts,tsx}"],
+      include: ["src/**/*.{test,spec}.{ts,tsx}"],
       environment: "jsdom",
       environmentOptions: {
         jsdom: {

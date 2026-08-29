@@ -66,6 +66,15 @@ func TestBackupScriptExecsTimestampedOneShotBackup(t *testing.T) {
 func TestBuildAndCheckScriptsDeclareCompleteNativeGates(t *testing.T) {
 	repo := repositoryRoot(t)
 	build := readFile(t, filepath.Join(repo, "scripts", "build.sh"))
+	check := readFile(t, filepath.Join(repo, "scripts", "check.sh"))
+	for name, contents := range map[string]string{"build.sh": build, "check.sh": check} {
+		if strings.Count(contents, `"$script_dir/verify-toolchain.sh"`) != 1 {
+			t.Errorf("%s must call the shared toolchain validator exactly once", name)
+		}
+		if strings.Contains(contents, "node_major=") || strings.Contains(contents, "go_version_output=") {
+			t.Errorf("%s duplicates shared toolchain validation", name)
+		}
+	}
 	if !strings.Contains(build, `npm ci --include=dev --prefix "$repo_root/web"`) {
 		t.Error("build.sh must install locked frontend development dependencies even when NODE_ENV=production")
 	}
@@ -81,7 +90,6 @@ func TestBuildAndCheckScriptsDeclareCompleteNativeGates(t *testing.T) {
 	if versionAt, buildAt := strings.Index(build, `git -C "$repo_root" describe --always --dirty`), strings.Index(build, "npm run build"); versionAt < 0 || buildAt < 0 || versionAt > buildAt {
 		t.Error("build.sh must capture the checkout version before generated frontend output can dirty the tree")
 	}
-	check := readFile(t, filepath.Join(repo, "scripts", "check.sh"))
 	ordered := []string{
 		"gofmt -l", "go vet ./...", "go test -race -count=1 ./...",
 		"npm run typecheck", "npm test", "npm run build",
@@ -140,7 +148,7 @@ func TestBuildScriptAcceptsSupportedToolchainBoundariesBeforeNPMInstall(t *testi
 		{name: "Node 26 lower bound", goVersion: "go version go1.25.1 linux/amd64", nodeVersion: "v26.0.0"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			output, capture, err := runBuildWithFakeToolchain(t, test.goVersion, test.nodeVersion)
+			output, capture, err := runGateWithFakeToolchain(t, "build.sh", test.goVersion, test.nodeVersion)
 			if err == nil {
 				t.Fatal("build unexpectedly continued past the intentionally failing fake npm")
 			}
@@ -168,7 +176,7 @@ func TestBuildScriptRejectsUnsupportedToolchainsBeforeNPMInstall(t *testing.T) {
 		{name: "malformed Node", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v24.latest.0", wantMessage: "^22.22.2 || ^24.15.0 || >=26.0.0"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			output, capture, err := runBuildWithFakeToolchain(t, test.goVersion, test.nodeVersion)
+			output, capture, err := runGateWithFakeToolchain(t, "build.sh", test.goVersion, test.nodeVersion)
 			if err == nil {
 				t.Fatal("unsupported toolchain succeeded")
 			}
@@ -178,6 +186,55 @@ func TestBuildScriptRejectsUnsupportedToolchainsBeforeNPMInstall(t *testing.T) {
 			if contents, readErr := os.ReadFile(capture); readErr == nil && strings.Contains(string(contents), "npm ") {
 				t.Fatalf("npm ran before toolchain rejection: %s", contents)
 			} else if readErr != nil && !os.IsNotExist(readErr) {
+				t.Fatal(readErr)
+			}
+		})
+	}
+}
+
+func TestCheckScriptAcceptsSupportedToolchainBoundariesBeforeGoWork(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		goVersion   string
+		nodeVersion string
+	}{
+		{name: "Node 22 lower bound", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v22.22.2"},
+		{name: "Node 24 lower bound", goVersion: "go version go1.25.12 linux/amd64", nodeVersion: "v24.15.0"},
+		{name: "Node 26 lower bound", goVersion: "go version go1.25.1 linux/amd64", nodeVersion: "v26.0.0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, capture, err := runGateWithFakeToolchain(t, "check.sh", test.goVersion, test.nodeVersion)
+			if err == nil {
+				t.Fatal("check unexpectedly continued past the intentionally failing fake go")
+			}
+			if got := readFile(t, capture); !strings.HasPrefix(got, "go vet ./...") {
+				t.Fatalf("Go work not reached after supported versions: capture=%q output=%s", got, output)
+			}
+		})
+	}
+}
+
+func TestCheckScriptRejectsUnsupportedToolchainsBeforeGoOrNPMWork(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		goVersion   string
+		nodeVersion string
+		wantMessage string
+	}{
+		{name: "wrong Go", goVersion: "go version go1.26.0 linux/amd64", nodeVersion: "v24.15.0", wantMessage: "Go 1.25.x"},
+		{name: "Node 25", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v25.9.0", wantMessage: "^22.22.2 || ^24.15.0 || >=26.0.0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, capture, err := runGateWithFakeToolchain(t, "check.sh", test.goVersion, test.nodeVersion)
+			if err == nil {
+				t.Fatal("unsupported toolchain succeeded")
+			}
+			if !strings.Contains(output, test.wantMessage) {
+				t.Fatalf("error does not state supported range: output=%s", output)
+			}
+			if contents, readErr := os.ReadFile(capture); readErr == nil {
+				t.Fatalf("Go/npm work ran before toolchain rejection: %s", contents)
+			} else if !os.IsNotExist(readErr) {
 				t.Fatal(readErr)
 			}
 		})
@@ -194,6 +251,10 @@ func scriptFixture(t *testing.T, name string) string {
 	}
 	contents := readFile(t, filepath.Join(repositoryRoot(t), "scripts", name))
 	writeExecutable(t, filepath.Join(repo, "scripts", name), contents)
+	if name == "build.sh" || name == "check.sh" {
+		validator := readFile(t, filepath.Join(repositoryRoot(t), "scripts", "verify-toolchain.sh"))
+		writeExecutable(t, filepath.Join(repo, "scripts", "verify-toolchain.sh"), validator)
+	}
 	return repo
 }
 
@@ -227,9 +288,9 @@ func readLines(t *testing.T, path string) []string {
 	return strings.Split(strings.TrimSuffix(readFile(t, path), "\n"), "\n")
 }
 
-func runBuildWithFakeToolchain(t *testing.T, goVersion, nodeVersion string) (string, string, error) {
+func runGateWithFakeToolchain(t *testing.T, scriptName, goVersion, nodeVersion string) (string, string, error) {
 	t.Helper()
-	repo := scriptFixture(t, "build.sh")
+	repo := scriptFixture(t, scriptName)
 	bin := filepath.Join(repo, "test-bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {
 		t.Fatal(err)
@@ -253,7 +314,7 @@ exit 73
 	writeExecutable(t, filepath.Join(bin, "git"), `#!/usr/bin/env bash
 printf '%s\n' 'test-describe'
 `)
-	command := exec.Command(filepath.Join(repo, "scripts", "build.sh"))
+	command := exec.Command(filepath.Join(repo, "scripts", scriptName))
 	command.Env = append(os.Environ(),
 		"PATH="+bin+":"+os.Getenv("PATH"),
 		"CAPTURE="+capture,

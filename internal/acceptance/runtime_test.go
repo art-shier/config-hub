@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,7 @@ const (
 	featureValue            = "runtime-feature-revision-one"
 	revisionTwoValue        = "postgres://runtime-revision-two"
 	revisionTwoFeatureValue = "runtime-feature-revision-two"
+	runtimeSessionKey       = "runtime-session-key-012345678901234567890123456789"
 )
 
 func TestRuntimeWorkflow(t *testing.T) {
@@ -39,10 +41,30 @@ func TestRuntimeWorkflow(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	var cliDiagnostics diagnosticLog
 	fixture := startRuntimeServer(t, ctx)
-	defer fixture.stop(t)
+	leakGuard := newRuntimeLeakGuard(func() { fixture.stop(t) }, func() string {
+		return fixture.logs.String() + cliDiagnostics.AllString()
+	})
+	for label, secret := range map[string]string{
+		"configured value":           databaseValue,
+		"revision two value":         revisionTwoValue,
+		"feature value":              featureValue,
+		"revision two feature value": revisionTwoFeatureValue,
+		"admin password":             adminPassword,
+		"developer password":         developerPassword,
+		"session signing key":        runtimeSessionKey,
+	} {
+		leakGuard.add(label, secret)
+	}
+	t.Cleanup(func() {
+		if label, found := leakGuard.stopAndScan(); found {
+			t.Errorf("captured logs contain %s", label)
+		}
+	})
 
 	session := fixture.login(t, "admin", adminPassword)
+	leakGuard.add("session cookie", session.cookie.Value)
 	project := fixture.writeJSON(t, session, http.MethodPost, "/api/v1/projects", map[string]any{
 		"slug": "shop", "name": "Shop",
 	}, http.StatusCreated)
@@ -85,38 +107,38 @@ func TestRuntimeWorkflow(t *testing.T) {
 	if !strings.HasPrefix(issued.Token.Plaintext, "ch_") {
 		t.Fatal("machine token plaintext was not returned at issuance")
 	}
+	leakGuard.add("machine token", issued.Token.Plaintext)
 
 	getenv := runtimeEnvironment(fixture.url, issued.Token.Plaintext)
 	var jsonOutput, dotenvOutput, childOutput bytes.Buffer
-	var cliDiagnostics diagnosticLog
 	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
-		t.Fatalf("JSON export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
+		t.Fatalf("JSON export exit=%d", code)
 	}
 	var exported cli.ConfigResponse
 	decodeJSON(t, jsonOutput.Bytes(), &exported)
 	if exported.Revision != 1 || exported.Values["DATABASE_URL"] != databaseValue || exported.Values["FEATURE_FLAG"] != featureValue {
-		t.Fatalf("JSON export=%+v", exported)
+		t.Fatal("JSON export did not match revision 1")
 	}
 	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "dotenv"}, getenv, &dotenvOutput, &cliDiagnostics); code != 0 {
-		t.Fatalf("dotenv export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
+		t.Fatalf("dotenv export exit=%d", code)
 	}
 	if !strings.Contains(dotenvOutput.String(), "DATABASE_URL=") || !strings.Contains(dotenvOutput.String(), "FEATURE_FLAG=") {
-		t.Fatalf("dotenv export omitted values: %q", dotenvOutput.String())
+		t.Fatal("dotenv export omitted expected keys")
 	}
 
 	if code := executeCLI(cli.Execute, ctx, []string{"run", "--project", "shop", "--env", "production", "--", "sh", "-c", `printf '%s|%s' "$DATABASE_URL" "$FEATURE_FLAG"`}, getenv, &childOutput, &cliDiagnostics); code != 0 {
-		t.Fatalf("run exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
+		t.Fatalf("run exit=%d", code)
 	}
 	if childOutput.String() != databaseValue+"|"+featureValue {
-		t.Fatalf("child environment output=%q", childOutput.String())
+		t.Fatalf("child environment output length=%d, want=%d", childOutput.Len(), len(databaseValue)+1+len(featureValue))
 	}
 
 	var deniedOutput bytes.Buffer
 	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "development", "--format", "json"}, getenv, &deniedOutput, &cliDiagnostics); code != 1 {
-		t.Fatalf("development export exit=%d output=%q diagnostics=%q", code, deniedOutput.String(), cliDiagnostics.CurrentString())
+		t.Fatalf("development export exit=%d output_length=%d", code, deniedOutput.Len())
 	}
 	if !strings.Contains(cliDiagnostics.CurrentString(), "status 403") || !strings.Contains(cliDiagnostics.CurrentString(), "scope_denied") {
-		t.Fatalf("development denial diagnostics=%q", cliDiagnostics.CurrentString())
+		t.Fatal("development denial diagnostics omitted expected status or code")
 	}
 
 	revisionTwo := fixture.replaceConfig(t, session, 1, "runtime revision two", []revisions.Entry{
@@ -139,11 +161,11 @@ func TestRuntimeWorkflow(t *testing.T) {
 
 	jsonOutput.Reset()
 	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
-		t.Fatalf("post-rollback export exit=%d diagnostics=%q", code, cliDiagnostics.CurrentString())
+		t.Fatalf("post-rollback export exit=%d", code)
 	}
 	decodeJSON(t, jsonOutput.Bytes(), &exported)
 	if exported.Revision != 3 || exported.Values["DATABASE_URL"] != databaseValue || exported.Values["FEATURE_FLAG"] != featureValue {
-		t.Fatalf("post-rollback export=%+v", exported)
+		t.Fatal("post-rollback export did not match revision 3")
 	}
 
 	backupPath := filepath.Join(fixture.runtimeDir, "backups", "runtime.db")
@@ -152,7 +174,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 	backupCommand.Stdout = &fixture.logs
 	backupCommand.Stderr = &fixture.logs
 	if err := backupCommand.Run(); err != nil {
-		t.Fatalf("online backup command: %v logs=%s", err, fixture.logs.String())
+		t.Fatalf("online backup command: %v", err)
 	}
 	backup, err := database.OpenReadOnly(backupPath)
 	if err != nil {
@@ -180,21 +202,6 @@ func TestRuntimeWorkflow(t *testing.T) {
 		}
 	}
 
-	fixture.stop(t)
-	capturedLogs := fixture.logs.String() + cliDiagnostics.AllString()
-	secrets := map[string]string{
-		"configured value":           databaseValue,
-		"revision two value":         revisionTwoValue,
-		"feature value":              featureValue,
-		"revision two feature value": revisionTwoFeatureValue,
-		"admin password":             adminPassword,
-		"developer password":         developerPassword,
-		"session cookie":             session.cookie.Value,
-		"machine token":              issued.Token.Plaintext,
-	}
-	if label, found := findSensitiveLogLeak(capturedLogs, secrets); found {
-		t.Fatalf("captured logs contain %s", label)
-	}
 	if development.ID == "" {
 		t.Fatal("development environment was not created")
 	}
@@ -212,6 +219,9 @@ type runtimeFixture struct {
 	client         *http.Client
 	command        *exec.Cmd
 	logs           lockedBuffer
+	processDone    chan struct{}
+	processMu      sync.Mutex
+	processErr     error
 	stopOnce       sync.Once
 }
 
@@ -221,6 +231,27 @@ type browserSession struct {
 }
 
 type cliExecutor func(context.Context, []string, func(string) string, io.Writer, io.Writer) int
+
+type runtimeLeakGuard struct {
+	stop         func()
+	capturedLogs func() string
+	secrets      map[string]string
+}
+
+func newRuntimeLeakGuard(stop func(), capturedLogs func() string) *runtimeLeakGuard {
+	return &runtimeLeakGuard{stop: stop, capturedLogs: capturedLogs, secrets: make(map[string]string)}
+}
+
+func (g *runtimeLeakGuard) add(label, secret string) {
+	if secret != "" {
+		g.secrets[label] = secret
+	}
+}
+
+func (g *runtimeLeakGuard) stopAndScan() (string, bool) {
+	g.stop()
+	return findSensitiveLogLeak(g.capturedLogs(), g.secrets)
+}
 
 func TestDiagnosticLogRetainsEarlierCallsForLeakScan(t *testing.T) {
 	const sentinel = "early-cli-diagnostic-secret"
@@ -249,6 +280,52 @@ func TestDiagnosticLogRetainsEarlierCallsForLeakScan(t *testing.T) {
 	label, found := findSensitiveLogLeak(diagnostics.AllString(), map[string]string{"early CLI diagnostics": sentinel})
 	if !found || label != "early CLI diagnostics" {
 		t.Fatalf("leak scan result label=%q found=%t", label, found)
+	}
+}
+
+func TestRuntimeLeakGuardStopsBeforeScanningAndReportsOnlyLabel(t *testing.T) {
+	const secret = "early-runtime-secret"
+	stopped := false
+	guard := newRuntimeLeakGuard(func() {
+		stopped = true
+	}, func() string {
+		if !stopped {
+			t.Fatal("scanned runtime output before resources stopped")
+		}
+		return "late output contains " + secret
+	})
+	guard.add("machine token", secret)
+
+	label, found := guard.stopAndScan()
+	if !found || label != "machine token" {
+		t.Fatalf("leak result label=%q found=%t", label, found)
+	}
+	if strings.Contains(label, secret) {
+		t.Fatal("leak result disclosed the secret")
+	}
+}
+
+func TestRuntimeServerRetriesAnOccupiedCandidatePort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	attempts := 0
+	fixture := startRuntimeServerWithAddressProvider(t, ctx, func() (string, error) {
+		attempts++
+		if attempts == 1 {
+			return occupied.Addr().String(), nil
+		}
+		return unusedLoopbackAddress()
+	})
+	t.Cleanup(func() { fixture.stop(t) })
+	if attempts < 2 {
+		t.Fatalf("address attempts=%d, want at least 2", attempts)
 	}
 }
 
@@ -287,7 +364,7 @@ func (d *diagnosticLog) AllString() string {
 
 func findSensitiveLogLeak(capturedLogs string, secrets map[string]string) (string, bool) {
 	for label, secret := range secrets {
-		if strings.Contains(capturedLogs, secret) {
+		if secret != "" && strings.Contains(capturedLogs, secret) {
 			return label, true
 		}
 	}
@@ -311,30 +388,30 @@ func (b *lockedBuffer) String() string {
 	return b.buffer.String()
 }
 
+var errRuntimeServerExited = errors.New("runtime server exited during startup")
+
+type runtimeAddressProvider func() (string, error)
+
 func startRuntimeServer(t *testing.T, ctx context.Context) *runtimeFixture {
 	t.Helper()
+	return startRuntimeServerWithAddressProvider(t, ctx, unusedLoopbackAddress)
+}
+
+func startRuntimeServerWithAddressProvider(t *testing.T, ctx context.Context, addressProvider runtimeAddressProvider) *runtimeFixture {
+	t.Helper()
+	const maxStartAttempts = 5
+
 	repositoryRoot := acceptanceRepositoryRoot(t)
 	runtimeDir := t.TempDir()
 	serverBinary := filepath.Join(runtimeDir, "confighub-server")
 	build := exec.CommandContext(ctx, "go", "build", "-o", serverBinary, "./cmd/server")
 	build.Dir = repositoryRoot
 	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build runtime server: %v\n%s", err, output)
+		t.Fatalf("build runtime server: %v output_length=%d", err, len(output))
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	publicOrigin := "https://" + address
-	databasePath := filepath.Join(runtimeDir, "data", "confighub.db")
 	usersPath := filepath.Join(runtimeDir, "users.yaml")
 	sessionKeyPath := filepath.Join(runtimeDir, "session.key")
-	configPath := filepath.Join(runtimeDir, "config.yaml")
 	writeRestrictedFile(t, usersPath, []byte(fmt.Sprintf(`users:
   - username: admin
     display_name: Runtime Administrator
@@ -347,8 +424,17 @@ func startRuntimeServer(t *testing.T, ctx context.Context) *runtimeFixture {
     role: member
     enabled: true
 `, adminPassword, developerPassword)))
-	writeRestrictedFile(t, sessionKeyPath, []byte("runtime-session-key-012345678901234567890123456789\n"))
-	writeRestrictedFile(t, configPath, []byte(fmt.Sprintf(`server:
+	writeRestrictedFile(t, sessionKeyPath, []byte(runtimeSessionKey+"\n"))
+
+	for attempt := 1; attempt <= maxStartAttempts; attempt++ {
+		address, err := addressProvider()
+		if err != nil {
+			t.Fatalf("select runtime address attempt=%d: %v", attempt, err)
+		}
+		publicOrigin := "https://" + address
+		databasePath := filepath.Join(runtimeDir, fmt.Sprintf("data-%d", attempt), "confighub.db")
+		configPath := filepath.Join(runtimeDir, fmt.Sprintf("config-%d.yaml", attempt))
+		writeRestrictedFile(t, configPath, []byte(fmt.Sprintf(`server:
   listen: %s
   public_url: %s
   trusted_proxy_cidrs:
@@ -363,27 +449,68 @@ backup:
   directory: %s
 `, address, publicOrigin, databasePath, usersPath, sessionKeyPath, filepath.Join(runtimeDir, "backups"))))
 
-	fixture := &runtimeFixture{
-		url:            "http://" + address,
-		publicOrigin:   publicOrigin,
-		runtimeDir:     runtimeDir,
-		databasePath:   databasePath,
-		serverBinary:   serverBinary,
-		configPath:     configPath,
-		usersPath:      usersPath,
-		sessionKeyPath: sessionKeyPath,
-		client:         &http.Client{Timeout: 5 * time.Second},
+		fixture := &runtimeFixture{
+			url:            "http://" + address,
+			publicOrigin:   publicOrigin,
+			runtimeDir:     runtimeDir,
+			databasePath:   databasePath,
+			serverBinary:   serverBinary,
+			configPath:     configPath,
+			usersPath:      usersPath,
+			sessionKeyPath: sessionKeyPath,
+			client:         &http.Client{Timeout: 5 * time.Second},
+			processDone:    make(chan struct{}),
+		}
+		fixture.command = exec.Command(serverBinary, "serve", "--config", configPath)
+		fixture.command.Dir = repositoryRoot
+		fixture.command.Stdout = &fixture.logs
+		fixture.command.Stderr = &fixture.logs
+		if err := fixture.command.Start(); err != nil {
+			t.Fatalf("start runtime server attempt=%d: %v", attempt, err)
+		}
+		go fixture.waitForProcess()
+
+		if err := fixture.waitReady(ctx); err == nil {
+			t.Cleanup(func() { fixture.stop(t) })
+			return fixture
+		} else if errors.Is(err, errRuntimeServerExited) && attempt < maxStartAttempts {
+			if label, found := findSensitiveLogLeak(fixture.logs.String(), staticRuntimeSecrets()); found {
+				t.Fatalf("runtime startup logs contain %s", label)
+			}
+			continue
+		} else {
+			if !errors.Is(err, errRuntimeServerExited) {
+				fixture.stop(t)
+			}
+			if label, found := findSensitiveLogLeak(fixture.logs.String(), staticRuntimeSecrets()); found {
+				t.Fatalf("runtime startup logs contain %s", label)
+			}
+			t.Fatalf("runtime server readiness attempt=%d: %v", attempt, err)
+		}
 	}
-	fixture.command = exec.CommandContext(ctx, serverBinary, "serve", "--config", configPath)
-	fixture.command.Dir = repositoryRoot
-	fixture.command.Stdout = &fixture.logs
-	fixture.command.Stderr = &fixture.logs
-	if err := fixture.command.Start(); err != nil {
-		t.Fatal(err)
+
+	t.Fatalf("runtime server did not start after %d attempts", maxStartAttempts)
+	return nil
+}
+
+func staticRuntimeSecrets() map[string]string {
+	return map[string]string{
+		"admin password":      adminPassword,
+		"developer password":  developerPassword,
+		"session signing key": runtimeSessionKey,
 	}
-	t.Cleanup(func() { fixture.stop(t) })
-	fixture.waitReady(t, ctx)
-	return fixture
+}
+
+func unusedLoopbackAddress() (string, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		return "", err
+	}
+	return address, nil
 }
 
 func infoMode(info os.FileInfo) os.FileMode {
@@ -393,8 +520,21 @@ func infoMode(info os.FileInfo) os.FileMode {
 	return info.Mode()
 }
 
-func (f *runtimeFixture) waitReady(t *testing.T, ctx context.Context) {
-	t.Helper()
+func (f *runtimeFixture) waitForProcess() {
+	err := f.command.Wait()
+	f.processMu.Lock()
+	f.processErr = err
+	f.processMu.Unlock()
+	close(f.processDone)
+}
+
+func (f *runtimeFixture) processResult() error {
+	f.processMu.Lock()
+	defer f.processMu.Unlock()
+	return f.processErr
+}
+
+func (f *runtimeFixture) waitReady(ctx context.Context) error {
 	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -402,21 +542,23 @@ func (f *runtimeFixture) waitReady(t *testing.T, ctx context.Context) {
 	for {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url+"/api/v1/health/ready", nil)
 		if err != nil {
-			t.Fatal(err)
+			return fmt.Errorf("create readiness request: %w", err)
 		}
 		response, err := f.client.Do(request)
 		if err == nil {
 			_, _ = io.Copy(io.Discard, response.Body)
 			_ = response.Body.Close()
 			if response.StatusCode == http.StatusOK {
-				return
+				return nil
 			}
 		}
 		select {
+		case <-f.processDone:
+			return fmt.Errorf("%w: %v", errRuntimeServerExited, f.processResult())
 		case <-ctx.Done():
-			t.Fatalf("server readiness: %v logs=%s", ctx.Err(), f.logs.String())
+			return fmt.Errorf("readiness context: %w", ctx.Err())
 		case <-deadline.C:
-			t.Fatalf("server readiness timed out logs=%s", f.logs.String())
+			return errors.New("readiness timed out")
 		case <-ticker.C:
 		}
 	}
@@ -428,19 +570,25 @@ func (f *runtimeFixture) stop(t *testing.T) {
 		if f.command == nil || f.command.Process == nil {
 			return
 		}
+		select {
+		case <-f.processDone:
+			if err := f.processResult(); err != nil {
+				t.Errorf("runtime server exited before shutdown: %v", err)
+			}
+			return
+		default:
+		}
 		if err := f.command.Process.Signal(syscall.SIGTERM); err != nil && !strings.Contains(err.Error(), "process already finished") {
 			t.Errorf("stop runtime server: %v", err)
 		}
-		wait := make(chan error, 1)
-		go func() { wait <- f.command.Wait() }()
 		select {
-		case err := <-wait:
-			if err != nil {
-				t.Errorf("runtime server exit: %v logs=%s", err, f.logs.String())
+		case <-f.processDone:
+			if err := f.processResult(); err != nil {
+				t.Errorf("runtime server exit after shutdown: %v", err)
 			}
 		case <-time.After(15 * time.Second):
 			_ = f.command.Process.Kill()
-			<-wait
+			<-f.processDone
 			t.Errorf("runtime server did not stop gracefully")
 		}
 	})
@@ -517,7 +665,7 @@ func (f *runtimeFixture) requestJSON(t *testing.T, session *browserSession, meth
 		t.Fatal(err)
 	}
 	if response.StatusCode != status {
-		t.Fatalf("%s %s status=%d want=%d body=%s", method, path, response.StatusCode, status, contents)
+		t.Fatalf("%s %s status=%d want=%d response_length=%d", method, path, response.StatusCode, status, len(contents))
 	}
 	result := runtimeResponse{contents: contents}
 	for _, cookie := range response.Cookies() {
@@ -573,6 +721,6 @@ func acceptanceRepositoryRoot(t *testing.T) string {
 func decodeJSON(t *testing.T, contents []byte, destination any) {
 	t.Helper()
 	if err := json.Unmarshal(contents, destination); err != nil {
-		t.Fatalf("decode JSON: %v body=%s", err, contents)
+		t.Fatalf("decode JSON: %v body_length=%d", err, len(contents))
 	}
 }

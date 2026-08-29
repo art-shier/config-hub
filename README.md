@@ -141,14 +141,65 @@ CONFIGHUB_URL=https://config.example.com \
 
 目标文件已存在时不会覆盖。每次升级迁移前先完成一次成功备份，并定期做真实恢复演练。
 
-恢复流程：
+恢复必须在停服状态下原子切换，不能直接覆盖活动的 `database.path`。以下示例需要 `sqlite3` 和 GNU coreutils，并且应由实际运行 `confighub-server` 的账号执行；先把变量改成绝对路径：
 
-1. 停止 `confighub-server`，确认没有第二个实例访问数据库；
-2. 在隔离位置打开备份并执行 SQLite `PRAGMA integrity_check`，结果必须为 `ok`；
-3. 保留当前数据库及其 `-wal`、`-shm` 作为可回退副本；
-4. 将已验证备份复制到 `database.path`，设为 `0600`，数据目录设为 `0700`；不要把 WAL/SHM 与另一份数据库混用；
-5. 启动服务，让当前二进制检查并执行嵌入式迁移；
-6. 确认 readiness、登录、当前配置和版本历史后，再处理旧副本。
+```bash
+set -euo pipefail
+umask 077
+
+db_path=/srv/confighub/data/confighub.db
+backup_path=/srv/confighub/backups/confighub-20260829-120000.db
+data_dir="$(dirname -- "$db_path")"
+restore_id="$(date -u +%Y%m%d-%H%M%S)"
+rollback_dir="$data_dir/restore-rollback-$restore_id"
+staged_db="$data_dir/.confighub-restore-$restore_id.tmp"
+expected_uid="$(id -u)"
+expected_gid="$(id -g)"
+
+test -f "$db_path"
+test -f "$backup_path"
+
+# 先通过原有进程管理方式停止服务；这里确认该运行账号下没有遗漏的实例。
+if pgrep -u "$expected_uid" -f '[c]onfighub-server.*serve' >/dev/null; then
+  printf '%s\n' 'confighub-server is still running' >&2
+  exit 1
+fi
+
+test "$(stat -c '%a' "$data_dir")" = 700
+test "$(sqlite3 -readonly "$backup_path" 'PRAGMA integrity_check;')" = ok
+test ! -e "$rollback_dir"
+install -d -m 700 -- "$rollback_dir"
+test "$(stat -c '%a' "$rollback_dir")" = 700
+test "$(stat -c '%u' "$rollback_dir")" = "$expected_uid"
+test "$(stat -c '%g' "$rollback_dir")" = "$expected_gid"
+for active_file in "$db_path" "$db_path-wal" "$db_path-shm"; do
+  if [[ -e "$active_file" ]]; then
+    mv -- "$active_file" "$rollback_dir/"
+  fi
+done
+test ! -e "$db_path"
+test ! -e "$db_path-wal"
+test ! -e "$db_path-shm"
+test ! -e "$staged_db"
+sync -f "$data_dir"
+
+# 在目标目录内生成新文件，避免跨文件系统 rename；此时仍不占用活动路径。
+install -m 600 -- "$backup_path" "$staged_db"
+test "$(sqlite3 -readonly "$staged_db" 'PRAGMA integrity_check;')" = ok
+test "$(stat -c '%a' "$staged_db")" = 600
+test "$(stat -c '%u' "$staged_db")" = "$expected_uid"
+test "$(stat -c '%g' "$staged_db")" = "$expected_gid"
+
+# 先同步文件内容，再同目录原子 rename，最后同步 rename 所在文件系统。
+sync -d "$staged_db"
+mv -T -- "$staged_db" "$db_path"
+sync -d "$db_path"
+sync -f "$data_dir"
+```
+
+随后启动唯一的 `confighub-server` 实例，让当前二进制执行嵌入式迁移。依次确认 readiness 返回成功、管理员能够登录、当前配置内容正确、版本历史与预期一致。确认完成前保留整个 `rollback_dir`，不要把其中旧数据库的 `-wal`/`-shm` 与新数据库混用。
+
+如果启动、迁移或业务验证失败，先再次完全停服。把这次恢复生成的数据库及其新 sidecar 一并移到另一个 `0700` 故障留存目录，再将 `rollback_dir` 中原来同一代的数据库、`-wal`、`-shm` 一并移回原名，执行 `sync -f "$data_dir"` 后再启动验证；不要直接覆盖任一仍在使用的文件。
 
 SQLite 数据库和所有备份都以明文保存业务配置。任何能够读取这些文件的人都能读取全部配置，备份必须采用与运行数据库相同的访问控制和保管级别。
 

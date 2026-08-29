@@ -1,13 +1,20 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as requestHTTP } from "node:http";
 import { createServer as createHTTPSServer, type Server as HTTPSServer } from "node:https";
-import { createServer as createTCPServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { test, expect, type Page } from "@playwright/test";
+import {
+  AsyncCleanupStack,
+  ChildExitedBeforeReadyError,
+  retryWithLoopbackPort,
+  spawnManagedChild,
+  stopChild,
+  waitForReady,
+} from "./runtime-harness";
 
 const executeFile = promisify(execFile);
 const adminPassword = "e2e-admin-password";
@@ -15,6 +22,7 @@ const developerPassword = "e2e-developer-password";
 const originalDatabaseValue = "postgres://e2e-revision-one";
 const revisionTwoDatabaseValue = "postgres://e2e-revision-two";
 const originalFeatureValue = "e2e-feature-revision-one";
+const sessionSigningKey = "e2e-session-key-012345678901234567890123456789012345";
 let issuedMachineToken = "";
 
 interface E2ERuntime {
@@ -31,13 +39,19 @@ test.beforeAll(async () => {
 
 test.afterAll(async () => {
   if (runtimeServer) {
-    await runtimeServer.stop();
-    for (const secret of [adminPassword, developerPassword, originalDatabaseValue, revisionTwoDatabaseValue, originalFeatureValue, issuedMachineToken]) {
+    let stopFailed = false;
+    try {
+      await runtimeServer.stop();
+    } catch {
+      stopFailed = true;
+    }
+    for (const secret of [adminPassword, developerPassword, sessionSigningKey, originalDatabaseValue, revisionTwoDatabaseValue, originalFeatureValue, issuedMachineToken]) {
       if (secret === "") continue;
       if (runtimeServer.logs().includes(secret)) {
         throw new Error("runtime logs contained browser credentials or configuration values");
       }
     }
+    if (stopFailed) throw new Error("runtime resources did not stop cleanly");
   }
 });
 
@@ -160,52 +174,54 @@ async function createEnvironment(page: Page, slug: string, name: string): Promis
 
 async function startRuntimeServer(): Promise<E2ERuntime> {
   const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-  const runtimeDirectory = await mkdtemp(join(tmpdir(), "confighub-playwright-"));
-  const serverBinary = join(runtimeDirectory, "confighub-server");
-  const usersPath = join(runtimeDirectory, "users.yaml");
-  const sessionKeyPath = join(runtimeDirectory, "session.key");
-  const configPath = join(runtimeDirectory, "config.yaml");
-  const databasePath = join(runtimeDirectory, "data", "confighub.db");
-  const certificatePath = join(runtimeDirectory, "localhost.crt");
-  const privateKeyPath = join(runtimeDirectory, "localhost.key");
-  const backendPort = await unusedLoopbackPort();
+  const cleanups = new AsyncCleanupStack();
   let serverLogs = "";
+  try {
+    const runtimeDirectory = await mkdtemp(join(tmpdir(), "confighub-playwright-"));
+    cleanups.defer(async () => { await rm(runtimeDirectory, { recursive: true, force: true }); });
+    const serverBinary = join(runtimeDirectory, "confighub-server");
+    const usersPath = join(runtimeDirectory, "users.yaml");
+    const sessionKeyPath = join(runtimeDirectory, "session.key");
+    const certificatePath = join(runtimeDirectory, "localhost.crt");
+    const privateKeyPath = join(runtimeDirectory, "localhost.key");
 
-  await executeFile("go", ["build", "-o", serverBinary, "./cmd/server"], { cwd: repositoryRoot });
-  await executeFile("openssl", [
-    "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes", "-days", "1",
-    "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
-    "-keyout", privateKeyPath, "-out", certificatePath,
-  ]);
+    await executeFile("go", ["build", "-o", serverBinary, "./cmd/server"], { cwd: repositoryRoot });
+    await executeFile("openssl", [
+      "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes", "-days", "1",
+      "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+      "-keyout", privateKeyPath, "-out", certificatePath,
+    ]);
 
-  const proxy = createHTTPSServer({
-    key: await readFile(privateKeyPath),
-    cert: await readFile(certificatePath),
-  }, (request, response) => {
-    const upstream = requestHTTP({
-      hostname: "127.0.0.1",
-      port: backendPort,
-      path: request.url,
-      method: request.method,
-      headers: request.headers,
-    }, (upstreamResponse) => {
-      response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
-      upstreamResponse.pipe(response);
+    let backendPort = 0;
+    const proxy = createHTTPSServer({
+      key: await readFile(privateKeyPath),
+      cert: await readFile(certificatePath),
+    }, (request, response) => {
+      const upstream = requestHTTP({
+        hostname: "127.0.0.1",
+        port: backendPort,
+        path: request.url,
+        method: request.method,
+        headers: request.headers,
+      }, (upstreamResponse) => {
+        response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+        upstreamResponse.pipe(response);
+      });
+      upstream.on("error", () => {
+        if (!response.headersSent) response.writeHead(502);
+        response.end();
+      });
+      request.pipe(upstream);
     });
-    upstream.on("error", () => {
-      if (!response.headersSent) response.writeHead(502);
-      response.end();
-    });
-    request.pipe(upstream);
-  });
-  await listenHTTPS(proxy);
-  const proxyAddress = proxy.address();
-  if (proxyAddress === null || typeof proxyAddress === "string") {
-    throw new Error("HTTPS proxy did not bind a TCP address");
-  }
-  const origin = `https://127.0.0.1:${proxyAddress.port}`;
+    await listenHTTPS(proxy);
+    cleanups.defer(async () => { await closeHTTPS(proxy); });
+    const proxyAddress = proxy.address();
+    if (proxyAddress === null || typeof proxyAddress === "string") {
+      throw new Error("HTTPS proxy did not bind a TCP address");
+    }
+    const origin = `https://127.0.0.1:${proxyAddress.port}`;
 
-  await writeRestricted(usersPath, `users:
+    await writeRestricted(usersPath, `users:
   - username: admin
     display_name: E2E Administrator
     password: ${adminPassword}
@@ -217,8 +233,15 @@ async function startRuntimeServer(): Promise<E2ERuntime> {
     role: member
     enabled: true
 `);
-  await writeRestricted(sessionKeyPath, "e2e-session-key-012345678901234567890123456789012345\n");
-  await writeRestricted(configPath, `server:
+    await writeRestricted(sessionKeyPath, `${sessionSigningKey}\n`);
+
+    let runtimeAttempt = 0;
+    const server = await retryWithLoopbackPort(async (candidatePort) => {
+      runtimeAttempt += 1;
+      backendPort = candidatePort;
+      const configPath = join(runtimeDirectory, `config-${runtimeAttempt}.yaml`);
+      const databasePath = join(runtimeDirectory, `data-${runtimeAttempt}`, "confighub.db");
+      await writeRestricted(configPath, `server:
   listen: 127.0.0.1:${backendPort}
   public_url: ${origin}
   trusted_proxy_cidrs:
@@ -232,53 +255,52 @@ auth:
 backup:
   directory: ${join(runtimeDirectory, "backups")}
 `);
+      const child = await spawnManagedChild(serverBinary, ["serve", "--config", configPath], {
+        cwd: repositoryRoot,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child.child.stdout?.on("data", (chunk: Buffer) => { serverLogs += chunk.toString("utf8"); });
+      child.child.stderr?.on("data", (chunk: Buffer) => { serverLogs += chunk.toString("utf8"); });
+      try {
+        await waitForReady(`http://127.0.0.1:${backendPort}`, { child });
+        return child;
+      } catch (error) {
+        await stopChild(child);
+        if (error instanceof ChildExitedBeforeReadyError) throw error;
+        throw new Error("runtime readiness failed without a bind error");
+      }
+    }, { retryIf: (error) => error instanceof ChildExitedBeforeReadyError });
+    cleanups.defer(async () => { await stopChild(server); });
 
-  const server = spawn(serverBinary, ["serve", "--config", configPath], {
-    cwd: repositoryRoot,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  server.stdout?.on("data", (chunk: Buffer) => { serverLogs += chunk.toString("utf8"); });
-  server.stderr?.on("data", (chunk: Buffer) => { serverLogs += chunk.toString("utf8"); });
-
-  try {
-    await waitForReady(`http://127.0.0.1:${backendPort}`);
-  } catch (error) {
-    server.kill("SIGKILL");
-    proxy.close();
-    await rm(runtimeDirectory, { recursive: true, force: true });
-    throw new Error(`real server did not become ready: ${String(error)}\n${serverLogs}`);
+    let stopped = false;
+    return {
+      origin,
+      logs: () => serverLogs,
+      stop: async () => {
+        if (stopped) return;
+        stopped = true;
+        await cleanups.dispose();
+      },
+    };
+  } catch {
+    let cleanupFailed = false;
+    try {
+      await cleanups.dispose();
+    } catch {
+      cleanupFailed = true;
+    }
+    for (const secret of [adminPassword, developerPassword, sessionSigningKey, originalDatabaseValue, revisionTwoDatabaseValue, originalFeatureValue]) {
+      if (serverLogs.includes(secret)) {
+        throw new Error("runtime startup logs contained a protected value");
+      }
+    }
+    if (cleanupFailed) throw new Error("runtime startup cleanup failed");
+    throw new Error("real server did not become ready");
   }
-
-  let stopped = false;
-  return {
-    origin,
-    logs: () => serverLogs,
-    stop: async () => {
-      if (stopped) return;
-      stopped = true;
-      await Promise.all([
-        new Promise<void>((resolveClose) => proxy.close(() => resolveClose())),
-        stopChild(server),
-      ]);
-      await rm(runtimeDirectory, { recursive: true, force: true });
-    },
-  };
 }
 
 async function writeRestricted(path: string, contents: string): Promise<void> {
   await writeFile(path, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
-}
-
-async function unusedLoopbackPort(): Promise<number> {
-  const server = createTCPServer();
-  await new Promise<void>((resolveListen, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolveListen());
-  });
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("could not reserve loopback port");
-  await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
-  return address.port;
 }
 
 async function listenHTTPS(server: HTTPSServer): Promise<void> {
@@ -288,31 +310,9 @@ async function listenHTTPS(server: HTTPSServer): Promise<void> {
   });
 }
 
-async function waitForReady(baseURL: string): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseURL}/api/v1/health/ready`);
-      if (response.ok) return;
-    } catch {
-      // The server may still be hashing initial credentials.
-    }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
-  }
-  throw new Error("readiness timed out");
-}
-
-async function stopChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise<void>((resolveExit) => {
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolveExit();
-    }, 15_000);
-    child.once("exit", () => {
-      clearTimeout(timeout);
-      resolveExit();
-    });
-    child.kill("SIGTERM");
+async function closeHTTPS(server: HTTPSServer): Promise<void> {
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => error ? rejectClose(error) : resolveClose());
+    server.closeAllConnections();
   });
 }

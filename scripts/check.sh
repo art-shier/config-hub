@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 
+"$script_dir/verify-toolchain.sh"
 cd "$repo_root"
 raw_version="$(git -C "$repo_root" describe --always --dirty)"
 build_version="$(printf '%s' "$raw_version" | LC_ALL=C sed 's/[^A-Za-z0-9._+-]/-/g')"
