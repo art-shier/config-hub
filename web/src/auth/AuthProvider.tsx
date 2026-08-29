@@ -22,7 +22,7 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 interface BootstrapRequest {
-  generation: number;
+  epoch: number;
   promise: Promise<Session>;
 }
 
@@ -30,47 +30,118 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const csrfTokenRef = useRef<string | null>(null);
-  const authGenerationRef = useRef(0);
+  const operationEpochRef = useRef(0);
+  const requestGenerationRef = useRef(0);
+  const authTransitionPendingRef = useRef(false);
+  const loadingOwnerRef = useRef<number | null>(0);
   const mountedRef = useRef(false);
   const bootstrapRequestRef = useRef<BootstrapRequest | null>(null);
+  const authMutationQueueRef = useRef<Promise<void>>(Promise.resolve());
 
-  const clearAuth = useCallback((expectedGeneration?: number) => {
-    const generation = expectedGeneration ?? authGenerationRef.current;
-    if (generation !== authGenerationRef.current) {
+  const beginAuthOperation = useCallback(() => {
+    operationEpochRef.current += 1;
+    requestGenerationRef.current += 1;
+    authTransitionPendingRef.current = true;
+    const epoch = operationEpochRef.current;
+    if (loadingOwnerRef.current !== null) {
+      loadingOwnerRef.current = epoch;
+    }
+    return epoch;
+  }, []);
+
+  const clearAuthForOperation = useCallback((expectedEpoch: number) => {
+    if (expectedEpoch !== operationEpochRef.current) {
       return;
     }
 
-    authGenerationRef.current += 1;
+    authTransitionPendingRef.current = false;
+    requestGenerationRef.current += 1;
     csrfTokenRef.current = null;
     if (mountedRef.current) {
       setUser(null);
     }
   }, []);
 
+  const clearAuthForRequest = useCallback((expectedGeneration: number) => {
+    if (
+      authTransitionPendingRef.current ||
+      expectedGeneration !== requestGenerationRef.current
+    ) {
+      return;
+    }
+
+    requestGenerationRef.current += 1;
+    csrfTokenRef.current = null;
+    if (mountedRef.current) {
+      setUser(null);
+    }
+  }, []);
+
+  const finishLoading = useCallback((expectedEpoch: number) => {
+    if (loadingOwnerRef.current !== expectedEpoch) {
+      return;
+    }
+
+    loadingOwnerRef.current = null;
+    if (mountedRef.current) {
+      setLoading(false);
+    }
+  }, []);
+
+  const enqueueAuthMutation = useCallback(
+    <T,>(operation: () => Promise<T>): Promise<T> => {
+      const result = authMutationQueueRef.current.then(operation);
+      authMutationQueueRef.current = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    },
+    [],
+  );
+
   const clientRef = useRef<APIClient | null>(null);
   if (clientRef.current === null) {
     clientRef.current = new APIClient(
       () => csrfTokenRef.current,
-      clearAuth,
-      () => authGenerationRef.current,
+      clearAuthForRequest,
+      () => requestGenerationRef.current,
     );
   }
   const client = clientRef.current;
 
   const applySession = useCallback(
-    (session: Session, expectedGeneration: number) => {
+    (session: Session, expectedEpoch: number) => {
       if (
         !mountedRef.current ||
-        expectedGeneration !== authGenerationRef.current
+        expectedEpoch !== operationEpochRef.current
       ) {
         return;
       }
 
-      authGenerationRef.current += 1;
+      authTransitionPendingRef.current = false;
+      requestGenerationRef.current += 1;
       csrfTokenRef.current = session.csrf_token;
       setUser(session.user);
     },
     [],
+  );
+
+  const reconcileSession = useCallback(
+    async (expectedEpoch: number) => {
+      if (expectedEpoch !== operationEpochRef.current) {
+        return;
+      }
+
+      const reconciliationClient = new APIClient(() => csrfTokenRef.current);
+      try {
+        const session = await reconciliationClient.get<Session>("/auth/session");
+        applySession(session, expectedEpoch);
+      } catch {
+        clearAuthForOperation(expectedEpoch);
+      }
+    },
+    [applySession, clearAuthForOperation],
   );
 
   useEffect(() => {
@@ -78,8 +149,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     let active = true;
 
     if (bootstrapRequestRef.current === null) {
+      const epoch = beginAuthOperation();
       bootstrapRequestRef.current = {
-        generation: authGenerationRef.current,
+        epoch,
         promise: client.get<Session>("/auth/session"),
       };
     }
@@ -87,17 +159,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void bootstrapRequest.promise
       .then((session) => {
         if (active) {
-          applySession(session, bootstrapRequest.generation);
+          applySession(session, bootstrapRequest.epoch);
         }
       })
       .catch(() => {
         if (active) {
-          clearAuth(bootstrapRequest.generation);
+          clearAuthForOperation(bootstrapRequest.epoch);
         }
       })
       .finally(() => {
-        if (active && mountedRef.current) {
-          setLoading(false);
+        if (active) {
+          finishLoading(bootstrapRequest.epoch);
         }
       });
 
@@ -105,28 +177,66 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       active = false;
       mountedRef.current = false;
     };
-  }, [applySession, clearAuth, client]);
+  }, [
+    applySession,
+    beginAuthOperation,
+    clearAuthForOperation,
+    client,
+    finishLoading,
+  ]);
 
   const login = useCallback(
     async (username: string, password: string) => {
-      const generation = authGenerationRef.current;
-      const session = await client.post<Session>("/auth/login", {
-        username,
-        password,
-      });
-      applySession(session, generation);
+      const epoch = beginAuthOperation();
+      try {
+        await enqueueAuthMutation(async () => {
+          const operationClient = new APIClient(() => csrfTokenRef.current);
+          try {
+            const session = await operationClient.post<Session>("/auth/login", {
+              username,
+              password,
+            });
+            csrfTokenRef.current = session.csrf_token;
+            applySession(session, epoch);
+          } catch (error) {
+            await reconcileSession(epoch);
+            throw error;
+          }
+        });
+      } finally {
+        finishLoading(epoch);
+      }
     },
-    [applySession, client],
+    [
+      applySession,
+      beginAuthOperation,
+      enqueueAuthMutation,
+      finishLoading,
+      reconcileSession,
+    ],
   );
 
   const logout = useCallback(async () => {
-    const generation = authGenerationRef.current;
+    const epoch = beginAuthOperation();
     try {
-      await client.post<void>("/auth/logout", {});
+      await enqueueAuthMutation(async () => {
+        const operationClient = new APIClient(() => csrfTokenRef.current);
+        try {
+          await operationClient.post<void>("/auth/logout", {});
+          csrfTokenRef.current = null;
+        } finally {
+          clearAuthForOperation(epoch);
+        }
+      });
     } finally {
-      clearAuth(generation);
+      finishLoading(epoch);
     }
-  }, [clearAuth, client]);
+  }, [
+    beginAuthOperation,
+    clearAuthForOperation,
+    enqueueAuthMutation,
+    finishLoading,
+  ]);
 
   const value = useMemo<AuthContextValue>(
     () => ({ client, loading, login, logout, user }),
