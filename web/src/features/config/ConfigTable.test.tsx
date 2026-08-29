@@ -84,6 +84,48 @@ describe("ConfigTable", () => {
     );
   });
 
+  it("keeps configuration readable but requires a desktop viewport to edit", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === "(max-width: 759px)",
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    const api = client();
+    vi.mocked(api.get).mockResolvedValue({
+      revision: {
+        id: "revision-8",
+        environment_id: "env-prod",
+        message: "mobile read",
+        created_by: "user-admin",
+        version: 8,
+        created_at: "2026-08-29T08:00:00Z",
+        entries: [
+          { key: "DATABASE_URL", value: "postgres://exact", service: "api" },
+        ],
+      },
+    });
+    render(
+      <ConfigTable
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByTestId("configuration-value-DATABASE_URL")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit configuration" })).not.toBeInTheDocument();
+    expect(screen.getByText(/desktop viewport is required to edit/iu)).toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
   it("filters current entries by key or service without changing values", async () => {
     const api = client();
     vi.mocked(api.get).mockResolvedValue({

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 
@@ -15,6 +15,42 @@ export function AppShell() {
   const { logout, user } = useAuth();
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState("");
+  const [navigationOpen, setNavigationOpen] = useState(false);
+  const navigationButtonRef = useRef<HTMLButtonElement>(null);
+  const navigationRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (!navigationOpen) {
+      return;
+    }
+    navigationRef.current?.querySelector<HTMLAnchorElement>("a")?.focus();
+
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) {
+        return;
+      }
+      if (!navigationRef.current?.contains(target) && !navigationButtonRef.current?.contains(target)) {
+        setNavigationOpen(false);
+      }
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      setNavigationOpen(false);
+      navigationButtonRef.current?.focus();
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [navigationOpen]);
 
   if (user === null) {
     return null;
@@ -53,6 +89,17 @@ export function AppShell() {
             <span className="brand-context">Control ledger</span>
           </div>
         </div>
+        <button
+          ref={navigationButtonRef}
+          className="navigation-button"
+          type="button"
+          aria-controls="primary-navigation"
+          aria-expanded={navigationOpen}
+          aria-label={navigationOpen ? "Close navigation" : "Open navigation"}
+          onClick={() => setNavigationOpen((current) => !current)}
+        >
+          <span aria-hidden="true">Menu</span>
+        </button>
         <div className="session-summary">
           <span className="session-user">{user.display_name}</span>
           <span className="session-role">{user.role}</span>
@@ -77,13 +124,19 @@ export function AppShell() {
         </div>
       </header>
       <div className="app-frame">
-        <nav className="primary-nav" aria-label="Primary">
+        <nav
+          ref={navigationRef}
+          id="primary-navigation"
+          className={navigationOpen ? "primary-nav primary-nav-open" : "primary-nav"}
+          aria-label="Primary"
+        >
           <p className="nav-label">Workspace</p>
           <ul>
             {navigation.map((item) => (
               <li key={item.to}>
                 <NavLink
                   to={item.to}
+                  onClick={() => setNavigationOpen(false)}
                   className={({ isActive }) =>
                     isActive ? "nav-link nav-link-active" : "nav-link"
                   }

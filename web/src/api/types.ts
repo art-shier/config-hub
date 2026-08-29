@@ -39,6 +39,65 @@ export interface Environment {
   updated_at: string;
 }
 
+export interface MachineEnvironmentGrant {
+  project_id: string;
+  environment_id: string;
+}
+
+export interface MachineTokenMetadata {
+  id: string;
+  name: string;
+  prefix: string;
+  expires_at: string;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface IssuedMachineToken {
+  id: string;
+  name: string;
+  prefix: string;
+  plaintext: string;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface MachineIdentity {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MachineIdentityDetail extends MachineIdentity {
+  grants: MachineEnvironmentGrant[];
+  tokens: MachineTokenMetadata[];
+}
+
+export interface SynchronizedUser {
+  id: string;
+  username: string;
+  display_name: string;
+  role: UserRole;
+  enabled: boolean;
+  updated_at: string;
+}
+
+export interface UserRegister {
+  users: SynchronizedUser[];
+  last_successful_user_sync_at: string;
+}
+
+export interface SystemStatus {
+  build_version: string;
+  live: boolean;
+  ready: boolean;
+  sqlite_ready: boolean;
+  last_successful_user_sync_at: string;
+}
+
 export interface ProjectDetail extends Project {
   permission: ProjectPermission;
   environments: Environment[];

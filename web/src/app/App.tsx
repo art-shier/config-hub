@@ -10,8 +10,11 @@ import {
 import { useEffect, useRef } from "react";
 import { AuthProvider, useAuth } from "../auth/AuthProvider";
 import { LoginPage } from "../pages/LoginPage";
+import { MachineAccessPage } from "../pages/MachineAccessPage";
+import { MembersPage } from "../pages/MembersPage";
 import { ProjectPage } from "../pages/ProjectPage";
 import { ProjectsPage } from "../pages/ProjectsPage";
+import { SystemPage } from "../pages/SystemPage";
 import { AppShell } from "./AppShell";
 
 export function App() {
@@ -52,33 +55,15 @@ function AppRoutes() {
             <Route element={<RequireAdmin />}>
               <Route
                 path="/machine-access"
-                element={
-                  <PlaceholderPage
-                    eyebrow="Scoped credentials"
-                    title="Machine Access"
-                    description="Machine identities and token controls will appear here."
-                  />
-                }
+                element={<MachineAccessPage />}
               />
               <Route
                 path="/members"
-                element={
-                  <PlaceholderPage
-                    eyebrow="Team permissions"
-                    title="Members"
-                    description="Project membership controls will appear here."
-                  />
-                }
+                element={<MembersPage />}
               />
               <Route
                 path="/system"
-                element={
-                  <PlaceholderPage
-                    eyebrow="Service status"
-                    title="System"
-                    description="Operational status will appear here."
-                  />
-                }
+                element={<SystemPage />}
               />
             </Route>
             <Route

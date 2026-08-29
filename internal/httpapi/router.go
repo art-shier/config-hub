@@ -28,6 +28,7 @@ type Dependencies struct {
 	Revisions   RevisionService
 	Machines    MachineAccessService
 	System      SystemStatus
+	Admin       AdministrationService
 }
 
 type RateLimitOptions struct {
@@ -66,6 +67,7 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	projectsEnabled := deps.Projects != nil
 	revisionsEnabled := deps.Revisions != nil
 	machinesEnabled := deps.Machines != nil
+	administrationEnabled := deps.Admin != nil
 	mux.HandleFunc("POST /api/v1/auth/login", handlers.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", handlers.logout)
 	mux.HandleFunc("GET /api/v1/auth/session", handlers.session)
@@ -100,6 +102,11 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 		mux.HandleFunc("POST /api/v1/machine-identities/{identity}/tokens", machineAPI.issueToken)
 		mux.HandleFunc("DELETE /api/v1/machine-identities/{identity}/tokens/{token}", machineAPI.revokeToken)
 	}
+	if administrationEnabled {
+		administrationAPI := &administrationHandlers{service: deps.Admin, auth: handlers}
+		mux.HandleFunc("GET /api/v1/users", administrationAPI.users)
+		mux.HandleFunc("GET /api/v1/system", administrationAPI.system)
+	}
 	if options.Register != nil {
 		options.Register(mux)
 	}
@@ -133,6 +140,13 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 		if machinesEnabled {
 			if allowed, known := machineRouteMethods(r.URL.Path); known {
 				w.Header().Set("Allow", allowed)
+				writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+				return
+			}
+		}
+		if administrationEnabled {
+			if r.URL.Path == "/api/v1/users" || r.URL.Path == "/api/v1/system" {
+				w.Header().Set("Allow", http.MethodGet)
 				writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
 				return
 			}

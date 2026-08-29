@@ -447,6 +447,45 @@ func TestReloadKeepsLastValidUsers(t *testing.T) {
 	}
 }
 
+func TestReloadTracksOnlySuccessfulUserSynchronizations(t *testing.T) {
+	first := time.Date(2026, time.August, 29, 9, 30, 0, 123, time.UTC)
+	second := first.Add(5 * time.Minute)
+	clock := first
+	reloader := &fakeReloader{results: []error{nil, errors.New("reload failed"), nil}}
+	nativeServer := New(
+		newFakeHTTPServer(),
+		WithUserReloader(reloader),
+		WithNow(func() time.Time { return clock }),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+
+	if got := nativeServer.LastSuccessfulUserSyncAt(); !got.IsZero() {
+		t.Fatalf("initial last successful sync=%s, want zero", got)
+	}
+	if err := nativeServer.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := nativeServer.LastSuccessfulUserSyncAt(); !got.Equal(first) {
+		t.Fatalf("last successful sync=%s, want %s", got, first)
+	}
+
+	clock = first.Add(time.Minute)
+	if err := nativeServer.Reload(context.Background()); !errors.Is(err, ErrUserReload) {
+		t.Fatalf("failed reload error=%v, want ErrUserReload", err)
+	}
+	if got := nativeServer.LastSuccessfulUserSyncAt(); !got.Equal(first) {
+		t.Fatalf("failed reload changed last successful sync=%s, want %s", got, first)
+	}
+
+	clock = second
+	if err := nativeServer.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := nativeServer.LastSuccessfulUserSyncAt(); !got.Equal(second) {
+		t.Fatalf("last successful sync=%s, want %s", got, second)
+	}
+}
+
 func TestReloadSerializesInitialAndSignalReconciliation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		reloader := &serializedReloader{

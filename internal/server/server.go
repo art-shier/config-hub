@@ -49,14 +49,26 @@ func (fn UserReloadFunc) Reload(ctx context.Context) error { return fn(ctx) }
 
 // State is the concurrency-safe health state shared with HTTP handlers.
 type State struct {
-	live  atomic.Bool
-	ready atomic.Bool
+	live                         atomic.Bool
+	ready                        atomic.Bool
+	lastSuccessfulUserSyncAtNano atomic.Int64
 }
 
 func NewState() *State { return new(State) }
 
 func (s *State) Live() bool  { return s != nil && s.live.Load() }
 func (s *State) Ready() bool { return s != nil && s.ready.Load() }
+
+func (s *State) LastSuccessfulUserSyncAt() time.Time {
+	if s == nil {
+		return time.Time{}
+	}
+	nanoseconds := s.lastSuccessfulUserSyncAtNano.Load()
+	if nanoseconds == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanoseconds).UTC()
+}
 
 type Option func(*Server)
 
@@ -80,6 +92,14 @@ func WithState(state *State) Option {
 	}
 }
 
+func WithNow(now func() time.Time) Option {
+	return func(server *Server) {
+		if now != nil {
+			server.now = now
+		}
+	}
+}
+
 func WithHandlerDrainer(drainer handlerDrainer) Option {
 	return func(server *Server) { server.handlerDrainer = drainer }
 }
@@ -98,6 +118,7 @@ type Server struct {
 	generation     uint64
 	terminal       bool
 	running        atomic.Bool
+	now            func() time.Time
 }
 
 func New(httpServer HTTPServer, options ...Option) *Server {
@@ -106,6 +127,7 @@ func New(httpServer HTTPServer, options ...Option) *Server {
 		logger:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		state:      NewState(),
 		reloadSlot: make(chan struct{}, 1),
+		now:        time.Now,
 	}
 	server.reloadSlot <- struct{}{}
 	for _, option := range options {
@@ -118,6 +140,12 @@ func New(httpServer HTTPServer, options ...Option) *Server {
 
 func (s *Server) Live() bool  { return s != nil && s.state.Live() }
 func (s *Server) Ready() bool { return s != nil && s.state.Ready() }
+func (s *Server) LastSuccessfulUserSyncAt() time.Time {
+	if s == nil || s.state == nil {
+		return time.Time{}
+	}
+	return s.state.LastSuccessfulUserSyncAt()
+}
 
 func (s *Server) currentGeneration() uint64 {
 	s.lifecycleMu.Lock()
@@ -207,6 +235,7 @@ func (s *Server) Reload(ctx context.Context) error {
 		}
 		return ErrUserReload
 	}
+	s.state.lastSuccessfulUserSyncAtNano.Store(s.now().UTC().UnixNano())
 	s.publishReady(generation)
 	return nil
 }

@@ -29,6 +29,7 @@ export function ConfigTable({
   const [editing, setEditing] = useState(false);
   const [search, setSearch] = useState("");
   const [savedStatus, setSavedStatus] = useState("");
+  const requiresDesktop = useMediaQuery("(max-width: 759px)");
   const generationRef = useRef(0);
   const skipOwnRefreshRef = useRef(false);
   const editButtonRef = useRef<HTMLButtonElement>(null);
@@ -100,6 +101,7 @@ export function ConfigTable({
         entry.service.toLocaleLowerCase().includes(query),
     );
   }, [revision, search]);
+  const canEdit = canWrite && !requiresDesktop;
 
   if (!environmentSlug) {
     return (
@@ -126,7 +128,7 @@ export function ConfigTable({
     );
   }
 
-  if (editing) {
+  if (editing && canEdit) {
     return (
       <ConfigEditor
         client={client}
@@ -158,7 +160,7 @@ export function ConfigTable({
           <p>Plain values are shown exactly as stored in this environment.</p>
           {savedStatus ? <p className="form-message" role="status">{savedStatus}</p> : null}
         </div>
-        {canWrite ? (
+        {canEdit ? (
           <button
             ref={editButtonRef}
             className="secondary-button"
@@ -174,10 +176,14 @@ export function ConfigTable({
         ) : null}
       </header>
 
+      {canWrite && requiresDesktop ? (
+        <p className="desktop-edit-note">A desktop viewport is required to edit configuration. Values and revision history remain available here.</p>
+      ) : null}
+
       {revision.entries.length === 0 ? (
         <div className="empty-state compact-empty">
           <h3>No configuration entries</h3>
-          <p>{canWrite ? "Edit configuration to add the first entry." : "This environment has an empty configuration."}</p>
+          <p>{canEdit ? "Edit configuration to add the first entry." : "This environment has an empty configuration."}</p>
         </div>
       ) : (
         <>
@@ -228,4 +234,23 @@ export function ConfigTable({
 
 function configPath(projectSlug: string, environmentSlug: string): string {
   return `/projects/${encodeURIComponent(projectSlug)}/environments/${encodeURIComponent(environmentSlug)}/config`;
+}
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
+    typeof window.matchMedia === "function" && window.matchMedia(query).matches,
+  );
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") {
+      return;
+    }
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+
+  return matches;
 }

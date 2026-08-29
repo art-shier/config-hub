@@ -51,6 +51,9 @@ func TestIssuedTokenIsShownOnceAndScopeIsEnforced(t *testing.T) {
 	if issued.Prefix != issued.Plaintext[:10] {
 		t.Fatalf("prefix=%q want=%q", issued.Prefix, issued.Plaintext[:10])
 	}
+	if issued.CreatedAt.IsZero() {
+		t.Fatal("issued token omitted its creation time")
+	}
 	if _, err := fixture.service.AuthenticateForEnvironment(context.Background(), issued.Plaintext, fixture.allowedEnv.ID); err != nil {
 		t.Fatal(err)
 	}

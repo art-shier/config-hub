@@ -88,6 +88,7 @@ type IssuedToken struct {
 	Prefix    string    `json:"prefix"`
 	Plaintext string    `json:"plaintext"`
 	ExpiresAt time.Time `json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type IssueToken struct {
@@ -324,6 +325,7 @@ func (s *Service) IssueToken(ctx context.Context, actor auth.User, identityID st
 			return &ValidationError{Fields: map[string]string{"identity": "must be enabled to issue a token"}}
 		}
 		now := s.now().UTC().Truncate(time.Second)
+		issued.CreatedAt = now
 		if err := validateTokenExpiry(issued.ExpiresAt, now); err != nil {
 			return err
 		}

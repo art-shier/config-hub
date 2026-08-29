@@ -15,7 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"confighub.local/internal/administration"
 	"confighub.local/internal/auth"
+	"confighub.local/internal/buildinfo"
 	"confighub.local/internal/config"
 	"confighub.local/internal/database"
 	"confighub.local/internal/httpapi"
@@ -144,6 +146,7 @@ func serve(parent context.Context, configPath string, stderr io.Writer) error {
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 	state := server.NewState()
+	administrationService := administration.NewService(store, state, buildinfo.Version)
 	router, err := httpapi.NewRouter(httpapi.Dependencies{
 		Credentials: credentials,
 		Sessions:    sessions,
@@ -151,6 +154,7 @@ func serve(parent context.Context, configPath string, stderr io.Writer) error {
 		Revisions:   revisionService,
 		Machines:    machineService,
 		System:      state,
+		Admin:       administrationService,
 	}, httpapi.Options{
 		PublicOrigin:      cfg.Server.PublicURL,
 		TrustedProxyCIDRs: cfg.Server.TrustedProxyCIDRs,
