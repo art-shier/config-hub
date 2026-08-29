@@ -101,6 +101,89 @@ func TestBuildAndCheckScriptsDeclareCompleteNativeGates(t *testing.T) {
 	}
 }
 
+func TestRuntimeIgnoresProtectSecretsDatabaseAndNestedBackupTemps(t *testing.T) {
+	repo := repositoryRoot(t)
+	for _, path := range []string{
+		"config/config.yaml",
+		"config/users.yaml",
+		"config/session.key",
+		"data/confighub.db",
+		"data/confighub.db-wal",
+		"data/confighub.db-shm",
+		"data/confighub.db-journal",
+		"archive/daily/.confighub-backup-operation.tmp",
+		"archive/daily/.confighub-backup-operation.tmp-wal",
+	} {
+		command := exec.Command("git", "check-ignore", "--no-index", "--quiet", "--", path)
+		command.Dir = repo
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Errorf("runtime artifact %q is not ignored: err=%v output=%s", path, err, output)
+		}
+	}
+	for _, path := range []string{"config/config.example.yaml", "config/users.example.yaml"} {
+		command := exec.Command("git", "check-ignore", "--no-index", "--quiet", "--", path)
+		command.Dir = repo
+		if err := command.Run(); err == nil {
+			t.Errorf("tracked example %q is hidden by ignore rules", path)
+		}
+	}
+}
+
+func TestBuildScriptAcceptsSupportedToolchainBoundariesBeforeNPMInstall(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		goVersion   string
+		nodeVersion string
+	}{
+		{name: "Go 1.25 and Node 22 lower bound", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v22.22.2"},
+		{name: "Go patch and Node 24 lower bound", goVersion: "go version go1.25.12 linux/amd64", nodeVersion: "v24.15.0"},
+		{name: "Node 26 lower bound", goVersion: "go version go1.25.1 linux/amd64", nodeVersion: "v26.0.0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, capture, err := runBuildWithFakeToolchain(t, test.goVersion, test.nodeVersion)
+			if err == nil {
+				t.Fatal("build unexpectedly continued past the intentionally failing fake npm")
+			}
+			if got := readFile(t, capture); !strings.HasPrefix(got, "npm ci --include=dev") {
+				t.Fatalf("npm install not reached after supported versions: capture=%q output=%s", got, output)
+			}
+		})
+	}
+}
+
+func TestBuildScriptRejectsUnsupportedToolchainsBeforeNPMInstall(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		goVersion   string
+		nodeVersion string
+		wantMessage string
+	}{
+		{name: "older Go", goVersion: "go version go1.24.9 linux/amd64", nodeVersion: "v24.15.0", wantMessage: "Go 1.25.x"},
+		{name: "newer Go line", goVersion: "go version go1.26.0 linux/amd64", nodeVersion: "v24.15.0", wantMessage: "Go 1.25.x"},
+		{name: "malformed Go", goVersion: "go version devel unknown linux/amd64", nodeVersion: "v24.15.0", wantMessage: "Go 1.25.x"},
+		{name: "Node 22 below patch floor", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v22.22.1", wantMessage: "^22.22.2 || ^24.15.0 || >=26.0.0"},
+		{name: "Node 23", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v23.9.0", wantMessage: "^22.22.2 || ^24.15.0 || >=26.0.0"},
+		{name: "Node 24 below minor floor", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v24.14.9", wantMessage: "^22.22.2 || ^24.15.0 || >=26.0.0"},
+		{name: "Node 25", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v25.9.0", wantMessage: "^22.22.2 || ^24.15.0 || >=26.0.0"},
+		{name: "malformed Node", goVersion: "go version go1.25.0 linux/amd64", nodeVersion: "v24.latest.0", wantMessage: "^22.22.2 || ^24.15.0 || >=26.0.0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, capture, err := runBuildWithFakeToolchain(t, test.goVersion, test.nodeVersion)
+			if err == nil {
+				t.Fatal("unsupported toolchain succeeded")
+			}
+			if !strings.Contains(output, test.wantMessage) {
+				t.Fatalf("error does not state supported range: output=%s", output)
+			}
+			if contents, readErr := os.ReadFile(capture); readErr == nil && strings.Contains(string(contents), "npm ") {
+				t.Fatalf("npm ran before toolchain rejection: %s", contents)
+			} else if readErr != nil && !os.IsNotExist(readErr) {
+				t.Fatal(readErr)
+			}
+		})
+	}
+}
+
 func scriptFixture(t *testing.T, name string) string {
 	t.Helper()
 	repo := t.TempDir()
@@ -142,4 +225,41 @@ func readFile(t *testing.T, path string) string {
 func readLines(t *testing.T, path string) []string {
 	t.Helper()
 	return strings.Split(strings.TrimSuffix(readFile(t, path), "\n"), "\n")
+}
+
+func runBuildWithFakeToolchain(t *testing.T, goVersion, nodeVersion string) (string, string, error) {
+	t.Helper()
+	repo := scriptFixture(t, "build.sh")
+	bin := filepath.Join(repo, "test-bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capture := filepath.Join(repo, "capture")
+	writeExecutable(t, filepath.Join(bin, "go"), `#!/usr/bin/env bash
+if [[ "${1-}" == "version" ]]; then
+  printf '%s\n' "$FAKE_GO_VERSION"
+  exit 0
+fi
+printf 'go %s\n' "$*" >> "$CAPTURE"
+exit 72
+`)
+	writeExecutable(t, filepath.Join(bin, "node"), `#!/usr/bin/env bash
+printf '%s\n' "$FAKE_NODE_VERSION"
+`)
+	writeExecutable(t, filepath.Join(bin, "npm"), `#!/usr/bin/env bash
+printf 'npm %s\n' "$*" >> "$CAPTURE"
+exit 73
+`)
+	writeExecutable(t, filepath.Join(bin, "git"), `#!/usr/bin/env bash
+printf '%s\n' 'test-describe'
+`)
+	command := exec.Command(filepath.Join(repo, "scripts", "build.sh"))
+	command.Env = append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"CAPTURE="+capture,
+		"FAKE_GO_VERSION="+goVersion,
+		"FAKE_NODE_VERSION="+nodeVersion,
+	)
+	output, err := command.CombinedOutput()
+	return string(output), capture, err
 }

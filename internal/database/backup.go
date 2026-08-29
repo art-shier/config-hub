@@ -60,7 +60,7 @@ func Backup(ctx context.Context, source *sql.DB, destination string) error {
 	published := false
 	defer func() {
 		if !published {
-			for _, path := range []string{temporaryPath, temporaryPath + "-wal", temporaryPath + "-shm"} {
+			for _, path := range []string{temporaryPath, temporaryPath + "-wal", temporaryPath + "-shm", temporaryPath + "-journal"} {
 				_ = os.Remove(path)
 			}
 		}

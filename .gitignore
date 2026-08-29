@@ -4,7 +4,14 @@
 /bin/
 /dist/
 /backups/
-/.confighub-backup-*.tmp*
+.confighub-backup-*.tmp*
+
+# Runtime configuration and SQLite state
+/config/config.yaml
+/config/users.yaml
+/config/session.key
+/data/confighub.db
+/data/confighub.db-*
 
 # Node and Vite
 web/node_modules/

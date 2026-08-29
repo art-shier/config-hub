@@ -156,6 +156,51 @@ func TestBackupFailureCleansOnlyItsTemporaryFile(t *testing.T) {
 	}
 }
 
+func TestBackupPublicationFailureRemovesOwnedRollbackJournalOnly(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.db")
+	store, err := Open(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	destination := filepath.Join(dir, "backup.db")
+	neighbor := filepath.Join(dir, "neighbor-journal")
+	if err := os.WriteFile(neighbor, []byte("unrelated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("injected publication failure")
+	var ownedJournal string
+	originalPublish := publishBackup
+	publishBackup = func(temp, _ string) error {
+		ownedJournal = temp + "-journal"
+		if err := os.WriteFile(ownedJournal, []byte("owned"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return sentinel
+	}
+	t.Cleanup(func() { publishBackup = originalPublish })
+
+	if err := Backup(context.Background(), store.DB(), destination); err == nil {
+		t.Fatal("Backup succeeded after injected publication failure")
+	}
+	if ownedJournal == "" {
+		t.Fatal("publication seam was not reached")
+	}
+	if _, err := os.Stat(ownedJournal); !os.IsNotExist(err) {
+		t.Fatalf("owned rollback journal remains after failure: %v", err)
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination exists after failure: %v", err)
+	}
+	if got, err := os.ReadFile(neighbor); err != nil || string(got) != "unrelated" {
+		t.Fatalf("unrelated neighbor changed: contents=%q err=%v", got, err)
+	}
+	if err := store.Ready(context.Background()); err != nil {
+		t.Fatalf("source changed or became unavailable: %v", err)
+	}
+}
+
 func TestBackupRestrictsDestinationAndDirectoryPermissions(t *testing.T) {
 	store := openTestStore(t)
 	dir := filepath.Join(t.TempDir(), "backups")
