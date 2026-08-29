@@ -24,9 +24,17 @@ export function toDraftEntry(entry: ConfigEntry): DraftEntry {
 }
 
 export function sameSnapshot(draft: DraftEntry[], entries: ConfigEntry[]): boolean {
-  return draft.length === entries.length && draft.every((entry, index) => {
-    const loaded = entries[index];
-    return loaded !== undefined && entry.key === loaded.key && entry.value === loaded.value && entry.service === loaded.service;
+  const normalizedDraft = draft
+    .map((entry) => ({ key: entry.key.trim(), value: entry.value, service: entry.service.trim() }))
+    .sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+  const orderedEntries = [...entries]
+    .sort((left, right) => left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+  return normalizedDraft.length === orderedEntries.length && normalizedDraft.every((entry, index) => {
+    const loaded = orderedEntries[index];
+    return loaded !== undefined &&
+      entry.key === loaded.key &&
+      entry.value === loaded.value &&
+      entry.service === loaded.service;
   });
 }
 
@@ -75,7 +83,7 @@ export function mapServerValidation(
 export function compareEntries(serverEntries: ConfigEntry[], localDraft: DraftEntry[]): Comparison[] {
   const server = new Map(serverEntries.map((entry) => [entry.key, entry]));
   const local = new Map(localDraft.map((entry) => [entry.key.trim(), {
-    key: entry.key.trim(), value: entry.value, service: entry.service,
+    key: entry.key.trim(), value: entry.value, service: entry.service.trim(),
   }]));
   return [...new Set([...server.keys(), ...local.keys()])].sort().flatMap((key) => {
     const serverEntry = server.get(key);

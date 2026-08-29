@@ -316,7 +316,7 @@ describe("ProjectPage", () => {
     await user.type(screen.getByLabelText("Change message"), "update URL");
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
-    expect(await screen.findByTestId("configuration-value-API_URL")).toHaveTextContent("https://next.test");
+    expect((await screen.findByTestId("configuration-value-API_URL")).textContent).toBe("https://next.test");
     expect(body).toEqual({
       base_revision: 7,
       message: "update URL",

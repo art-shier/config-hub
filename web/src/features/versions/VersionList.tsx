@@ -7,6 +7,7 @@ import type {
   RevisionChange,
   RevisionSummary,
 } from "../../api/types";
+import { ExactValue } from "../../components/ExactValue";
 import { ModalDialog } from "../../components/ModalDialog";
 
 interface RevisionListResponse {
@@ -146,7 +147,6 @@ export function VersionList({
         rollingBackRef.current = false;
         setRollingBack(false);
         onRevisionChanged(response.revision);
-        await loadRevisions();
       }
     } catch (error) {
       if (rollbackGenerationRef.current !== generation) {
@@ -367,9 +367,15 @@ function HistorySide({
   return (
     <div className="difference-side">
       <p>{label}</p>
-      <span className="configuration-value" data-testid={`diff-${side}-${entryKey}`}>
-        {present ? (value || <span className="empty-value">Empty string</span>) : <span className="absent-value">Absent</span>}
-      </span>
+      {present ? (
+        <ExactValue
+          label={`${label} value for ${entryKey}`}
+          testId={`diff-${side}-${entryKey}`}
+          value={value}
+        />
+      ) : (
+        <span className="absent-value" data-testid={`diff-${side}-${entryKey}`}>Absent</span>
+      )}
       <span className="difference-service" data-testid={`diff-${side}-service-${entryKey}`}>
         Service: {present ? (service || <span className="empty-value">Empty string</span>) : <span className="absent-value">Absent</span>}
       </span>

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useBlocker } from "react-router-dom";
 import { APIError } from "../../api/client";
 import type { APIClientContract, ConfigEntry, Revision } from "../../api/types";
+import { ExactValue } from "../../components/ExactValue";
 import { ModalDialog } from "../../components/ModalDialog";
 import {
   compareEntries,
@@ -40,21 +41,26 @@ export function ConfigEditor({
   );
   const [message, setMessage] = useState("");
   const [baseRevision, setBaseRevision] = useState(revision.version);
+  const [baselineEntries, setBaselineEntries] = useState(revision.entries);
   const [entryErrors, setEntryErrors] = useState<Record<string, EntryErrors>>({});
   const [entriesError, setEntriesError] = useState("");
   const [messageError, setMessageError] = useState("");
   const [formError, setFormError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<DraftEntry | null>(null);
   const [conflictState, setConflictState] = useState<ConflictState>("none");
   const [latestRevision, setLatestRevision] = useState<Revision | null>(null);
   const submittingRef = useRef(false);
   const operationGenerationRef = useRef(0);
   const refreshGenerationRef = useRef(0);
+  const deleteFocusFrameRef = useRef<number | null>(null);
+  const editorHeadingRef = useRef<HTMLHeadingElement>(null);
+  const addEntryRef = useRef<HTMLButtonElement>(null);
 
   const dirty = useMemo(
-    () => message !== "" || !sameSnapshot(draft, revision.entries),
-    [draft, message, revision.entries],
+    () => message !== "" || !sameSnapshot(draft, baselineEntries),
+    [baselineEntries, draft, message],
   );
   const blocker = useBlocker(dirty);
   const navigationBlocked = blocker.state === "blocked";
@@ -75,6 +81,9 @@ export function ConfigEditor({
     return () => {
       operationGenerationRef.current += 1;
       refreshGenerationRef.current += 1;
+      if (deleteFocusFrameRef.current !== null) {
+        cancelAnimationFrame(deleteFocusFrameRef.current);
+      }
     };
   }, [environmentSlug, projectSlug]);
 
@@ -103,6 +112,26 @@ export function ConfigEditor({
       return next;
     });
     setEntriesError("");
+  }
+
+  function confirmDeleteEntry() {
+    if (pendingDelete === null) {
+      return;
+    }
+    const index = draft.findIndex((entry) => entry.id === pendingDelete.id);
+    const nextEntry = index >= 0 ? draft[index + 1] : undefined;
+    deleteEntry(pendingDelete.id);
+    setPendingDelete(null);
+    if (deleteFocusFrameRef.current !== null) {
+      cancelAnimationFrame(deleteFocusFrameRef.current);
+    }
+    deleteFocusFrameRef.current = requestAnimationFrame(() => {
+      const nextControl = nextEntry === undefined
+        ? addEntryRef.current ?? editorHeadingRef.current
+        : document.getElementById(`draft-${nextEntry.id}-key`);
+      nextControl?.focus();
+      deleteFocusFrameRef.current = null;
+    });
   }
 
   function requestCancel() {
@@ -203,7 +232,7 @@ export function ConfigEditor({
       <header className="section-heading configuration-heading">
         <div>
           <p className="section-index">Draft register / Base version {baseRevision}</p>
-          <h2 id="configuration-editor-title">Edit configuration</h2>
+          <h2 ref={editorHeadingRef} id="configuration-editor-title" tabIndex={-1}>Edit configuration</h2>
           <p>Keys and services are trimmed when saved. Values remain exact.</p>
         </div>
         <button
@@ -234,11 +263,11 @@ export function ConfigEditor({
               errors={entryErrors[entry.id]}
               disabled={submitting}
               onChange={(field, value) => updateEntry(entry.id, field, value)}
-              onDelete={() => deleteEntry(entry.id)}
+              onDelete={() => setPendingDelete(entry)}
             />
           ))}
         </div>
-        <button className="secondary-button add-entry-button" type="button" disabled={submitting} onClick={addEntry}>
+        <button ref={addEntryRef} className="secondary-button add-entry-button" type="button" disabled={submitting} onClick={addEntry}>
           Add entry
         </button>
         <div className="form-field configuration-message-field">
@@ -283,6 +312,7 @@ export function ConfigEditor({
             type="button"
             onClick={() => {
               setBaseRevision(latestRevision.version);
+              setBaselineEntries(latestRevision.entries);
               setConflictState("none");
               setFormError("");
             }}
@@ -299,6 +329,34 @@ export function ConfigEditor({
           {submitting ? "Saving…" : "Save changes"}
         </button>
       </form>
+
+      {pendingDelete !== null ? (
+        <ModalDialog
+          labelledBy="delete-configuration-entry-title"
+          describedBy="delete-configuration-entry-description"
+          onRequestClose={() => setPendingDelete(null)}
+        >
+          <header className="dialog-heading">
+            <div>
+              <p className="section-index">Configuration draft</p>
+              <h2 id="delete-configuration-entry-title">
+                Remove {pendingDelete.key.trim() || "new entry"} from this draft?
+              </h2>
+            </div>
+          </header>
+          <p id="delete-configuration-entry-description">
+            This entry will be removed from this draft only. The removal is not published until you save changes.
+          </p>
+          <div className="dialog-actions">
+            <button className="secondary-button" type="button" onClick={() => setPendingDelete(null)}>
+              Cancel
+            </button>
+            <button className="primary-button" type="button" onClick={confirmDeleteEntry}>
+              Remove {pendingDelete.key.trim() || "new entry"}
+            </button>
+          </div>
+        </ModalDialog>
+      ) : null}
 
       {leaveDialogOpen ? (
         <ModalDialog
@@ -419,8 +477,18 @@ function ConflictComparison({ comparisons, revision }: { comparisons: Comparison
           {comparisons.map((comparison) => (
             <article className="difference-row" key={comparison.key}>
               <h4 className="code-label">{comparison.key}</h4>
-              <DifferenceSide label="Latest server" entry={comparison.server} testId={`conflict-server-${comparison.key}`} />
-              <DifferenceSide label="Your draft" entry={comparison.local} testId={`conflict-local-${comparison.key}`} />
+              <DifferenceSide
+                label="Latest server"
+                valueLabel={`Latest server value for ${comparison.key}`}
+                entry={comparison.server}
+                testId={`conflict-server-${comparison.key}`}
+              />
+              <DifferenceSide
+                label="Your draft"
+                valueLabel={`Your draft value for ${comparison.key}`}
+                entry={comparison.local}
+                testId={`conflict-local-${comparison.key}`}
+              />
             </article>
           ))}
         </div>
@@ -429,16 +497,26 @@ function ConflictComparison({ comparisons, revision }: { comparisons: Comparison
   );
 }
 
-function DifferenceSide({ entry, label, testId }: { entry?: ConfigEntry; label: string; testId: string }) {
+function DifferenceSide({
+  entry,
+  label,
+  testId,
+  valueLabel,
+}: {
+  entry?: ConfigEntry;
+  label: string;
+  testId: string;
+  valueLabel: string;
+}) {
   return (
     <div className="difference-side">
       <p>{label}</p>
       {entry ? (
         <>
-          <span className="configuration-value" data-testid={testId}>{entry.value || <span className="empty-value">Empty string</span>}</span>
+          <ExactValue label={valueLabel} testId={testId} value={entry.value} />
           <span className="difference-service">Service: {entry.service || <span className="empty-value">Empty string</span>}</span>
         </>
-      ) : <span className="absent-value">Absent</span>}
+      ) : <span className="absent-value" data-testid={testId}>Absent</span>}
     </div>
   );
 }

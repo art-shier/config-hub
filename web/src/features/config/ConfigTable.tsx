@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { APIClientContract, Revision } from "../../api/types";
+import { ExactValue } from "../../components/ExactValue";
 import { ConfigEditor } from "./ConfigEditor";
 
 interface CurrentRevisionResponse {
@@ -27,10 +28,15 @@ export function ConfigTable({
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [editing, setEditing] = useState(false);
   const [search, setSearch] = useState("");
+  const [savedStatus, setSavedStatus] = useState("");
   const generationRef = useRef(0);
   const skipOwnRefreshRef = useRef(false);
+  const editButtonRef = useRef<HTMLButtonElement>(null);
+  const configurationHeadingRef = useRef<HTMLHeadingElement>(null);
+  const focusTargetRef = useRef<"editor" | "edit" | "saved" | null>(null);
 
   const loadCurrent = useCallback(async () => {
+    setSavedStatus("");
     if (!environmentSlug) {
       setRevision(null);
       setLoadState("idle");
@@ -65,6 +71,23 @@ export function ConfigTable({
       generationRef.current += 1;
     };
   }, [loadCurrent, refreshEpoch]);
+
+  useEffect(() => {
+    const target = focusTargetRef.current;
+    if (target === null) {
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      const focusTarget = target === "editor"
+        ? document.getElementById("configuration-editor-title")
+        : target === "edit"
+          ? editButtonRef.current
+          : configurationHeadingRef.current;
+      focusTarget?.focus();
+      focusTargetRef.current = null;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [editing, revision]);
 
   const visibleEntries = useMemo(() => {
     const query = search.toLocaleLowerCase();
@@ -110,11 +133,16 @@ export function ConfigTable({
         projectSlug={projectSlug}
         environmentSlug={environmentSlug}
         revision={revision}
-        onCancel={() => setEditing(false)}
+        onCancel={() => {
+          focusTargetRef.current = "edit";
+          setEditing(false);
+        }}
         onSaved={(saved) => {
           skipOwnRefreshRef.current = true;
+          focusTargetRef.current = "saved";
           setRevision(saved);
           setEditing(false);
+          setSavedStatus(`Revision ${saved.version} saved.`);
           onRevisionChanged(saved);
         }}
       />
@@ -126,11 +154,21 @@ export function ConfigTable({
       <header className="section-heading configuration-heading">
         <div>
           <p className="section-index">Current register / Version {revision.version}</p>
-          <h2 id="configuration-title">Configuration</h2>
+          <h2 ref={configurationHeadingRef} id="configuration-title" tabIndex={-1}>Configuration</h2>
           <p>Plain values are shown exactly as stored in this environment.</p>
+          {savedStatus ? <p className="form-message" role="status">{savedStatus}</p> : null}
         </div>
         {canWrite ? (
-          <button className="secondary-button" type="button" onClick={() => setEditing(true)}>
+          <button
+            ref={editButtonRef}
+            className="secondary-button"
+            type="button"
+            onClick={() => {
+              focusTargetRef.current = "editor";
+              setSavedStatus("");
+              setEditing(true);
+            }}
+          >
             Edit configuration
           </button>
         ) : null}
@@ -169,10 +207,11 @@ export function ConfigTable({
                     <tr key={entry.key}>
                       <th scope="row" data-label="Key"><span className="code-label">{entry.key}</span></th>
                       <td data-label="Value">
-                        <span
-                          className="configuration-value"
-                          data-testid={`configuration-value-${entry.key}`}
-                        >{entry.value}</span>
+                        <ExactValue
+                          label={`Stored value for ${entry.key}`}
+                          testId={`configuration-value-${entry.key}`}
+                          value={entry.value}
+                        />
                       </td>
                       <td data-label="Service"><span className="code-label">{entry.service}</span></td>
                     </tr>

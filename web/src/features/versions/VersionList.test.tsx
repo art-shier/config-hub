@@ -151,14 +151,14 @@ describe("VersionList", () => {
     expect(screen.getByTestId("diff-before-service-CHANGED").textContent).toContain("api");
     expect(screen.getByTestId("diff-after-service-CHANGED").textContent).toContain("worker");
     expect(screen.getByTestId("diff-before-ADDED_EMPTY")).toHaveTextContent("Absent");
-    expect(screen.getByTestId("diff-after-ADDED_EMPTY")).toHaveTextContent("Empty string");
-    expect(screen.getByTestId("diff-before-DELETED_EMPTY")).toHaveTextContent("Empty string");
+    expect(screen.getByRole("textbox", { name: "Current version value for ADDED_EMPTY" }).textContent).toBe("");
+    expect(screen.getByRole("textbox", { name: "Selected version value for DELETED_EMPTY" }).textContent).toBe("");
     expect(screen.getByTestId("diff-after-DELETED_EMPTY")).toHaveTextContent("Absent");
     expect(api.get).toHaveBeenCalledWith("/projects/shop/environments/prod/revisions/1");
     expect(api.get).toHaveBeenCalledWith("/projects/shop/environments/prod/revisions/1/diff");
   });
 
-  it("confirms rollback creates a new version, prevents double submit, and refreshes history", async () => {
+  it("confirms rollback creates a new version, prevents double submit, and delegates refresh", async () => {
     let resolveRollback!: (value: unknown) => void;
     const api = client();
     const onRevisionChanged = vi.fn();
@@ -200,7 +200,7 @@ describe("VersionList", () => {
       },
     });
     await waitFor(() => expect(onRevisionChanged).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(api.get).toHaveBeenCalledTimes(2));
+    expect(api.get).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -243,6 +243,44 @@ describe("VersionList", () => {
     await user.click(await screen.findByRole("button", { name: "Rollback to version 1" }));
 
     expect(screen.getByRole("button", { name: "Create rollback version" })).toBeEnabled();
+  });
+
+  it("refreshes history exactly once through the shared epoch after rollback succeeds", async () => {
+    let historyRequests = 0;
+    const api = client();
+    vi.mocked(api.get).mockImplementation(() => {
+      historyRequests += 1;
+      return Promise.resolve({
+        revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" }],
+      });
+    });
+    vi.mocked(api.post).mockResolvedValue({
+      revision: { id: "r2", environment_id: "env", version: 2, message: "restore", created_by: "ada", created_at: "2026-08-29T09:00:00Z", entries: [] },
+    });
+    function Harness() {
+      const [epoch, setEpoch] = useState(0);
+      return (
+        <>
+          <output aria-label="Refresh epoch">{epoch}</output>
+          <VersionList
+            client={api}
+            projectSlug="shop"
+            environmentSlug="prod"
+            canWrite
+            refreshEpoch={epoch}
+            onRevisionChanged={() => setEpoch((current) => current + 1)}
+          />
+        </>
+      );
+    }
+    render(<Harness />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Rollback to version 1" }));
+    await user.click(screen.getByRole("button", { name: "Create rollback version" }));
+
+    await waitFor(() => expect(screen.getByLabelText("Refresh epoch")).toHaveTextContent("1"));
+    await waitFor(() => expect(historyRequests).toBe(2));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it.each([

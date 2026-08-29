@@ -1252,6 +1252,43 @@ a {
   white-space: pre-wrap;
 }
 
+.exact-value {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.exact-value-empty {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-style: italic;
+  letter-spacing: 0.035em;
+}
+
+.exact-value-control {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 7.5rem;
+  min-height: 6rem;
+  max-height: 15rem;
+  margin: 0;
+  padding: var(--space-3);
+  overflow: auto;
+  resize: vertical;
+  white-space: pre;
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--copper);
+  border-radius: 0;
+  background: var(--surface-quiet);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
 .filter-empty,
 .inline-error-state,
 .empty-version-detail {

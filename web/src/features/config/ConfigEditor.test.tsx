@@ -83,6 +83,7 @@ describe("ConfigEditor", () => {
     await user.clear(screen.getByLabelText("Value for FIRST"));
     await user.type(screen.getByLabelText("Value for FIRST"), "  exact 😀\nline  ");
     await user.click(screen.getByRole("button", { name: "Delete SECOND" }));
+    await user.click(screen.getByRole("button", { name: "Remove SECOND" }));
     await user.click(screen.getByRole("button", { name: "Add entry" }));
     await user.type(screen.getByLabelText("Key for new entry"), " NEW_KEY ");
     await user.type(screen.getByLabelText("Value for NEW_KEY"), "值 ");
@@ -102,6 +103,50 @@ describe("ConfigEditor", () => {
         ],
       },
     );
+  });
+
+  it("confirms draft-only deletion and restores or advances focus without an API request", async () => {
+    const api = client();
+    renderEditor(api, {
+      ...revision,
+      entries: [
+        { key: "FIRST", value: "one", service: "api" },
+        { key: "SECOND", value: "two", service: "worker" },
+        { key: "THIRD", value: "three", service: "worker" },
+      ],
+    });
+    const user = userEvent.setup();
+    const deleteSecond = screen.getByRole("button", { name: "Delete SECOND" });
+
+    await user.click(deleteSecond);
+    const firstDialog = screen.getByRole("dialog", { name: "Remove SECOND from this draft?" });
+    expect(screen.getByLabelText("Value for SECOND")).toHaveValue("two");
+    expect(within(firstDialog).getByText(/removed from this draft only/iu)).toBeInTheDocument();
+    expect(within(firstDialog).getByText(/not published until you save changes/iu)).toBeInTheDocument();
+    await user.click(within(firstDialog).getByRole("button", { name: "Cancel" }));
+    expect(deleteSecond).toHaveFocus();
+    expect(screen.getByLabelText("Value for SECOND")).toBeInTheDocument();
+
+    await user.click(deleteSecond);
+    await user.keyboard("{Escape}");
+    expect(deleteSecond).toHaveFocus();
+    expect(screen.getByLabelText("Value for SECOND")).toBeInTheDocument();
+
+    await user.click(deleteSecond);
+    await user.click(screen.getByRole("button", { name: "Remove SECOND" }));
+    expect(screen.queryByLabelText("Value for SECOND")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText("Key for THIRD")).toHaveFocus());
+    expect(api.put).not.toHaveBeenCalled();
+  });
+
+  it("moves focus to Add entry after confirming deletion of the final row", async () => {
+    renderEditor();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Delete EMPTY" }));
+    await user.click(screen.getByRole("button", { name: "Remove EMPTY" }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add entry" })).toHaveFocus());
   });
 
   it("associates invalid and trimmed duplicate key errors with their rows", async () => {
@@ -254,13 +299,67 @@ describe("ConfigEditor", () => {
     expect(await screen.findByRole("heading", { name: "Latest server compared with your draft" })).toBeInTheDocument();
     expect(screen.getByTestId("conflict-server-EMPTY").textContent).toBe("server latest");
     expect(screen.getByTestId("conflict-local-EMPTY").textContent).toBe("local draft  ");
+    expect(screen.getByRole("textbox", { name: "Latest server value for SERVER_ONLY" }).textContent).toBe("");
     expect(screen.getByText("Absent", { selector: "span" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Use version 8 as new base" }));
     expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    const dirtyEvent = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(dirtyEvent);
+    expect(dirtyEvent.defaultPrevented).toBe(true);
+    await user.click(screen.getByRole("link", { name: "Project register" }));
+    expect(screen.getByRole("dialog", { name: "Leave without saving?" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Stay" }));
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() => expect(api.put).toHaveBeenCalledTimes(2));
     expect(vi.mocked(api.put).mock.calls[1]?.[1]).toMatchObject({ base_revision: 8 });
+  });
+
+  it("becomes clean when a reordered adopted server snapshot equals the normalized draft", async () => {
+    const exactValue = " exact line  \n完整 😀 ";
+    const api = client();
+    vi.mocked(api.put).mockRejectedValue(
+      new APIError(409, "revision_conflict", "SECRET", "req", {}),
+    );
+    vi.mocked(api.get).mockResolvedValue({
+      revision: {
+        ...revision,
+        id: "revision-8",
+        version: 8,
+        entries: [
+          { key: "MIDDLE", value: "unchanged", service: "api" },
+          { key: "Z_RENAMED", value: exactValue, service: "worker" },
+        ],
+      },
+    });
+    renderEditor(api, {
+      ...revision,
+      entries: [
+        { key: "ORIGINAL", value: "old", service: "api" },
+        { key: "MIDDLE", value: "unchanged", service: "api" },
+      ],
+    });
+    const user = userEvent.setup();
+    await user.clear(screen.getByLabelText("Key for ORIGINAL"));
+    await user.type(screen.getByLabelText("Key for new entry"), " Z_RENAMED ");
+    await user.clear(screen.getByLabelText("Value for Z_RENAMED"));
+    await user.type(screen.getByLabelText("Value for Z_RENAMED"), exactValue);
+    await user.clear(screen.getByLabelText("Service for Z_RENAMED"));
+    await user.type(screen.getByLabelText("Service for Z_RENAMED"), " worker ");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await user.click(await screen.findByRole("button", { name: "Refresh and compare" }));
+
+    expect(await screen.findByText("The snapshots contain the same entries.")).toBeInTheDocument();
+    expect(screen.getByLabelText("Value for Z_RENAMED")).toHaveValue(exactValue);
+    await user.click(screen.getByRole("button", { name: "Use version 8 as new base" }));
+
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    const cleanEvent = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(cleanEvent);
+    expect(cleanEvent.defaultPrevented).toBe(false);
+    await user.click(screen.getByRole("link", { name: "Project register" }));
+    expect(await screen.findByRole("heading", { name: "Projects destination" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Leave without saving?" })).not.toBeInTheDocument();
   });
 
   it("prevents double submit and keeps pending saves non-cancelable", async () => {
