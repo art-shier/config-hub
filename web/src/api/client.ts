@@ -43,6 +43,10 @@ export class APIClient implements APIClientContract {
     return this.request<T>("PUT", path, body, "content");
   }
 
+  putNoContent(path: string, body: unknown): Promise<void> {
+    return this.request("PUT", path, body, "no-content");
+  }
+
   delete(path: string): Promise<void> {
     return this.request("DELETE", path, undefined, "no-content");
   }

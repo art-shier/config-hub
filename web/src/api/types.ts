@@ -18,6 +18,41 @@ export interface LoginCredentials {
   password: string;
 }
 
+export interface Project {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type ProjectPermission = "admin" | "viewer" | "editor";
+
+export interface Environment {
+  id: string;
+  project_id: string;
+  slug: string;
+  name: string;
+  current_revision_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectDetail extends Project {
+  permission: ProjectPermission;
+  environments: Environment[];
+}
+
+export type MemberPermission = "viewer" | "editor";
+
+export interface MemberGrant {
+  user_id: string;
+  username: string;
+  display_name: string;
+  permission: MemberPermission;
+}
+
 export interface APIErrorBody {
   code: string;
   message: string;

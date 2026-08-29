@@ -97,6 +97,91 @@ describe("APIClient", () => {
     ).resolves.toEqual({ projects: [{ slug: "shop" }] });
   });
 
+  it("sends JSON and CSRF for a no-content PUT", async () => {
+    let requestDetails:
+      | {
+          body: unknown;
+          contentType: string | null;
+          csrf: string | null;
+          credentials: RequestCredentials;
+        }
+      | undefined;
+    server.use(
+      http.put(
+        "/api/v1/projects/shop/members/alex.smith",
+        async ({ request }) => {
+          requestDetails = {
+            body: await request.json(),
+            contentType: request.headers.get("Content-Type"),
+            csrf: request.headers.get("X-CSRF-Token"),
+            credentials: request.credentials,
+          };
+          return new HttpResponse(null, { status: 204 });
+        },
+      ),
+    );
+
+    const client = new APIClient(() => "csrf-token");
+
+    await expect(
+      client.putNoContent("/projects/shop/members/alex.smith", {
+        permission: "editor",
+      }),
+    ).resolves.toBeUndefined();
+    expect(requestDetails).toEqual({
+      body: { permission: "editor" },
+      contentType: "application/json",
+      csrf: "csrf-token",
+      credentials: "same-origin",
+    });
+  });
+
+  it.each([204, 205])(
+    "accepts explicit %i for a no-content PUT",
+    async (status) => {
+      server.use(
+        http.put(
+          "/api/v1/projects/shop/members/alex.smith",
+          () => new HttpResponse(null, { status }),
+        ),
+      );
+      const client = new APIClient(() => "csrf-token");
+
+      await expect(
+        client.putNoContent("/projects/shop/members/alex.smith", {
+          permission: "viewer",
+        }),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  it.each([
+    [200, null],
+    [201, null],
+    [200, { member: true }],
+  ] as const)(
+    "rejects status %i with body %j for a no-content PUT",
+    async (status, responseBody) => {
+      server.use(
+        http.put("/api/v1/projects/shop/members/alex.smith", () =>
+          responseBody === null
+            ? new HttpResponse(null, { status })
+            : HttpResponse.json(responseBody, { status }),
+        ),
+      );
+      const client = new APIClient(() => "csrf-token");
+
+      await expect(
+        client.putNoContent("/projects/shop/members/alex.smith", {
+          permission: "viewer",
+        }),
+      ).rejects.toMatchObject({
+        status,
+        code: "unexpected_response",
+      });
+    },
+  );
+
   it.each([204, 205])(
     "accepts explicit %i responses for no-content methods",
     async (status) => {

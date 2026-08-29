@@ -8,6 +8,8 @@ import {
 } from "react-router-dom";
 import { AuthProvider, useAuth } from "../auth/AuthProvider";
 import { LoginPage } from "../pages/LoginPage";
+import { ProjectPage } from "../pages/ProjectPage";
+import { ProjectsPage } from "../pages/ProjectsPage";
 import { AppShell } from "./AppShell";
 
 export function App() {
@@ -19,16 +21,8 @@ export function App() {
           <Route element={<RequireSession />}>
             <Route element={<AppShell />}>
               <Route index element={<Navigate to="/projects" replace />} />
-              <Route
-                path="/projects"
-                element={
-                  <PlaceholderPage
-                    eyebrow="Configuration inventory"
-                    title="Projects"
-                    description="Project and environment controls will appear here."
-                  />
-                }
-              />
+              <Route path="/projects" element={<ProjectsPage />} />
+              <Route path="/projects/:project" element={<ProjectPage />} />
               <Route element={<RequireAdmin />}>
                 <Route
                   path="/machine-access"
