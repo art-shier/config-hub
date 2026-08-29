@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -393,6 +394,138 @@ func TestBackupDirectoryStatRequiresCurrentOwnerPrivateModeAndDirectory(t *testi
 				t.Fatalf("isSafeBackupDirectoryStat()=%v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestWalkDirectoryPathSyncsEachParentImmediatelyAfterCreatingChild(t *testing.T) {
+	base := createSafeBackupDirectory(t)
+	destinationDirectory := filepath.Join(base, "first", "second", "third")
+	var events []string
+	ops := directoryWalkOps{
+		mkdirat: func(parentFD int, name string, mode uint32) error {
+			parent := directoryFDPath(t, parentFD)
+			events = append(events, "mkdir "+filepath.Join(parent, name))
+			return unix.Mkdirat(parentFD, name, mode)
+		},
+		fsync: func(fd int) error {
+			events = append(events, "fsync "+directoryFDPath(t, fd))
+			return unix.Fsync(fd)
+		},
+	}
+
+	fd, _, err := walkDirectoryPathWithOps(destinationDirectory, true, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	want := []string{
+		"mkdir " + filepath.Join(base, "first"),
+		"fsync " + base,
+		"mkdir " + filepath.Join(base, "first", "second"),
+		"fsync " + filepath.Join(base, "first"),
+		"mkdir " + destinationDirectory,
+		"fsync " + filepath.Join(base, "first", "second"),
+	}
+	if strings.Join(events, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("directory durability events:\n%s\nwant:\n%s", strings.Join(events, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestWalkDirectoryPathSyncsParentAfterMkdirCreationRace(t *testing.T) {
+	base := createSafeBackupDirectory(t)
+	destinationDirectory := filepath.Join(base, "raced")
+	var events []string
+	ops := directoryWalkOps{
+		mkdirat: func(parentFD int, name string, mode uint32) error {
+			if err := unix.Mkdirat(parentFD, name, mode); err != nil {
+				return err
+			}
+			events = append(events, "mkdir raced")
+			return unix.EEXIST
+		},
+		fsync: func(fd int) error {
+			events = append(events, "fsync "+directoryFDPath(t, fd))
+			return unix.Fsync(fd)
+		},
+	}
+
+	fd, _, err := walkDirectoryPathWithOps(destinationDirectory, true, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	want := []string{"mkdir raced", "fsync " + base}
+	if strings.Join(events, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("creation-race durability events=%q, want %q", events, want)
+	}
+}
+
+func TestBackupParentSyncFailureAbortsWithoutPublicationOrRecursiveCleanup(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source.db")
+	store, err := Open(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.DB().Exec(`INSERT INTO machine_identities
+		(id, name, enabled, created_at, updated_at)
+		VALUES ('parent-sync', 'unchanged source', 1, 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	sourceBefore, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	neighbor := filepath.Join(root, "existing-backup.db")
+	neighborContents := []byte("existing replacement")
+	if err := os.WriteFile(neighbor, neighborContents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(root, "new-first")
+	second := filepath.Join(first, "new-second")
+	destination := filepath.Join(second, "backup.db")
+	sentinel := errors.New("injected parent fsync failure")
+	fsyncCalls := 0
+
+	err = backupWithHooks(context.Background(), store.DB(), destination, backupHooks{
+		directoryOps: directoryWalkOps{
+			fsync: func(fd int) error {
+				fsyncCalls++
+				if fsyncCalls == 2 {
+					return sentinel
+				}
+				return unix.Fsync(fd)
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("Backup succeeded after parent fsync failure")
+	}
+	if fsyncCalls != 2 {
+		t.Fatalf("parent fsync calls=%d, want 2", fsyncCalls)
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination exists after parent fsync failure: %v", err)
+	}
+	if got, err := os.ReadFile(neighbor); err != nil || string(got) != string(neighborContents) {
+		t.Fatalf("existing replacement changed: contents=%q err=%v", got, err)
+	}
+	sourceAfter, err := os.ReadFile(sourcePath)
+	if err != nil || string(sourceAfter) != string(sourceBefore) {
+		t.Fatalf("source changed: err=%v", err)
+	}
+	if err := store.Ready(context.Background()); err != nil {
+		t.Fatalf("source became unavailable: %v", err)
+	}
+	// Creation was successful even though its parent sync failed. The private
+	// empty hierarchy is intentionally retained instead of recursively removed.
+	for _, directory := range []string{first, second} {
+		info, err := os.Stat(directory)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("created directory was removed: path=%q info=%v err=%v", directory, info, err)
+		}
+		assertNoBackupTemps(t, directory)
 	}
 }
 
@@ -914,4 +1047,13 @@ func assertNoBackupTemps(t *testing.T, dir string) {
 			t.Errorf("temporary backup left behind: %s", entry.Name())
 		}
 	}
+}
+
+func directoryFDPath(t *testing.T, fd int) string {
+	t.Helper()
+	path, err := os.Readlink(filepath.Join("/proc/self/fd", strconv.Itoa(fd)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

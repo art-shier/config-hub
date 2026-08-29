@@ -18,8 +18,27 @@ type backupDirectory struct {
 	stat unix.Stat_t
 }
 
+type directoryWalkOps struct {
+	mkdirat func(int, string, uint32) error
+	fsync   func(int) error
+}
+
+func (ops directoryWalkOps) withDefaults() directoryWalkOps {
+	if ops.mkdirat == nil {
+		ops.mkdirat = unix.Mkdirat
+	}
+	if ops.fsync == nil {
+		ops.fsync = unix.Fsync
+	}
+	return ops
+}
+
 func openBackupDirectory(path string, create bool) (*backupDirectory, error) {
-	fd, stat, err := walkDirectoryPath(path, create)
+	return openBackupDirectoryWithOps(path, create, directoryWalkOps{})
+}
+
+func openBackupDirectoryWithOps(path string, create bool, ops directoryWalkOps) (*backupDirectory, error) {
+	fd, stat, err := walkDirectoryPathWithOps(path, create, ops)
 	if err != nil {
 		return nil, errors.New("open backup directory")
 	}
@@ -31,7 +50,12 @@ func openBackupDirectory(path string, create bool) (*backupDirectory, error) {
 }
 
 func walkDirectoryPath(path string, create bool) (int, unix.Stat_t, error) {
+	return walkDirectoryPathWithOps(path, create, directoryWalkOps{})
+}
+
+func walkDirectoryPathWithOps(path string, create bool, ops directoryWalkOps) (int, unix.Stat_t, error) {
 	var zero unix.Stat_t
+	ops = ops.withDefaults()
 	cleanPath := filepath.Clean(path)
 	if !filepath.IsAbs(cleanPath) {
 		return -1, zero, unix.EINVAL
@@ -47,10 +71,14 @@ func walkDirectoryPath(path string, create bool) (int, unix.Stat_t, error) {
 		}
 		nextFD, openErr := unix.Openat(currentFD, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if errors.Is(openErr, unix.ENOENT) && create {
-			mkdirErr := unix.Mkdirat(currentFD, component, 0o700)
+			mkdirErr := ops.mkdirat(currentFD, component, 0o700)
 			if mkdirErr != nil && !errors.Is(mkdirErr, unix.EEXIST) {
 				_ = unix.Close(currentFD)
 				return -1, zero, mkdirErr
+			}
+			if err := ops.fsync(currentFD); err != nil {
+				_ = unix.Close(currentFD)
+				return -1, zero, err
 			}
 			nextFD, openErr = unix.Openat(currentFD, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		}

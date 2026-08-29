@@ -37,6 +37,7 @@ type sqliteCodedError interface {
 type backupHooks struct {
 	beforePublish func(string) error
 	afterPublish  func() error
+	directoryOps  directoryWalkOps
 }
 
 // Backup creates a consistent SQLite backup and atomically publishes it at
@@ -64,7 +65,7 @@ func backupWithHooks(ctx context.Context, source *sql.DB, destination string, ho
 	if !isBackupBasename(finalName) {
 		return errors.New("invalid backup destination")
 	}
-	directory, err := openBackupDirectory(filepath.Dir(finalPath), true)
+	directory, err := openBackupDirectoryWithOps(filepath.Dir(finalPath), true, hooks.directoryOps)
 	if err != nil {
 		return err
 	}
