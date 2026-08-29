@@ -9,6 +9,7 @@ import { Link } from "react-router-dom";
 import { APIError } from "../api/client";
 import type { Project } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
+import { ModalDialog } from "../components/ModalDialog";
 
 interface ProjectListResponse {
   projects: Project[];
@@ -25,36 +26,42 @@ export function ProjectsPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const [loadAnnouncement, setLoadAnnouncement] = useState("Loading projects…");
   const [creating, setCreating] = useState(false);
   const newProjectButtonRef = useRef<HTMLButtonElement>(null);
+  const loadGenerationRef = useRef(0);
 
-  useEffect(() => {
-    let current = true;
+  const loadProjects = useCallback(async () => {
+    const generation = ++loadGenerationRef.current;
     setLoading(true);
     setLoadError("");
-    void client
-      .get<ProjectListResponse>("/projects")
-      .then((response) => {
-        if (current) {
-          setProjects(response.projects);
-        }
-      })
-      .catch(() => {
-        if (current) {
-          setLoadError(
-            "Projects couldn’t be loaded. Check the server and try again.",
-          );
-        }
-      })
-      .finally(() => {
-        if (current) {
-          setLoading(false);
-        }
-      });
-    return () => {
-      current = false;
-    };
+    setLoadAnnouncement("Loading projects…");
+    try {
+      const response = await client.get<ProjectListResponse>("/projects");
+      if (loadGenerationRef.current === generation) {
+        setProjects(response.projects);
+        setLoadAnnouncement("Projects loaded.");
+      }
+    } catch {
+      if (loadGenerationRef.current === generation) {
+        setLoadError(
+          "Projects couldn’t be loaded. Check the server and try again.",
+        );
+        setLoadAnnouncement("Projects unavailable.");
+      }
+    } finally {
+      if (loadGenerationRef.current === generation) {
+        setLoading(false);
+      }
+    }
   }, [client]);
+
+  useEffect(() => {
+    void loadProjects();
+    return () => {
+      loadGenerationRef.current += 1;
+    };
+  }, [loadProjects]);
 
   const closeCreation = useCallback(() => {
     setCreating(false);
@@ -93,9 +100,13 @@ export function ProjectsPage() {
 
       {loading ? (
         <p className="loading-line" role="status">
-          Loading projects…
+          {loadAnnouncement}
         </p>
-      ) : null}
+      ) : (
+        <div className="sr-status" aria-live="polite" aria-atomic="true">
+          {loadAnnouncement}
+        </div>
+      )}
       {loadError ? (
         <div
           className="empty-state"
@@ -104,6 +115,13 @@ export function ProjectsPage() {
         >
           <h2>Projects unavailable</h2>
           <p>{loadError}</p>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => void loadProjects()}
+          >
+            Retry
+          </button>
         </div>
       ) : null}
       {!loading && !loadError && projects.length === 0 ? (
@@ -173,23 +191,14 @@ function CreateProjectDialog({
   const [formError, setFormError] = useState("");
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const slugRef = useRef<HTMLInputElement>(null);
-  const mountedRef = useRef(true);
+  const operationGenerationRef = useRef(0);
   const submittingRef = useRef(false);
 
   useEffect(() => {
-    slugRef.current?.focus();
-    function closeOnEscape(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onCancel();
-      }
-    }
-    document.addEventListener("keydown", closeOnEscape);
     return () => {
-      mountedRef.current = false;
-      document.removeEventListener("keydown", closeOnEscape);
+      operationGenerationRef.current += 1;
     };
-  }, [onCancel]);
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -197,6 +206,7 @@ function CreateProjectDialog({
       return;
     }
     submittingRef.current = true;
+    const operationGeneration = ++operationGenerationRef.current;
     setSubmitting(true);
     setFormError("");
     setFieldErrors({});
@@ -206,11 +216,11 @@ function CreateProjectDialog({
         name,
         description,
       });
-      if (mountedRef.current) {
+      if (operationGenerationRef.current === operationGeneration) {
         onCreated(response.project);
       }
     } catch (error) {
-      if (!mountedRef.current) {
+      if (operationGenerationRef.current !== operationGeneration) {
         return;
       }
       if (error instanceof APIError && error.status === 422) {
@@ -227,7 +237,7 @@ function CreateProjectDialog({
         );
       }
     } finally {
-      if (mountedRef.current) {
+      if (operationGenerationRef.current === operationGeneration) {
         submittingRef.current = false;
         setSubmitting(false);
       }
@@ -235,82 +245,81 @@ function CreateProjectDialog({
   }
 
   return (
-    <div className="dialog-backdrop">
-      <section
-        className="dialog-panel"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="new-project-title"
-      >
-        <header className="dialog-heading">
-          <div>
-            <p className="section-index">Project register / New</p>
-            <h2 id="new-project-title">New project</h2>
-          </div>
-          <button className="text-button" type="button" onClick={onCancel}>
-            Cancel
-          </button>
-        </header>
-        <form className="resource-form" onSubmit={(event) => void handleSubmit(event)}>
-          <Field
+    <ModalDialog
+      labelledBy="new-project-title"
+      initialFocusRef={slugRef}
+      closeDisabled={submitting}
+      onRequestClose={onCancel}
+    >
+      <header className="dialog-heading">
+        <div>
+          <p className="section-index">Project register / New</p>
+          <h2 id="new-project-title">New project</h2>
+        </div>
+        <button
+          className="text-button"
+          type="button"
+          disabled={submitting}
+          onClick={onCancel}
+        >
+          Cancel
+        </button>
+      </header>
+      <form className="resource-form" onSubmit={(event) => void handleSubmit(event)}>
+        <Field id="project-slug" label="Project slug" error={fieldErrors.slug}>
+          <input
+            ref={slugRef}
             id="project-slug"
-            label="Project slug"
-            error={fieldErrors.slug}
-          >
-            <input
-              ref={slugRef}
-              id="project-slug"
-              name="slug"
-              autoCapitalize="none"
-              autoComplete="off"
-              spellCheck={false}
-              required
-              disabled={submitting}
-              value={slug}
-              aria-invalid={fieldErrors.slug ? "true" : undefined}
-              aria-describedby={fieldErrors.slug ? "project-slug-error" : undefined}
-              onChange={(event) => setSlug(event.currentTarget.value)}
-            />
-          </Field>
-          <Field id="project-name" label="Project name" error={fieldErrors.name}>
-            <input
-              id="project-name"
-              name="name"
-              required
-              disabled={submitting}
-              value={name}
-              aria-invalid={fieldErrors.name ? "true" : undefined}
-              aria-describedby={fieldErrors.name ? "project-name-error" : undefined}
-              onChange={(event) => setName(event.currentTarget.value)}
-            />
-          </Field>
-          <Field
+            name="slug"
+            autoCapitalize="none"
+            autoComplete="off"
+            spellCheck={false}
+            required
+            disabled={submitting}
+            value={slug}
+            aria-invalid={fieldErrors.slug ? "true" : undefined}
+            aria-describedby={fieldErrors.slug ? "project-slug-error" : undefined}
+            onChange={(event) => setSlug(event.currentTarget.value)}
+          />
+        </Field>
+        <Field id="project-name" label="Project name" error={fieldErrors.name}>
+          <input
+            id="project-name"
+            name="name"
+            required
+            disabled={submitting}
+            value={name}
+            aria-invalid={fieldErrors.name ? "true" : undefined}
+            aria-describedby={fieldErrors.name ? "project-name-error" : undefined}
+            onChange={(event) => setName(event.currentTarget.value)}
+          />
+        </Field>
+        <Field
+          id="project-description"
+          label="Description"
+          error={fieldErrors.description}
+        >
+          <textarea
             id="project-description"
-            label="Description"
-            error={fieldErrors.description}
-          >
-            <textarea
-              id="project-description"
-              name="description"
-              rows={4}
-              disabled={submitting}
-              value={description}
-              aria-invalid={fieldErrors.description ? "true" : undefined}
-              aria-describedby={
-                fieldErrors.description ? "project-description-error" : undefined
-              }
-              onChange={(event) => setDescription(event.currentTarget.value)}
-            />
-          </Field>
-          <div className="form-message" aria-live="polite" aria-atomic="true">
-            {formError ? <p role="alert">{formError}</p> : null}
-          </div>
-          <button className="primary-button" type="submit" disabled={submitting}>
-            {submitting ? "Creating project…" : "Create project"}
-          </button>
-        </form>
-      </section>
-    </div>
+            name="description"
+            rows={4}
+            disabled={submitting}
+            value={description}
+            aria-invalid={fieldErrors.description ? "true" : undefined}
+            aria-describedby={
+              fieldErrors.description ? "project-description-error" : undefined
+            }
+            onChange={(event) => setDescription(event.currentTarget.value)}
+          />
+        </Field>
+        <div className="form-message" aria-live="polite" aria-atomic="true">
+          {formError ? <p role="alert">{formError}</p> : null}
+        </div>
+        <button className="primary-button" type="submit" disabled={submitting}>
+          {submitting ? "Creating project…" : "Create project"}
+        </button>
+      </form>
+    </ModalDialog>
   );
 }
 

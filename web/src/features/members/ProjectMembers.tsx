@@ -7,10 +7,19 @@ import {
 import { APIError } from "../../api/client";
 import type { MemberGrant, MemberPermission } from "../../api/types";
 import { useAuth } from "../../auth/AuthProvider";
+import { ModalDialog } from "../../components/ModalDialog";
 
 interface MemberListResponse {
   members: MemberGrant[];
 }
+
+type RowOperationKind = "adding" | "saving" | "removing";
+type RowOperation = { kind: RowOperationKind; token: number };
+type MemberRefreshResult =
+  | { kind: "applied"; members: MemberGrant[] }
+  | { kind: "failed" }
+  | { kind: "superseded"; members: MemberGrant[] }
+  | { kind: "stale" };
 
 const usernamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 
@@ -35,50 +44,147 @@ export function ProjectMembers({
   const [permissionDrafts, setPermissionDrafts] = useState<
     Record<string, MemberPermission>
   >({});
-  const [savingUsername, setSavingUsername] = useState("");
-  const savingUsernamesRef = useRef(new Set<string>());
+  const [rowOperations, setRowOperations] = useState<
+    Record<string, RowOperation>
+  >({});
+  const rowOperationsRef = useRef(new Map<string, RowOperation>());
+  const operationTokenRef = useRef(0);
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
   const [confirmation, setConfirmation] = useState<MemberGrant | null>(null);
-  const [removing, setRemoving] = useState(false);
-  const removingRef = useRef(false);
   const [removeError, setRemoveError] = useState("");
   const [status, setStatus] = useState("");
-  const mountedRef = useRef(true);
+  const statusRef = useRef<HTMLDivElement>(null);
+  const projectGenerationRef = useRef(0);
+  const memberListRequestRef = useRef(0);
 
   useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    let current = true;
+    const projectGeneration = ++projectGenerationRef.current;
+    rowOperationsRef.current.clear();
+    setRowOperations({});
+    addSubmittingRef.current = false;
+    setAddSubmitting(false);
+    setMembers([]);
+    setPermissionDrafts({});
+    setRowErrors({});
+    setConfirmation(null);
+    setRemoveError("");
+    setStatus("Loading project members…");
     setLoading(true);
     setLoadError("");
-    void client
-      .get<MemberListResponse>(memberCollectionPath(projectSlug))
-      .then((response) => {
-        if (current) {
-          applyMemberList(response.members, setMembers, setPermissionDrafts);
-        }
-      })
-      .catch(() => {
-        if (current) {
+    void refreshMembers(projectSlug, projectGeneration).then((result) => {
+      if (projectGenerationRef.current === projectGeneration) {
+        if (result.kind === "failed") {
           setLoadError(
             "Project members couldn’t be loaded. Check the server and try again.",
           );
+          setStatus("Project members unavailable.");
+        } else if (result.kind === "applied") {
+          setStatus("Project members loaded.");
         }
-      })
-      .finally(() => {
-        if (current) {
-          setLoading(false);
-        }
-      });
+        setLoading(false);
+      }
+    });
     return () => {
-      current = false;
+      if (projectGenerationRef.current === projectGeneration) {
+        projectGenerationRef.current += 1;
+      }
+      memberListRequestRef.current += 1;
     };
   }, [client, projectSlug]);
+
+  async function refreshMembers(
+    requestedProjectSlug: string,
+    projectGeneration: number,
+  ): Promise<MemberRefreshResult> {
+    const request = ++memberListRequestRef.current;
+    try {
+      const response = await client.get<MemberListResponse>(
+        memberCollectionPath(requestedProjectSlug),
+      );
+      if (projectGenerationRef.current !== projectGeneration) {
+        return { kind: "stale" };
+      }
+      if (memberListRequestRef.current !== request) {
+        return { kind: "superseded", members: response.members };
+      }
+      applyMemberList(
+        response.members,
+        setMembers,
+        setPermissionDrafts,
+        new Set(rowOperationsRef.current.keys()),
+      );
+      setLoadError("");
+      return { kind: "applied", members: response.members };
+    } catch {
+      return projectGenerationRef.current === projectGeneration &&
+        memberListRequestRef.current === request
+        ? { kind: "failed" }
+        : { kind: "stale" };
+    }
+  }
+
+  async function retryMemberLoad() {
+    const projectGeneration = projectGenerationRef.current;
+    setLoading(true);
+    setLoadError("");
+    setStatus("Loading project members…");
+    const result = await refreshMembers(projectSlug, projectGeneration);
+    if (projectGenerationRef.current !== projectGeneration) {
+      return;
+    }
+    if (result.kind === "applied") {
+      setStatus("Project members loaded.");
+    } else if (result.kind === "failed") {
+      setLoadError(
+        "Project members couldn’t be loaded. Check the server and try again.",
+      );
+      setStatus("Project members unavailable.");
+    }
+    setLoading(false);
+  }
+
+  function startRowOperation(
+    operationUsername: string,
+    kind: RowOperationKind,
+  ): RowOperation | null {
+    if (rowOperationsRef.current.has(operationUsername)) {
+      return null;
+    }
+    const operation = { kind, token: ++operationTokenRef.current };
+    rowOperationsRef.current.set(operationUsername, operation);
+    setRowOperations((current) => ({
+      ...current,
+      [operationUsername]: operation,
+    }));
+    return operation;
+  }
+
+  function isCurrentRowOperation(
+    operationUsername: string,
+    operation: RowOperation,
+    projectGeneration: number,
+  ): boolean {
+    return (
+      projectGenerationRef.current === projectGeneration &&
+      rowOperationsRef.current.get(operationUsername)?.token === operation.token
+    );
+  }
+
+  function finishRowOperation(
+    operationUsername: string,
+    operation: RowOperation,
+    projectGeneration: number,
+  ) {
+    if (!isCurrentRowOperation(operationUsername, operation, projectGeneration)) {
+      return;
+    }
+    rowOperationsRef.current.delete(operationUsername);
+    setRowOperations((current) => {
+      const next = { ...current };
+      delete next[operationUsername];
+      return next;
+    });
+  }
 
   async function handleAdd(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -96,121 +202,188 @@ export function ProjectMembers({
       return;
     }
 
+    const operation = startRowOperation(username, "adding");
+    if (operation === null) {
+      setAddError("An access change for this username is already in progress.");
+      return;
+    }
+    const operationUsername = username;
+    const permission = newPermission;
+    const requestedProjectSlug = projectSlug;
+    const projectGeneration = projectGenerationRef.current;
     addSubmittingRef.current = true;
     setAddSubmitting(true);
+    let mutationError: unknown = null;
+    let mutationSucceeded = false;
     try {
-      await client.putNoContent(memberPath(projectSlug, username), {
-        permission: newPermission,
+      await client.putNoContent(memberPath(requestedProjectSlug, operationUsername), {
+        permission,
       });
-      if (!mountedRef.current) {
-        return;
-      }
+      mutationSucceeded = true;
+    } catch (error) {
+      mutationError = error;
+    }
+
+    if (
+      !isCurrentRowOperation(
+        operationUsername,
+        operation,
+        projectGeneration,
+      )
+    ) {
+      return;
+    }
+    const refresh = await refreshMembers(requestedProjectSlug, projectGeneration);
+    if (
+      !isCurrentRowOperation(
+        operationUsername,
+        operation,
+        projectGeneration,
+      )
+    ) {
+      return;
+    }
+
+    const confirmed =
+      (refresh.kind === "applied" || refresh.kind === "superseded") &&
+      refresh.members.some(
+        (member) =>
+          member.username === operationUsername && member.permission === permission,
+      );
+    if (confirmed) {
       setUsername("");
       setNewPermission("viewer");
-      try {
-        const response = await client.get<MemberListResponse>(
-          memberCollectionPath(projectSlug),
-        );
-        if (mountedRef.current) {
-          applyMemberList(response.members, setMembers, setPermissionDrafts);
-          setStatus("Member access saved.");
-        }
-      } catch {
-        if (mountedRef.current) {
-          setAddError(
-            "Access was saved, but the member list couldn’t be refreshed. Reload this page to confirm the current grants.",
-          );
-        }
-      }
-    } catch (error) {
-      if (!mountedRef.current) {
-        return;
-      }
-      if (error instanceof APIError && error.status === 422) {
-        setAddFields(error.fields);
-        setAddError("Check the marked member fields and try again.");
-      } else {
-        setAddError(memberMutationError(error, "add"));
-      }
-    } finally {
-      if (mountedRef.current) {
-        addSubmittingRef.current = false;
-        setAddSubmitting(false);
-      }
+      setStatus("Member access saved.");
+    } else if (mutationError instanceof APIError && mutationError.status === 422) {
+      setAddFields(mutationError.fields);
+      setAddError("Check the marked member fields and try again.");
+    } else if (mutationError !== null) {
+      setAddError(memberMutationError(mutationError, "add"));
+    } else if (refresh.kind === "failed") {
+      setAddError(
+        "Access was saved, but the member list couldn’t be refreshed. Retry the register to confirm the current grants.",
+      );
+    } else if (mutationSucceeded) {
+      setAddError(
+        "The server did not confirm this member grant. Review the refreshed register and try again if needed.",
+      );
+    }
+    finishRowOperation(operationUsername, operation, projectGeneration);
+    if (projectGenerationRef.current === projectGeneration) {
+      addSubmittingRef.current = false;
+      setAddSubmitting(false);
     }
   }
 
   async function savePermission(member: MemberGrant) {
-    if (savingUsernamesRef.current.has(member.username)) {
+    const operation = startRowOperation(member.username, "saving");
+    if (operation === null) {
       return;
     }
     const permission = permissionDrafts[member.username] ?? member.permission;
-    savingUsernamesRef.current.add(member.username);
-    setSavingUsername(member.username);
+    const requestedProjectSlug = projectSlug;
+    const projectGeneration = projectGenerationRef.current;
     setStatus("");
     setRowErrors((current) => ({ ...current, [member.username]: "" }));
+    let mutationError: unknown = null;
     try {
-      await client.putNoContent(memberPath(projectSlug, member.username), {
+      await client.putNoContent(memberPath(requestedProjectSlug, member.username), {
         permission,
       });
-      if (mountedRef.current) {
-        setMembers((current) =>
-          current.map((item) =>
-            item.username === member.username ? { ...item, permission } : item,
-          ),
-        );
-        setStatus(
-          `Permission for ${member.display_name} updated to ${titleCase(permission)}.`,
-        );
-      }
     } catch (error) {
-      if (mountedRef.current) {
-        setRowErrors((current) => ({
-          ...current,
-          [member.username]: memberMutationError(error, "save"),
-        }));
-      }
-    } finally {
-      savingUsernamesRef.current.delete(member.username);
-      if (mountedRef.current) {
-        setSavingUsername("");
-      }
+      mutationError = error;
     }
+
+    if (!isCurrentRowOperation(member.username, operation, projectGeneration)) {
+      return;
+    }
+    const refresh = await refreshMembers(requestedProjectSlug, projectGeneration);
+    if (!isCurrentRowOperation(member.username, operation, projectGeneration)) {
+      return;
+    }
+
+    const confirmed =
+      (refresh.kind === "applied" || refresh.kind === "superseded") &&
+      refresh.members.some(
+        (item) =>
+          item.username === member.username && item.permission === permission,
+      );
+    if (confirmed) {
+      setStatus(
+        `Permission for ${member.display_name} updated to ${titleCase(permission)}.`,
+      );
+    } else if (mutationError !== null) {
+      setPermissionDrafts((current) => ({
+        ...current,
+        [member.username]: permission,
+      }));
+      setRowErrors((current) => ({
+        ...current,
+        [member.username]: memberMutationError(mutationError, "save"),
+      }));
+    } else if (refresh.kind === "failed") {
+      setRowErrors((current) => ({
+        ...current,
+        [member.username]:
+          "Permission was saved, but the member register couldn’t be refreshed. Retry the register to confirm it.",
+      }));
+    } else {
+      setRowErrors((current) => ({
+        ...current,
+        [member.username]:
+          "The refreshed register did not confirm this permission change. Review it and try again if needed.",
+      }));
+    }
+    finishRowOperation(member.username, operation, projectGeneration);
   }
 
   async function removeMember() {
-    if (confirmation === null || removingRef.current) {
+    if (confirmation === null) {
       return;
     }
     const member = confirmation;
-    removingRef.current = true;
-    setRemoving(true);
+    const operation = startRowOperation(member.username, "removing");
+    if (operation === null) {
+      return;
+    }
+    const requestedProjectSlug = projectSlug;
+    const projectGeneration = projectGenerationRef.current;
     setRemoveError("");
     setStatus("");
+    let mutationError: unknown = null;
     try {
-      await client.delete(memberPath(projectSlug, member.username));
-      if (mountedRef.current) {
-        setMembers((current) =>
-          current.filter((item) => item.username !== member.username),
-        );
-        setPermissionDrafts((current) => {
-          const next = { ...current };
-          delete next[member.username];
-          return next;
-        });
-        setConfirmation(null);
-        setStatus(`Access removed for ${member.display_name}.`);
-      }
+      await client.delete(memberPath(requestedProjectSlug, member.username));
     } catch (error) {
-      if (mountedRef.current) {
-        setRemoveError(memberMutationError(error, "remove"));
-      }
-    } finally {
-      removingRef.current = false;
-      if (mountedRef.current) {
-        setRemoving(false);
-      }
+      mutationError = error;
     }
+
+    if (!isCurrentRowOperation(member.username, operation, projectGeneration)) {
+      return;
+    }
+    const refresh = await refreshMembers(requestedProjectSlug, projectGeneration);
+    if (!isCurrentRowOperation(member.username, operation, projectGeneration)) {
+      return;
+    }
+
+    const confirmedRemoved =
+      (refresh.kind === "applied" || refresh.kind === "superseded") &&
+      !refresh.members.some((item) => item.username === member.username);
+    if (confirmedRemoved) {
+      setConfirmation(null);
+      setStatus(`Access removed for ${member.display_name}.`);
+      window.requestAnimationFrame(() => statusRef.current?.focus());
+    } else if (mutationError !== null) {
+      setRemoveError(memberMutationError(mutationError, "remove"));
+    } else if (refresh.kind === "failed") {
+      setRemoveError(
+        "Access may have been removed, but the member register couldn’t be refreshed. Retry the register before trying again.",
+      );
+    } else {
+      setRemoveError(
+        "The refreshed register still includes this grant. Review it before trying again.",
+      );
+    }
+    finishRowOperation(member.username, operation, projectGeneration);
   }
 
   return (
@@ -294,11 +467,29 @@ export function ProjectMembers({
         </p>
       )}
 
-      <div className="sr-status" role="status" aria-live="polite">
+      <div
+        ref={statusRef}
+        className="sr-status"
+        role="status"
+        aria-label="Member register status"
+        aria-live="polite"
+        tabIndex={-1}
+      >
         {status}
       </div>
-      {loading ? <p role="status">Loading project members…</p> : null}
-      {loadError ? <p role="alert">{loadError}</p> : null}
+      {loading ? <p className="loading-line">Loading project members…</p> : null}
+      {loadError ? (
+        <div role="alert">
+          <p>{loadError}</p>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => void retryMemberLoad()}
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
       {!loading && !loadError && members.length === 0 ? (
         <div className="empty-state compact-empty">
           <h3>No member grants</h3>
@@ -312,7 +503,9 @@ export function ProjectMembers({
       {!loading && !loadError && members.length > 0 ? (
         <ul className="member-list" aria-label="Current project grants">
           {members.map((member) => {
-            const isSaving = savingUsername === member.username;
+            const rowOperation = rowOperations[member.username];
+            const isSaving = rowOperation?.kind === "saving";
+            const rowBusy = rowOperation !== undefined;
             return (
               <li key={member.user_id} aria-label={`${member.display_name} access`}>
                 <div className="member-identity">
@@ -327,7 +520,7 @@ export function ProjectMembers({
                     <select
                       id={`permission-${member.user_id}`}
                       value={permissionDrafts[member.username] ?? member.permission}
-                      disabled={isSaving}
+                      disabled={rowBusy}
                       onChange={(event) => {
                         const permission = event.currentTarget
                           .value as MemberPermission;
@@ -343,7 +536,7 @@ export function ProjectMembers({
                     <button
                       className="secondary-button"
                       type="button"
-                      disabled={isSaving}
+                      disabled={rowBusy}
                       onClick={() => void savePermission(member)}
                     >
                       {isSaving ? "Saving…" : "Save permission"}
@@ -351,6 +544,7 @@ export function ProjectMembers({
                     <button
                       className="danger-button"
                       type="button"
+                      disabled={rowBusy}
                       onClick={() => {
                         setRemoveError("");
                         setConfirmation(member);
@@ -379,9 +573,11 @@ export function ProjectMembers({
         <RemoveMemberDialog
           member={confirmation}
           error={removeError}
-          removing={removing}
+          removing={
+            rowOperations[confirmation.username]?.kind === "removing"
+          }
           onCancel={() => {
-            if (!removing) {
+            if (rowOperations[confirmation.username] === undefined) {
               setConfirmation(null);
               setRemoveError("");
             }
@@ -407,58 +603,47 @@ function RemoveMemberDialog({
   removing: boolean;
 }) {
   const cancelRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    cancelRef.current?.focus();
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key === "Escape" && !removing) {
-        onCancel();
-      }
-    }
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [onCancel, removing]);
 
   return (
-    <div className="dialog-backdrop">
-      <section
-        className="dialog-panel confirmation-panel"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="remove-member-title"
-        aria-describedby="remove-member-description"
-      >
-        <p className="section-index">Access register / Confirmation</p>
-        <h2 id="remove-member-title">Remove {member.display_name} access</h2>
-        <p id="remove-member-description">
-          Remove project access for {member.display_name} (@{member.username})?
-          This takes effect immediately.
+    <ModalDialog
+      className="confirmation-panel"
+      labelledBy="remove-member-title"
+      describedBy="remove-member-description"
+      initialFocusRef={cancelRef}
+      closeDisabled={removing}
+      onRequestClose={onCancel}
+    >
+      <p className="section-index">Access register / Confirmation</p>
+      <h2 id="remove-member-title">Remove {member.display_name} access</h2>
+      <p id="remove-member-description">
+        Remove project access for {member.display_name} (@{member.username})? This
+        takes effect immediately.
+      </p>
+      {error ? (
+        <p className="confirmation-error" role="alert">
+          {error}
         </p>
-        {error ? (
-          <p className="confirmation-error" role="alert">
-            {error}
-          </p>
-        ) : null}
-        <div className="dialog-actions">
-          <button
-            ref={cancelRef}
-            className="secondary-button"
-            type="button"
-            disabled={removing}
-            onClick={onCancel}
-          >
-            Cancel
-          </button>
-          <button
-            className="danger-button"
-            type="button"
-            disabled={removing}
-            onClick={onRemove}
-          >
-            {removing ? "Removing access…" : "Remove access"}
-          </button>
-        </div>
-      </section>
-    </div>
+      ) : null}
+      <div className="dialog-actions">
+        <button
+          ref={cancelRef}
+          className="secondary-button"
+          type="button"
+          disabled={removing}
+          onClick={onCancel}
+        >
+          Cancel
+        </button>
+        <button
+          className="danger-button"
+          type="button"
+          disabled={removing}
+          onClick={onRemove}
+        >
+          {removing ? "Removing access…" : "Remove access"}
+        </button>
+      </div>
+    </ModalDialog>
   );
 }
 
@@ -468,11 +653,17 @@ function applyMemberList(
   setPermissionDrafts: React.Dispatch<
     React.SetStateAction<Record<string, MemberPermission>>
   >,
+  preserveDrafts = new Set<string>(),
 ) {
   setMembers(members);
-  setPermissionDrafts(
+  setPermissionDrafts((current) =>
     Object.fromEntries(
-      members.map((member) => [member.username, member.permission]),
+      members.map((member) => [
+        member.username,
+        preserveDrafts.has(member.username)
+          ? (current[member.username] ?? member.permission)
+          : member.permission,
+      ]),
     ),
   );
 }

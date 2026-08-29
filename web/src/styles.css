@@ -90,6 +90,7 @@ a {
   font-weight: 750;
   letter-spacing: 0.13em;
   line-height: 1.4;
+  overflow-wrap: anywhere;
   text-transform: uppercase;
 }
 
@@ -552,6 +553,12 @@ a {
   min-width: 0;
 }
 
+.resource-register,
+.project-workspace,
+.members-panel {
+  container-type: inline-size;
+}
+
 .resource-heading,
 .project-heading,
 .section-heading,
@@ -594,11 +601,13 @@ a {
   margin: 0;
   color: var(--ink-soft);
   line-height: 1.65;
+  overflow-wrap: anywhere;
 }
 
 .action-button {
   width: auto;
-  min-width: 10.5rem;
+  min-width: min(10.5rem, 100%);
+  max-width: 100%;
   flex: 0 0 auto;
 }
 
@@ -628,6 +637,7 @@ a {
   font-weight: 400;
   letter-spacing: -0.035em;
   line-height: 1.08;
+  overflow-wrap: anywhere;
 }
 
 .empty-state > p:last-child,
@@ -637,6 +647,7 @@ a {
   margin: 0;
   color: var(--ink-soft);
   line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 
 .compact-empty {
@@ -801,6 +812,7 @@ a {
   font-weight: 750;
   letter-spacing: 0.055em;
   line-height: 1.4;
+  overflow-wrap: anywhere;
   text-transform: uppercase;
 }
 
@@ -810,6 +822,8 @@ a {
 .environment-picker select,
 .member-controls select {
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   min-height: var(--touch-target);
   padding: 0.68rem var(--space-3);
   border: 1px solid var(--line-strong);
@@ -928,7 +942,9 @@ a {
 
 .environment-picker {
   display: grid;
+  width: 100%;
   max-width: 24rem;
+  min-width: 0;
   gap: var(--space-2);
   margin-top: var(--space-6);
 }
@@ -951,6 +967,10 @@ a {
   display: grid;
   min-width: 0;
   gap: var(--space-1);
+}
+
+.environment-list strong {
+  overflow-wrap: anywhere;
 }
 
 .environment-list > li > span {
@@ -1036,12 +1056,20 @@ a {
 .member-add-form {
   display: grid;
   min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-4);
   margin-top: var(--space-6);
   padding: var(--space-5);
   border-top: 1px solid var(--line-strong);
   border-bottom: 1px solid var(--line-strong);
   background: color-mix(in oklch, var(--surface-quiet) 44%, transparent);
+}
+
+.member-add-form > *,
+.member-controls > * {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .compact-button {
@@ -1107,6 +1135,7 @@ a {
 .member-controls {
   display: grid;
   min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-3);
 }
 
@@ -1157,7 +1186,7 @@ a {
   border: 0;
 }
 
-@media (min-width: 47.5rem) {
+@media (min-width: 60rem) {
   .login-page {
     grid-template-columns: minmax(0, 1.08fr) minmax(23rem, 0.92fr);
   }
@@ -1248,11 +1277,14 @@ a {
       var(--canvas);
   }
 
+}
+
+@container (min-width: 40rem) {
   .register-header,
   .project-list > li {
     display: grid;
-    grid-template-columns: minmax(10rem, 0.85fr) minmax(13rem, 1.35fr)
-      minmax(10rem, 0.7fr);
+    grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.35fr)
+      minmax(0, 0.7fr);
     gap: var(--space-6);
   }
 
@@ -1269,7 +1301,7 @@ a {
 
   .project-heading {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(18rem, 0.55fr);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 0.55fr);
     gap: var(--space-10);
   }
 
@@ -1278,28 +1310,42 @@ a {
   }
 
   .environment-list > li {
-    grid-template-columns: minmax(10rem, 1fr) minmax(13rem, 1fr);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     align-items: center;
   }
 
   .member-add-form {
-    grid-template-columns: minmax(12rem, 1.35fr) minmax(9rem, 0.65fr) auto;
+    grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.65fr) auto;
     align-items: start;
   }
 
   .compact-button {
     width: auto;
-    min-width: 9rem;
+    min-width: min(9rem, 100%);
     margin-top: 1.47rem;
   }
 
   .member-list > li {
-    grid-template-columns: minmax(10rem, 0.75fr) minmax(22rem, 1.25fr);
+    grid-template-columns: minmax(0, 0.75fr) minmax(0, 1.25fr);
   }
 
   .member-controls {
-    grid-template-columns: minmax(8.5rem, 1fr) auto auto;
+    grid-template-columns: repeat(
+      auto-fit,
+      minmax(min(100%, 9rem), 1fr)
+    );
     align-items: start;
+  }
+}
+
+@container (max-width: 20rem) {
+  .action-button {
+    padding-inline: var(--space-4);
+    overflow-wrap: anywhere;
+  }
+
+  .action-button::after {
+    display: none;
   }
 }
 

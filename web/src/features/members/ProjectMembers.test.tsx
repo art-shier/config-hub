@@ -47,15 +47,27 @@ function mockMembers(members: TestMember[] = [alex]) {
   );
 }
 
-function renderMembers(role: Role, canManage: boolean) {
-  mockSession(role);
-  return render(
+function membersTree(projectSlug: string, canManage: boolean) {
+  return (
     <MemoryRouter>
       <AuthProvider>
-        <ProjectMembers projectSlug="shop" canManage={canManage} />
+        <ProjectMembers projectSlug={projectSlug} canManage={canManage} />
       </AuthProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderMembers(role: Role, canManage: boolean, projectSlug = "shop") {
+  mockSession(role);
+  return render(membersTree(projectSlug, canManage));
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
 }
 
 function apiError(
@@ -87,6 +99,79 @@ describe("ProjectMembers", () => {
     expect(screen.getByText(/project administrators can change access/iu)).toBeInTheDocument();
     expect(screen.queryByLabelText("Synchronized username")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Remove access" })).not.toBeInTheDocument();
+  });
+
+  it("announces a failed register load and retries it successfully", async () => {
+    const retryStarted = createDeferred<void>();
+    const releaseRetry = createDeferred<void>();
+    let requests = 0;
+    server.use(
+      http.get("/api/v1/projects/shop/members", async () => {
+        requests += 1;
+        if (requests === 1) {
+          return apiError(503, "service_unavailable");
+        }
+        retryStarted.resolve();
+        await releaseRetry.promise;
+        return HttpResponse.json({ members: [alex] });
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    await retryStarted.promise;
+    expect(screen.getByRole("status", { name: "Member register status" })).toHaveTextContent(
+      "Loading project members",
+    );
+    releaseRetry.resolve();
+
+    expect(await screen.findByText("Alex Smith")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Member register status" })).toHaveTextContent(
+      "Project members loaded",
+    );
+  });
+
+  it("discards a late register retry after switching projects", async () => {
+    const retryStarted = createDeferred<void>();
+    const releaseRetry = createDeferred<void>();
+    let shopRequests = 0;
+    server.use(
+      http.get("/api/v1/projects/shop/members", async () => {
+        shopRequests += 1;
+        if (shopRequests === 1) {
+          return apiError(503, "service_unavailable");
+        }
+        retryStarted.resolve();
+        await releaseRetry.promise;
+        return HttpResponse.json({ members: [alex] });
+      }),
+      http.get("/api/v1/projects/billing/members", () =>
+        HttpResponse.json({
+          members: [
+            {
+              user_id: "user-betty",
+              username: "betty",
+              display_name: "Betty Billing",
+              permission: "viewer",
+            },
+          ],
+        }),
+      ),
+    );
+    const view = renderMembers("admin", true);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    await retryStarted.promise;
+
+    view.rerender(membersTree("billing", true));
+    expect(await screen.findByText("Betty Billing")).toBeInTheDocument();
+    releaseRetry.resolve();
+
+    await waitFor(() =>
+      expect(screen.queryByText("Alex Smith")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("Betty Billing")).toBeInTheDocument();
   });
 
   it("adds a synchronized username with encoded path, JSON, CSRF, and a refreshed grant", async () => {
@@ -202,13 +287,17 @@ describe("ProjectMembers", () => {
   it("changes an existing viewer grant to editor and confirms the saved permission", async () => {
     let putPath = "";
     let putBody: unknown;
-    mockMembers();
+    let currentMembers: TestMember[] = [alex];
     server.use(
+      http.get("/api/v1/projects/shop/members", () =>
+        HttpResponse.json({ members: currentMembers }),
+      ),
       http.put(
         "/api/v1/projects/shop/members/alex.smith",
         async ({ request }) => {
           putPath = new URL(request.url).pathname;
           putBody = await request.json();
+          currentMembers = [{ ...alex, permission: "editor" }];
           return new HttpResponse(null, { status: 204 });
         },
       ),
@@ -238,26 +327,186 @@ describe("ProjectMembers", () => {
     expect(permission).toHaveValue("editor");
   });
 
-  it("requires named confirmation, preserves it on failure, and retries removal", async () => {
-    let removeRequests = 0;
-    mockMembers();
+  it("serializes save and remove per username while other rows remain independent", async () => {
+    const jane = {
+      user_id: "user-jane",
+      username: "jane.doe",
+      display_name: "Jane Doe",
+      permission: "viewer" as const,
+    };
+    let currentMembers: TestMember[] = [alex, jane];
+    const alexStarted = createDeferred<void>();
+    const releaseAlex = createDeferred<void>();
+    const janeStarted = createDeferred<void>();
+    const releaseJane = createDeferred<void>();
     server.use(
-      http.delete("/api/v1/projects/shop/members/alex.smith", () => {
-        removeRequests += 1;
-        return removeRequests === 1
-          ? apiError(503, "service_unavailable")
-          : new HttpResponse(null, { status: 204 });
+      http.get("/api/v1/projects/shop/members", () =>
+        HttpResponse.json({ members: currentMembers }),
+      ),
+      http.put("/api/v1/projects/shop/members/:username", async ({ params }) => {
+        if (params.username === "alex.smith") {
+          alexStarted.resolve();
+          await releaseAlex.promise;
+        } else {
+          janeStarted.resolve();
+          await releaseJane.promise;
+        }
+        currentMembers = currentMembers.map((member) =>
+          member.username === params.username
+            ? { ...member, permission: "editor" }
+            : member,
+        );
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    const alexRow = await screen.findByRole("listitem", { name: "Alex Smith access" });
+    const janeRow = screen.getByRole("listitem", { name: "Jane Doe access" });
+
+    await user.selectOptions(
+      within(alexRow).getByLabelText("Permission for alex.smith"),
+      "editor",
+    );
+    await user.selectOptions(
+      within(janeRow).getByLabelText("Permission for jane.doe"),
+      "editor",
+    );
+    await user.click(within(alexRow).getByRole("button", { name: "Save permission" }));
+    await alexStarted.promise;
+
+    expect(within(alexRow).getByRole("button", { name: "Saving…" })).toBeDisabled();
+    expect(within(alexRow).getByRole("button", { name: "Remove access" })).toBeDisabled();
+    expect(within(janeRow).getByRole("button", { name: "Save permission" })).toBeEnabled();
+
+    await user.click(within(janeRow).getByRole("button", { name: "Save permission" }));
+    await janeStarted.promise;
+    expect(within(alexRow).getByRole("button", { name: "Saving…" })).toBeDisabled();
+    expect(within(janeRow).getByRole("button", { name: "Saving…" })).toBeDisabled();
+
+    releaseJane.resolve();
+    await waitFor(() =>
+      expect(within(janeRow).getByRole("button", { name: "Save permission" })).toBeEnabled(),
+    );
+    expect(within(alexRow).getByRole("button", { name: "Saving…" })).toBeDisabled();
+    releaseAlex.resolve();
+    await waitFor(() =>
+      expect(within(alexRow).getByRole("button", { name: "Save permission" })).toBeEnabled(),
+    );
+    expect(within(alexRow).queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(janeRow).queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(alexRow).getByLabelText("Permission for alex.smith")).toHaveValue(
+      "editor",
+    );
+    expect(within(janeRow).getByLabelText("Permission for jane.doe")).toHaveValue(
+      "editor",
+    );
+  });
+
+  it("reconciles an uncertain permission save from the authoritative register", async () => {
+    let currentMembers: TestMember[] = [alex];
+    let gets = 0;
+    server.use(
+      http.get("/api/v1/projects/shop/members", () => {
+        gets += 1;
+        return HttpResponse.json({ members: currentMembers });
+      }),
+      http.put("/api/v1/projects/shop/members/alex.smith", () => {
+        currentMembers = [{ ...alex, permission: "editor" }];
+        return apiError(503, "service_unavailable");
       }),
     );
     renderMembers("admin", true);
     const user = userEvent.setup();
     const row = await screen.findByRole("listitem", { name: "Alex Smith access" });
 
-    await user.click(within(row).getByRole("button", { name: "Remove access" }));
+    await user.selectOptions(
+      within(row).getByLabelText("Permission for alex.smith"),
+      "editor",
+    );
+    await user.click(within(row).getByRole("button", { name: "Save permission" }));
+
+    await waitFor(() => expect(gets).toBe(2));
+    expect(within(row).getByLabelText("Permission for alex.smith")).toHaveValue("editor");
+    expect(within(row).queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Permission for Alex Smith updated to Editor.",
+    );
+  });
+
+  it("discards a deferred save response after switching projects", async () => {
+    const saveStarted = createDeferred<void>();
+    const releaseSave = createDeferred<void>();
+    server.use(
+      http.get("/api/v1/projects/shop/members", () =>
+        HttpResponse.json({ members: [alex] }),
+      ),
+      http.get("/api/v1/projects/billing/members", () =>
+        HttpResponse.json({
+          members: [
+            {
+              user_id: "user-betty",
+              username: "betty",
+              display_name: "Betty Billing",
+              permission: "viewer",
+            },
+          ],
+        }),
+      ),
+      http.put("/api/v1/projects/shop/members/alex.smith", async () => {
+        saveStarted.resolve();
+        await releaseSave.promise;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    const view = renderMembers("admin", true);
+    const user = userEvent.setup();
+    const row = await screen.findByRole("listitem", { name: "Alex Smith access" });
+    await user.selectOptions(
+      within(row).getByLabelText("Permission for alex.smith"),
+      "editor",
+    );
+    await user.click(within(row).getByRole("button", { name: "Save permission" }));
+    await saveStarted.promise;
+
+    view.rerender(membersTree("billing", true));
+    expect(await screen.findByText("Betty Billing")).toBeInTheDocument();
+    releaseSave.resolve();
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).not.toHaveTextContent("Alex Smith"),
+    );
+    expect(screen.getByText("Betty Billing")).toBeInTheDocument();
+  });
+
+  it("requires named confirmation, preserves it on failure, and retries removal", async () => {
+    let removeRequests = 0;
+    let currentMembers: TestMember[] = [alex];
+    server.use(
+      http.get("/api/v1/projects/shop/members", () =>
+        HttpResponse.json({ members: currentMembers }),
+      ),
+      http.delete("/api/v1/projects/shop/members/alex.smith", () => {
+        removeRequests += 1;
+        if (removeRequests === 1) {
+          return apiError(503, "service_unavailable");
+        }
+        currentMembers = [];
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    const row = await screen.findByRole("listitem", { name: "Alex Smith access" });
+
+    const removeButton = within(row).getByRole("button", { name: "Remove access" });
+    await user.click(removeButton);
     let dialog = screen.getByRole("dialog", { name: "Remove Alex Smith access" });
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveFocus();
     expect(within(dialog).getByText(/Alex Smith \(@alex\.smith\)/u)).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(removeButton).toHaveFocus();
     expect(screen.getByText("Alex Smith")).toBeInTheDocument();
     expect(removeRequests).toBe(0);
 
@@ -274,5 +523,82 @@ describe("ProjectMembers", () => {
     await waitFor(() => expect(screen.queryByText("Alex Smith")).not.toBeInTheDocument());
     expect(removeRequests).toBe(2);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveFocus(),
+    );
+  });
+
+  it("reconciles an uncertain removal from the authoritative register", async () => {
+    let currentMembers: TestMember[] = [alex];
+    let gets = 0;
+    server.use(
+      http.get("/api/v1/projects/shop/members", () => {
+        gets += 1;
+        return HttpResponse.json({ members: currentMembers });
+      }),
+      http.delete("/api/v1/projects/shop/members/alex.smith", () => {
+        currentMembers = [];
+        return apiError(503, "service_unavailable");
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    const row = await screen.findByRole("listitem", { name: "Alex Smith access" });
+    await user.click(within(row).getByRole("button", { name: "Remove access" }));
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Remove access" }),
+    );
+
+    await waitFor(() => expect(gets).toBe(2));
+    expect(screen.queryByText("Alex Smith")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Access removed for Alex Smith.",
+    );
+  });
+
+  it("discards a deferred removal response after switching projects", async () => {
+    const removeStarted = createDeferred<void>();
+    const releaseRemove = createDeferred<void>();
+    server.use(
+      http.get("/api/v1/projects/shop/members", () =>
+        HttpResponse.json({ members: [alex] }),
+      ),
+      http.get("/api/v1/projects/billing/members", () =>
+        HttpResponse.json({
+          members: [
+            {
+              user_id: "user-betty",
+              username: "betty",
+              display_name: "Betty Billing",
+              permission: "viewer",
+            },
+          ],
+        }),
+      ),
+      http.delete("/api/v1/projects/shop/members/alex.smith", async () => {
+        removeStarted.resolve();
+        await releaseRemove.promise;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    const view = renderMembers("admin", true);
+    const user = userEvent.setup();
+    const row = await screen.findByRole("listitem", { name: "Alex Smith access" });
+    await user.click(within(row).getByRole("button", { name: "Remove access" }));
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Remove access" }),
+    );
+    await removeStarted.promise;
+
+    view.rerender(membersTree("billing", true));
+    expect(await screen.findByText("Betty Billing")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    releaseRemove.resolve();
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).not.toHaveTextContent("Alex Smith"),
+    );
+    expect(screen.getByText("Betty Billing")).toBeInTheDocument();
   });
 });

@@ -1,6 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
+import { StrictMode } from "react";
 import { describe, expect, it } from "vitest";
 import { App } from "../app/App";
 import { server } from "../test/setup";
@@ -64,9 +65,17 @@ function mockProjectPage(
   );
 }
 
-function renderAppAt(path: string) {
+function renderAppAt(path: string, { strict = false } = {}) {
   window.history.pushState({}, "", path);
-  return render(<App />);
+  return render(strict ? <StrictMode><App /></StrictMode> : <App />);
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
 }
 
 function apiError(
@@ -91,7 +100,7 @@ describe("ProjectPage", () => {
   it("renders project metadata, environment state, and semantic tabs", async () => {
     mockProjectPage("admin", "admin");
 
-    renderAppAt("/projects/shop");
+    renderAppAt("/projects/shop", { strict: true });
 
     expect(await screen.findByRole("heading", { name: "Shop" })).toBeInTheDocument();
     expect(screen.getByText("Storefront runtime configuration.")).toBeInTheDocument();
@@ -104,9 +113,59 @@ describe("ProjectPage", () => {
       "aria-selected",
       "true",
     );
-    expect(within(tabs).getByRole("tab", { name: "Versions" })).toBeInTheDocument();
-    expect(within(tabs).getByRole("tab", { name: "Members" })).toBeInTheDocument();
+    for (const [name, id] of [
+      ["Configuration", "configuration"],
+      ["Versions", "versions"],
+      ["Members", "members"],
+    ] as const) {
+      expect(within(tabs).getByRole("tab", { name })).toHaveAttribute(
+        "aria-controls",
+        `project-panel-${id}`,
+      );
+      expect(document.getElementById(`project-panel-${id}`)).toBeInTheDocument();
+    }
     await waitFor(() => expect(window.location.search).toBe("?environment=prod"));
+  });
+
+  it("uses roving focus with automatic tab selection for arrows, Home, and End", async () => {
+    mockProjectPage("admin", "admin");
+    server.use(
+      http.get("/api/v1/projects/shop/members", () =>
+        HttpResponse.json({ members: [] }),
+      ),
+    );
+    renderAppAt("/projects/shop");
+    const user = userEvent.setup();
+    const configuration = await screen.findByRole("tab", {
+      name: "Configuration",
+    });
+    const versions = screen.getByRole("tab", { name: "Versions" });
+    const members = screen.getByRole("tab", { name: "Members" });
+    configuration.focus();
+
+    expect(configuration).toHaveAttribute("tabindex", "0");
+    expect(versions).toHaveAttribute("tabindex", "-1");
+    await user.keyboard("{ArrowRight}");
+    expect(versions).toHaveFocus();
+    expect(versions).toHaveAttribute("aria-selected", "true");
+    expect(versions).toHaveAttribute("tabindex", "0");
+    expect(configuration).toHaveAttribute("tabindex", "-1");
+    expect(document.getElementById("project-panel-versions")).not.toHaveAttribute(
+      "hidden",
+    );
+    expect(document.getElementById("project-panel-configuration")).toHaveAttribute(
+      "hidden",
+    );
+
+    await user.keyboard("{End}");
+    expect(members).toHaveFocus();
+    expect(members).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{Home}");
+    expect(configuration).toHaveFocus();
+    expect(configuration).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{ArrowLeft}");
+    expect(members).toHaveFocus();
+    expect(members).toHaveAttribute("aria-selected", "true");
   });
 
   it("preserves valid environment selection while switching tabs and sanitizes invalid values", async () => {
@@ -200,9 +259,10 @@ describe("ProjectPage", () => {
       }),
     );
 
-    renderAppAt("/projects/shop");
+    renderAppAt("/projects/shop", { strict: true });
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "New environment" }));
+    expect(screen.getByLabelText("Environment slug")).toHaveFocus();
     await user.type(screen.getByLabelText("Environment slug"), "Preview");
     await user.type(screen.getByLabelText("Environment name"), "Preview");
     await user.click(screen.getByRole("button", { name: "Create environment" }));
@@ -218,6 +278,47 @@ describe("ProjectPage", () => {
     expect(requests).toBe(2);
     expect(body).toEqual({ slug: "preview", name: "Preview" });
     expect(csrf).toBe("csrf-admin");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("keeps an uncertain environment creation open until its response arrives", async () => {
+    mockProjectPage("admin", "admin");
+    const requestStarted = createDeferred<void>();
+    const releaseRequest = createDeferred<void>();
+    server.use(
+      http.post("/api/v1/projects/shop/environments", async () => {
+        requestStarted.resolve();
+        await releaseRequest.promise;
+        return HttpResponse.json(
+          {
+            environment: {
+              ...environments[1],
+              id: "env-preview",
+              slug: "preview",
+              name: "Preview",
+            },
+          },
+          { status: 201 },
+        );
+      }),
+    );
+
+    renderAppAt("/projects/shop", { strict: true });
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "New environment" }));
+    await user.type(screen.getByLabelText("Environment slug"), "preview");
+    await user.type(screen.getByLabelText("Environment name"), "Preview");
+    await user.click(screen.getByRole("button", { name: "Create environment" }));
+    await requestStarted.promise;
+
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    await user.keyboard("{Escape}");
+    expect(
+      screen.getByRole("dialog", { name: "New environment" }),
+    ).toBeInTheDocument();
+
+    releaseRequest.resolve();
+    expect(await screen.findAllByText("Preview")).toHaveLength(2);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -266,5 +367,102 @@ describe("ProjectPage", () => {
 
     expect(await screen.findByRole("heading", { name: heading })).toBeInTheDocument();
     expect(screen.queryByText("SECRET")).not.toBeInTheDocument();
+  });
+
+  it("announces an unavailable project load and retries it successfully", async () => {
+    const retryStarted = createDeferred<void>();
+    const releaseRetry = createDeferred<void>();
+    let requests = 0;
+    mockProjectPage("admin", "admin");
+    server.use(
+      http.get("/api/v1/projects/shop", async () => {
+        requests += 1;
+        if (requests === 1) {
+          return apiError(503, "service_unavailable");
+        }
+        retryStarted.resolve();
+        await releaseRetry.promise;
+        return HttpResponse.json({
+          project: {
+            id: "project-shop",
+            slug: "shop",
+            name: "Shop",
+            description: "Storefront runtime configuration.",
+            created_at: "2026-08-20T08:00:00Z",
+            updated_at: "2026-08-29T08:30:00Z",
+            permission: "admin",
+            environments,
+          },
+        });
+      }),
+    );
+    renderAppAt("/projects/shop");
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    await retryStarted.promise;
+    expect(screen.getByRole("status")).toHaveTextContent("Loading project");
+    releaseRetry.resolve();
+
+    expect(await screen.findByRole("heading", { name: "Shop" })).toBeInTheDocument();
+    const result = screen.getByText("Project loaded.");
+    expect(result).toHaveAttribute("aria-live", "polite");
+  });
+
+  it("discards a late project retry after navigation selects another project", async () => {
+    const retryStarted = createDeferred<void>();
+    const releaseRetry = createDeferred<void>();
+    let shopRequests = 0;
+    mockProjectPage("admin", "admin");
+    server.use(
+      http.get("/api/v1/projects/shop", async () => {
+        shopRequests += 1;
+        if (shopRequests === 1) {
+          return apiError(503, "service_unavailable");
+        }
+        retryStarted.resolve();
+        await releaseRetry.promise;
+        return HttpResponse.json({
+          project: {
+            id: "project-shop",
+            slug: "shop",
+            name: "Stale Shop",
+            description: "stale",
+            created_at: "2026-08-20T08:00:00Z",
+            updated_at: "2026-08-29T08:30:00Z",
+            permission: "admin",
+            environments,
+          },
+        });
+      }),
+      http.get("/api/v1/projects/billing", () =>
+        HttpResponse.json({
+          project: {
+            id: "project-billing",
+            slug: "billing",
+            name: "Billing",
+            description: "Billing controls",
+            created_at: "2026-08-20T08:00:00Z",
+            updated_at: "2026-08-29T08:30:00Z",
+            permission: "admin",
+            environments: [],
+          },
+        }),
+      ),
+    );
+    renderAppAt("/projects/shop");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    await retryStarted.promise;
+
+    window.history.pushState({}, "", "/projects/billing");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    expect(await screen.findByRole("heading", { name: "Billing" })).toBeInTheDocument();
+    releaseRetry.resolve();
+
+    await waitFor(() =>
+      expect(screen.queryByRole("heading", { name: "Stale Shop" })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("heading", { name: "Billing" })).toBeInTheDocument();
   });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { APIError } from "../api/client";
 import type {
@@ -6,6 +6,7 @@ import type {
   ProjectDetail,
 } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
+import { ModalDialog } from "../components/ModalDialog";
 import { ProjectMembers } from "../features/members/ProjectMembers";
 
 interface ProjectDetailResponse {
@@ -33,46 +34,55 @@ export function ProjectPage() {
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [failure, setFailure] = useState<LoadFailure>(null);
+  const [loadAnnouncement, setLoadAnnouncement] = useState("Loading project…");
   const [creatingEnvironment, setCreatingEnvironment] = useState(false);
   const newEnvironmentButtonRef = useRef<HTMLButtonElement>(null);
+  const loadGenerationRef = useRef(0);
 
-  useEffect(() => {
-    let current = true;
+  const loadProject = useCallback(async () => {
+    const generation = ++loadGenerationRef.current;
     setProject(null);
     setFailure(null);
+    setLoading(true);
+    setLoadAnnouncement("Loading project…");
     if (!projectSlugPattern.test(projectSlug)) {
       setLoading(false);
       setFailure("not-found");
-      return () => {
-        current = false;
-      };
+      setLoadAnnouncement("Project not found.");
+      return;
     }
-    setLoading(true);
-    void client
-      .get<ProjectDetailResponse>(`/projects/${encodeURIComponent(projectSlug)}`)
-      .then((response) => {
-        if (current) {
-          setProject(response.project);
-        }
-      })
-      .catch((error) => {
-        if (current) {
-          setFailure(
-            error instanceof APIError && error.status === 404
-              ? "not-found"
-              : "unavailable",
-          );
-        }
-      })
-      .finally(() => {
-        if (current) {
-          setLoading(false);
-        }
-      });
-    return () => {
-      current = false;
-    };
+    try {
+      const response = await client.get<ProjectDetailResponse>(
+        `/projects/${encodeURIComponent(projectSlug)}`,
+      );
+      if (loadGenerationRef.current === generation) {
+        setProject(response.project);
+        setLoadAnnouncement("Project loaded.");
+      }
+    } catch (error) {
+      if (loadGenerationRef.current === generation) {
+        const nextFailure =
+          error instanceof APIError && error.status === 404
+            ? "not-found"
+            : "unavailable";
+        setFailure(nextFailure);
+        setLoadAnnouncement(
+          nextFailure === "not-found" ? "Project not found." : "Project unavailable.",
+        );
+      }
+    } finally {
+      if (loadGenerationRef.current === generation) {
+        setLoading(false);
+      }
+    }
   }, [client, projectSlug]);
+
+  useEffect(() => {
+    void loadProject();
+    return () => {
+      loadGenerationRef.current += 1;
+    };
+  }, [loadProject]);
 
   const activeTab = safeTab(searchParams.get("tab"));
   const requestedEnvironment = searchParams.get("environment");
@@ -120,7 +130,7 @@ export function ProjectPage() {
     return (
       <section className="resource-page">
         <p className="loading-line" role="status">
-          Loading project…
+          {loadAnnouncement}
         </p>
       </section>
     );
@@ -136,6 +146,13 @@ export function ProjectPage() {
             ? "This project address does not match an available project."
             : "The project couldn’t be loaded. Check the server and try again."}
         </p>
+        <button
+          className="secondary-button"
+          type="button"
+          onClick={() => void loadProject()}
+        >
+          Retry
+        </button>
         <Link className="text-link" to="/projects">
           Return to projects
         </Link>
@@ -148,8 +165,38 @@ export function ProjectPage() {
     (environment) => environment.slug === selectedEnvironment,
   );
 
+  function handleTabKeyDown(
+    event: React.KeyboardEvent<HTMLAnchorElement>,
+    currentIndex: number,
+  ) {
+    let nextIndex: number;
+    switch (event.key) {
+      case "ArrowRight":
+        nextIndex = (currentIndex + 1) % projectTabs.length;
+        break;
+      case "ArrowLeft":
+        nextIndex = (currentIndex - 1 + projectTabs.length) % projectTabs.length;
+        break;
+      case "Home":
+        nextIndex = 0;
+        break;
+      case "End":
+        nextIndex = projectTabs.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    const nextTab = projectTabs[nextIndex];
+    setSearchParams(approvedSearch(selectedEnvironment, nextTab.id));
+    document.getElementById(`project-tab-${nextTab.id}`)?.focus();
+  }
+
   return (
     <article className="resource-page project-workspace" aria-labelledby="project-title">
+      <div className="sr-status" aria-live="polite" aria-atomic="true">
+        {loadAnnouncement}
+      </div>
       <Link className="back-link" to="/projects">
         ← Project register
       </Link>
@@ -250,51 +297,57 @@ export function ProjectPage() {
       </section>
 
       <nav className="project-tabs" role="tablist" aria-label="Project sections">
-        {projectTabs.map((tab) => (
+        {projectTabs.map((tab, index) => (
           <Link
             key={tab.id}
             id={`project-tab-${tab.id}`}
             role="tab"
             aria-controls={`project-panel-${tab.id}`}
             aria-selected={activeTab === tab.id}
+            tabIndex={activeTab === tab.id ? 0 : -1}
             className={activeTab === tab.id ? "project-tab active-tab" : "project-tab"}
             to={{ search: `?${approvedSearch(selectedEnvironment, tab.id)}` }}
+            onKeyDown={(event) => handleTabKeyDown(event, index)}
           >
             {tab.label}
           </Link>
         ))}
       </nav>
 
-      <section
-        id={`project-panel-${activeTab}`}
-        className="project-tab-panel"
-        role="tabpanel"
-        aria-labelledby={`project-tab-${activeTab}`}
-      >
-        {activeTab === "configuration" ? (
-          <TaskPlaceholder
-            title="Configuration"
-            detail={
-              selectedEnvironmentRecord
-                ? `Configuration editing for ${selectedEnvironmentRecord.name} arrives in Task 14.`
-                : "Create an environment before editing configuration in Task 14."
-            }
-          />
-        ) : null}
-        {activeTab === "versions" ? (
-          <TaskPlaceholder
-            title="Versions"
-            detail={
-              selectedEnvironmentRecord
-                ? `Version history arrives in Task 14 for ${selectedEnvironmentRecord.name}.`
-                : "Version history arrives in Task 14 after an environment is created."
-            }
-          />
-        ) : null}
-        {activeTab === "members" ? (
-          <ProjectMembers projectSlug={project.slug} canManage={canManage} />
-        ) : null}
-      </section>
+      {projectTabs.map((tab) => (
+        <section
+          key={tab.id}
+          id={`project-panel-${tab.id}`}
+          className="project-tab-panel"
+          role="tabpanel"
+          aria-labelledby={`project-tab-${tab.id}`}
+          hidden={activeTab !== tab.id}
+        >
+          {activeTab === tab.id && tab.id === "configuration" ? (
+            <TaskPlaceholder
+              title="Configuration"
+              detail={
+                selectedEnvironmentRecord
+                  ? `Configuration editing for ${selectedEnvironmentRecord.name} arrives in Task 14.`
+                  : "Create an environment before editing configuration in Task 14."
+              }
+            />
+          ) : null}
+          {activeTab === tab.id && tab.id === "versions" ? (
+            <TaskPlaceholder
+              title="Versions"
+              detail={
+                selectedEnvironmentRecord
+                  ? `Version history arrives in Task 14 for ${selectedEnvironmentRecord.name}.`
+                  : "Version history arrives in Task 14 after an environment is created."
+              }
+            />
+          ) : null}
+          {activeTab === tab.id && tab.id === "members" ? (
+            <ProjectMembers projectSlug={project.slug} canManage={canManage} />
+          ) : null}
+        </section>
+      ))}
 
       {creatingEnvironment ? (
         <CreateEnvironmentDialog
@@ -326,25 +379,16 @@ function CreateEnvironmentDialog({
   const [name, setName] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false);
-  const mountedRef = useRef(true);
+  const operationGenerationRef = useRef(0);
   const slugRef = useRef<HTMLInputElement>(null);
   const [formError, setFormError] = useState("");
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    slugRef.current?.focus();
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onCancel();
-      }
-    }
-    document.addEventListener("keydown", closeOnEscape);
     return () => {
-      mountedRef.current = false;
-      document.removeEventListener("keydown", closeOnEscape);
+      operationGenerationRef.current += 1;
     };
-  }, [onCancel]);
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -352,6 +396,7 @@ function CreateEnvironmentDialog({
       return;
     }
     submittingRef.current = true;
+    const operationGeneration = ++operationGenerationRef.current;
     setSubmitting(true);
     setFormError("");
     setFieldErrors({});
@@ -360,11 +405,11 @@ function CreateEnvironmentDialog({
         `/projects/${encodeURIComponent(projectSlug)}/environments`,
         { slug, name },
       );
-      if (mountedRef.current) {
+      if (operationGenerationRef.current === operationGeneration) {
         onCreated(response.environment);
       }
     } catch (error) {
-      if (!mountedRef.current) {
+      if (operationGenerationRef.current !== operationGeneration) {
         return;
       }
       if (error instanceof APIError && error.status === 422) {
@@ -383,7 +428,7 @@ function CreateEnvironmentDialog({
         );
       }
     } finally {
-      if (mountedRef.current) {
+      if (operationGenerationRef.current === operationGeneration) {
         submittingRef.current = false;
         setSubmitting(false);
       }
@@ -391,76 +436,79 @@ function CreateEnvironmentDialog({
   }
 
   return (
-    <div className="dialog-backdrop">
-      <section
-        className="dialog-panel"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="new-environment-title"
-      >
-        <header className="dialog-heading">
-          <div>
-            <p className="section-index">Environment register / New</p>
-            <h2 id="new-environment-title">New environment</h2>
-          </div>
-          <button className="text-button" type="button" onClick={onCancel}>
-            Cancel
-          </button>
-        </header>
-        <form className="resource-form" onSubmit={(event) => void handleSubmit(event)}>
-          <div className="form-field">
-            <label htmlFor="environment-slug">Environment slug</label>
-            <input
-              ref={slugRef}
-              id="environment-slug"
-              name="slug"
-              autoCapitalize="none"
-              autoComplete="off"
-              spellCheck={false}
-              required
-              value={slug}
-              disabled={submitting}
-              aria-invalid={fieldErrors.slug ? "true" : undefined}
-              aria-describedby={
-                fieldErrors.slug ? "environment-slug-error" : undefined
-              }
-              onChange={(event) => setSlug(event.currentTarget.value)}
-            />
-            {fieldErrors.slug ? (
-              <p className="field-error" id="environment-slug-error">
-                {fieldErrors.slug}
-              </p>
-            ) : null}
-          </div>
-          <div className="form-field">
-            <label htmlFor="environment-name">Environment name</label>
-            <input
-              id="environment-name"
-              name="name"
-              required
-              value={name}
-              disabled={submitting}
-              aria-invalid={fieldErrors.name ? "true" : undefined}
-              aria-describedby={
-                fieldErrors.name ? "environment-name-error" : undefined
-              }
-              onChange={(event) => setName(event.currentTarget.value)}
-            />
-            {fieldErrors.name ? (
-              <p className="field-error" id="environment-name-error">
-                {fieldErrors.name}
-              </p>
-            ) : null}
-          </div>
-          <div className="form-message" aria-live="polite">
-            {formError ? <p role="alert">{formError}</p> : null}
-          </div>
-          <button className="primary-button" type="submit" disabled={submitting}>
-            {submitting ? "Creating environment…" : "Create environment"}
-          </button>
-        </form>
-      </section>
-    </div>
+    <ModalDialog
+      labelledBy="new-environment-title"
+      initialFocusRef={slugRef}
+      closeDisabled={submitting}
+      onRequestClose={onCancel}
+    >
+      <header className="dialog-heading">
+        <div>
+          <p className="section-index">Environment register / New</p>
+          <h2 id="new-environment-title">New environment</h2>
+        </div>
+        <button
+          className="text-button"
+          type="button"
+          disabled={submitting}
+          onClick={onCancel}
+        >
+          Cancel
+        </button>
+      </header>
+      <form className="resource-form" onSubmit={(event) => void handleSubmit(event)}>
+        <div className="form-field">
+          <label htmlFor="environment-slug">Environment slug</label>
+          <input
+            ref={slugRef}
+            id="environment-slug"
+            name="slug"
+            autoCapitalize="none"
+            autoComplete="off"
+            spellCheck={false}
+            required
+            value={slug}
+            disabled={submitting}
+            aria-invalid={fieldErrors.slug ? "true" : undefined}
+            aria-describedby={
+              fieldErrors.slug ? "environment-slug-error" : undefined
+            }
+            onChange={(event) => setSlug(event.currentTarget.value)}
+          />
+          {fieldErrors.slug ? (
+            <p className="field-error" id="environment-slug-error">
+              {fieldErrors.slug}
+            </p>
+          ) : null}
+        </div>
+        <div className="form-field">
+          <label htmlFor="environment-name">Environment name</label>
+          <input
+            id="environment-name"
+            name="name"
+            required
+            value={name}
+            disabled={submitting}
+            aria-invalid={fieldErrors.name ? "true" : undefined}
+            aria-describedby={
+              fieldErrors.name ? "environment-name-error" : undefined
+            }
+            onChange={(event) => setName(event.currentTarget.value)}
+          />
+          {fieldErrors.name ? (
+            <p className="field-error" id="environment-name-error">
+              {fieldErrors.name}
+            </p>
+          ) : null}
+        </div>
+        <div className="form-message" aria-live="polite">
+          {formError ? <p role="alert">{formError}</p> : null}
+        </div>
+        <button className="primary-button" type="submit" disabled={submitting}>
+          {submitting ? "Creating environment…" : "Create environment"}
+        </button>
+      </form>
+    </ModalDialog>
   );
 }
 

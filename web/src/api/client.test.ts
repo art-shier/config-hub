@@ -2,8 +2,17 @@ import { http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 import { server } from "../test/setup";
 import { APIClient, APIError } from "./client";
+import type { APIClientContract } from "./types";
 
 describe("APIClient", () => {
+  it("publishes every no-content mutation through its typed contract", () => {
+    const contract: APIClientContract = new APIClient(() => "csrf-token");
+
+    expect(contract.postNoContent).toBeTypeOf("function");
+    expect(contract.putNoContent).toBeTypeOf("function");
+    expect(contract.delete).toBeTypeOf("function");
+  });
+
   it("sends CSRF and exposes a typed conflict", async () => {
     let requestDetails:
       | {

@@ -67,6 +67,8 @@ export interface APIErrorEnvelope {
 export interface APIClientContract {
   get<T>(path: string): Promise<T>;
   post<T>(path: string, body: unknown): Promise<T>;
+  postNoContent(path: string, body?: unknown): Promise<void>;
   put<T>(path: string, body: unknown): Promise<T>;
+  putNoContent(path: string, body: unknown): Promise<void>;
   delete(path: string): Promise<void>;
 }
