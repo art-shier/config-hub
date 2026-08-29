@@ -113,8 +113,9 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 
 	var runProject, runEnvironment, runService string
 	run := &cobra.Command{
-		Use:   "run --project P --env E [--service S] -- command [arg...]",
-		Short: "Run a command with the current configuration",
+		Use:                   "run --project P --env E [--service S] -- command [arg...]",
+		Short:                 "Run a command with the current configuration",
+		DisableFlagsInUseLine: true,
 		Args: func(command *cobra.Command, argv []string) error {
 			if len(argv) == 0 || command.ArgsLenAtDash() != 0 {
 				return errCommandUsage
