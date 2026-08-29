@@ -17,11 +17,31 @@ type RowOperationKind = "adding" | "saving" | "removing";
 type RowOperation = { kind: RowOperationKind; token: number };
 type MemberRefreshResult =
   | { kind: "applied"; members: MemberGrant[] }
-  | { kind: "failed" }
+  | { kind: "failed"; request: number }
   | { kind: "superseded"; members: MemberGrant[] }
   | { kind: "stale" };
+type PendingReconciliation = (
+  | {
+      kind: "add";
+      username: string;
+      permission: MemberPermission;
+    }
+  | {
+      kind: "save";
+      username: string;
+      displayName: string;
+      permission: MemberPermission;
+    }
+  | {
+      kind: "remove";
+      username: string;
+      displayName: string;
+    }
+) & { minimumRequest: number };
 
 const usernamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const reconciliationMessage =
+  "An access change may have been saved, but the member register has not confirmed it. Retry the register to load the authoritative grants.";
 
 export function ProjectMembers({
   canManage,
@@ -48,19 +68,30 @@ export function ProjectMembers({
     Record<string, RowOperation>
   >({});
   const rowOperationsRef = useRef(new Map<string, RowOperation>());
+  const [pendingReconciliations, setPendingReconciliations] = useState<
+    Record<string, PendingReconciliation>
+  >({});
+  const pendingReconciliationsRef = useRef(
+    new Map<string, PendingReconciliation>(),
+  );
   const operationTokenRef = useRef(0);
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
   const [confirmation, setConfirmation] = useState<MemberGrant | null>(null);
   const [removeError, setRemoveError] = useState("");
   const [status, setStatus] = useState("");
+  const [reconciliationError, setReconciliationError] = useState("");
   const statusRef = useRef<HTMLDivElement>(null);
   const projectGenerationRef = useRef(0);
   const memberListRequestRef = useRef(0);
+  const appliedMemberListRequestRef = useRef(0);
+  const appliedMembersRef = useRef<MemberGrant[]>([]);
 
   useEffect(() => {
     const projectGeneration = ++projectGenerationRef.current;
     rowOperationsRef.current.clear();
+    pendingReconciliationsRef.current.clear();
     setRowOperations({});
+    setPendingReconciliations({});
     addSubmittingRef.current = false;
     setAddSubmitting(false);
     setMembers([]);
@@ -68,6 +99,9 @@ export function ProjectMembers({
     setRowErrors({});
     setConfirmation(null);
     setRemoveError("");
+    setReconciliationError("");
+    appliedMemberListRequestRef.current = 0;
+    appliedMembersRef.current = [];
     setStatus("Loading project members…");
     setLoading(true);
     setLoadError("");
@@ -104,50 +138,176 @@ export function ProjectMembers({
       if (projectGenerationRef.current !== projectGeneration) {
         return { kind: "stale" };
       }
-      if (memberListRequestRef.current !== request) {
-        return { kind: "superseded", members: response.members };
+      if (request < appliedMemberListRequestRef.current) {
+        return { kind: "superseded", members: appliedMembersRef.current };
       }
+      appliedMemberListRequestRef.current = request;
+      appliedMembersRef.current = response.members;
+      const preservedUsernames = new Set([
+        ...rowOperationsRef.current.keys(),
+        ...pendingReconciliationsRef.current.keys(),
+      ]);
       applyMemberList(
         response.members,
         setMembers,
         setPermissionDrafts,
-        new Set(rowOperationsRef.current.keys()),
+        preservedUsernames,
       );
       setLoadError("");
+      resolvePendingReconciliations(
+        response.members,
+        request,
+        projectGeneration,
+      );
       return { kind: "applied", members: response.members };
     } catch {
-      return projectGenerationRef.current === projectGeneration &&
-        memberListRequestRef.current === request
-        ? { kind: "failed" }
-        : { kind: "stale" };
+      if (projectGenerationRef.current !== projectGeneration) {
+        return { kind: "stale" };
+      }
+      return request < appliedMemberListRequestRef.current
+        ? { kind: "superseded", members: appliedMembersRef.current }
+        : { kind: "failed", request };
     }
   }
 
   async function retryMemberLoad() {
     const projectGeneration = projectGenerationRef.current;
+    const reconcilingMutation = pendingReconciliationsRef.current.size > 0;
     setLoading(true);
     setLoadError("");
-    setStatus("Loading project members…");
+    setStatus(
+      reconcilingMutation
+        ? "Refreshing the member register…"
+        : "Loading project members…",
+    );
     const result = await refreshMembers(projectSlug, projectGeneration);
     if (projectGenerationRef.current !== projectGeneration) {
       return;
     }
-    if (result.kind === "applied") {
-      setStatus("Project members loaded.");
+    if (result.kind === "applied" || result.kind === "superseded") {
+      if (!reconcilingMutation) {
+        setStatus("Project members loaded.");
+      }
     } else if (result.kind === "failed") {
-      setLoadError(
-        "Project members couldn’t be loaded. Check the server and try again.",
-      );
-      setStatus("Project members unavailable.");
+      if (reconcilingMutation) {
+        setReconciliationError(reconciliationMessage);
+        setStatus("Member register confirmation required.");
+      } else {
+        setLoadError(
+          "Project members couldn’t be loaded. Check the server and try again.",
+        );
+        setStatus("Project members unavailable.");
+      }
     }
     setLoading(false);
+  }
+
+  function queueReconciliation(reconciliation: PendingReconciliation) {
+    pendingReconciliationsRef.current.set(
+      reconciliation.username,
+      reconciliation,
+    );
+    setPendingReconciliations((current) => ({
+      ...current,
+      [reconciliation.username]: reconciliation,
+    }));
+    setReconciliationError(reconciliationMessage);
+    setStatus("Member register confirmation required.");
+  }
+
+  function resolvePendingReconciliations(
+    authoritativeMembers: MemberGrant[],
+    appliedRequest: number,
+    projectGeneration: number,
+  ) {
+    if (
+      projectGenerationRef.current !== projectGeneration ||
+      pendingReconciliationsRef.current.size === 0
+    ) {
+      return;
+    }
+    const pending = [...pendingReconciliationsRef.current.values()].filter(
+      (reconciliation) => reconciliation.minimumRequest <= appliedRequest,
+    );
+    if (pending.length === 0) {
+      return;
+    }
+    for (const reconciliation of pending) {
+      pendingReconciliationsRef.current.delete(reconciliation.username);
+    }
+    setPendingReconciliations(
+      Object.fromEntries(pendingReconciliationsRef.current.entries()),
+    );
+    if (pendingReconciliationsRef.current.size === 0) {
+      setReconciliationError("");
+    }
+
+    for (const reconciliation of pending) {
+      if (reconciliation.kind === "add") {
+        const confirmed = authoritativeMembers.some(
+          (member) =>
+            member.username === reconciliation.username &&
+            member.permission === reconciliation.permission,
+        );
+        if (confirmed) {
+          setUsername("");
+          setNewPermission("viewer");
+          setAddError("");
+          setStatus("Member access saved.");
+        } else {
+          setAddError(
+            "The refreshed register did not confirm this member grant. Review it and try again if needed.",
+          );
+        }
+        continue;
+      }
+
+      if (reconciliation.kind === "save") {
+        const confirmed = authoritativeMembers.some(
+          (member) =>
+            member.username === reconciliation.username &&
+            member.permission === reconciliation.permission,
+        );
+        setRowErrors((current) => ({
+          ...current,
+          [reconciliation.username]: confirmed
+            ? ""
+            : "The refreshed register did not confirm this permission change. Review it and try again if needed.",
+        }));
+        if (confirmed) {
+          setStatus(
+            `Permission for ${reconciliation.displayName} updated to ${titleCase(reconciliation.permission)}.`,
+          );
+        }
+        continue;
+      }
+
+      const confirmedRemoved = !authoritativeMembers.some(
+        (member) => member.username === reconciliation.username,
+      );
+      if (confirmedRemoved) {
+        setConfirmation((current) =>
+          current?.username === reconciliation.username ? null : current,
+        );
+        setRemoveError("");
+        setStatus(`Access removed for ${reconciliation.displayName}.`);
+        window.requestAnimationFrame(() => statusRef.current?.focus());
+      } else {
+        setRemoveError(
+          "The refreshed register still includes this grant. Review it before trying again.",
+        );
+      }
+    }
   }
 
   function startRowOperation(
     operationUsername: string,
     kind: RowOperationKind,
   ): RowOperation | null {
-    if (rowOperationsRef.current.has(operationUsername)) {
+    if (
+      rowOperationsRef.current.has(operationUsername) ||
+      pendingReconciliationsRef.current.has(operationUsername)
+    ) {
       return null;
     }
     const operation = { kind, token: ++operationTokenRef.current };
@@ -257,12 +417,16 @@ export function ProjectMembers({
     } else if (mutationError instanceof APIError && mutationError.status === 422) {
       setAddFields(mutationError.fields);
       setAddError("Check the marked member fields and try again.");
+    } else if (refresh.kind === "failed") {
+      setAddError("");
+      queueReconciliation({
+        kind: "add",
+        username: operationUsername,
+        permission,
+        minimumRequest: refresh.request,
+      });
     } else if (mutationError !== null) {
       setAddError(memberMutationError(mutationError, "add"));
-    } else if (refresh.kind === "failed") {
-      setAddError(
-        "Access was saved, but the member list couldn’t be refreshed. Retry the register to confirm the current grants.",
-      );
     } else if (mutationSucceeded) {
       setAddError(
         "The server did not confirm this member grant. Review the refreshed register and try again if needed.",
@@ -312,6 +476,15 @@ export function ProjectMembers({
       setStatus(
         `Permission for ${member.display_name} updated to ${titleCase(permission)}.`,
       );
+    } else if (refresh.kind === "failed") {
+      setRowErrors((current) => ({ ...current, [member.username]: "" }));
+      queueReconciliation({
+        kind: "save",
+        username: member.username,
+        displayName: member.display_name,
+        permission,
+        minimumRequest: refresh.request,
+      });
     } else if (mutationError !== null) {
       setPermissionDrafts((current) => ({
         ...current,
@@ -320,12 +493,6 @@ export function ProjectMembers({
       setRowErrors((current) => ({
         ...current,
         [member.username]: memberMutationError(mutationError, "save"),
-      }));
-    } else if (refresh.kind === "failed") {
-      setRowErrors((current) => ({
-        ...current,
-        [member.username]:
-          "Permission was saved, but the member register couldn’t be refreshed. Retry the register to confirm it.",
       }));
     } else {
       setRowErrors((current) => ({
@@ -372,12 +539,16 @@ export function ProjectMembers({
       setConfirmation(null);
       setStatus(`Access removed for ${member.display_name}.`);
       window.requestAnimationFrame(() => statusRef.current?.focus());
+    } else if (refresh.kind === "failed") {
+      setRemoveError("");
+      queueReconciliation({
+        kind: "remove",
+        username: member.username,
+        displayName: member.display_name,
+        minimumRequest: refresh.request,
+      });
     } else if (mutationError !== null) {
       setRemoveError(memberMutationError(mutationError, "remove"));
-    } else if (refresh.kind === "failed") {
-      setRemoveError(
-        "Access may have been removed, but the member register couldn’t be refreshed. Retry the register before trying again.",
-      );
     } else {
       setRemoveError(
         "The refreshed register still includes this grant. Review it before trying again.",
@@ -385,6 +556,10 @@ export function ProjectMembers({
     }
     finishRowOperation(member.username, operation, projectGeneration);
   }
+
+  const addAwaitingConfirmation = Object.values(pendingReconciliations).some(
+    (reconciliation) => reconciliation.kind === "add",
+  );
 
   return (
     <section className="members-panel" aria-labelledby="project-members-title">
@@ -407,7 +582,7 @@ export function ProjectMembers({
               autoComplete="off"
               spellCheck={false}
               value={username}
-              disabled={addSubmitting}
+              disabled={addSubmitting || addAwaitingConfirmation}
               aria-invalid={addFields.username ? "true" : undefined}
               aria-describedby={
                 addFields.username
@@ -432,7 +607,7 @@ export function ProjectMembers({
               id="new-member-permission"
               name="permission"
               value={newPermission}
-              disabled={addSubmitting}
+              disabled={addSubmitting || addAwaitingConfirmation}
               aria-invalid={addFields.permission ? "true" : undefined}
               aria-describedby={
                 addFields.permission ? "new-member-permission-error" : undefined
@@ -453,7 +628,7 @@ export function ProjectMembers({
           <button
             className="primary-button compact-button"
             type="submit"
-            disabled={addSubmitting}
+            disabled={addSubmitting || addAwaitingConfirmation}
           >
             {addSubmitting ? "Adding member…" : "Add member"}
           </button>
@@ -478,6 +653,19 @@ export function ProjectMembers({
         {status}
       </div>
       {loading ? <p className="loading-line">Loading project members…</p> : null}
+      {reconciliationError && confirmation === null ? (
+        <div role="alert">
+          <p>{reconciliationError}</p>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={loading}
+            onClick={() => void retryMemberLoad()}
+          >
+            {loading ? "Retrying register…" : "Retry register"}
+          </button>
+        </div>
+      ) : null}
       {loadError ? (
         <div role="alert">
           <p>{loadError}</p>
@@ -505,7 +693,9 @@ export function ProjectMembers({
           {members.map((member) => {
             const rowOperation = rowOperations[member.username];
             const isSaving = rowOperation?.kind === "saving";
-            const rowBusy = rowOperation !== undefined;
+            const rowBusy =
+              rowOperation !== undefined ||
+              pendingReconciliations[member.username] !== undefined;
             return (
               <li key={member.user_id} aria-label={`${member.display_name} access`}>
                 <div className="member-identity">
@@ -573,6 +763,11 @@ export function ProjectMembers({
         <RemoveMemberDialog
           member={confirmation}
           error={removeError}
+          awaitingReconciliation={
+            pendingReconciliations[confirmation.username]?.kind === "remove"
+          }
+          reconciliationError={reconciliationError}
+          retryingReconciliation={loading}
           removing={
             rowOperations[confirmation.username]?.kind === "removing"
           }
@@ -583,6 +778,7 @@ export function ProjectMembers({
             }
           }}
           onRemove={() => void removeMember()}
+          onRetryReconciliation={() => void retryMemberLoad()}
         />
       ) : null}
     </section>
@@ -590,17 +786,25 @@ export function ProjectMembers({
 }
 
 function RemoveMemberDialog({
+  awaitingReconciliation,
   error,
   member,
   onCancel,
   onRemove,
+  onRetryReconciliation,
+  reconciliationError,
   removing,
+  retryingReconciliation,
 }: {
+  awaitingReconciliation: boolean;
   error: string;
   member: MemberGrant;
   onCancel(): void;
   onRemove(): void;
+  onRetryReconciliation(): void;
+  reconciliationError: string;
   removing: boolean;
+  retryingReconciliation: boolean;
 }) {
   const cancelRef = useRef<HTMLButtonElement>(null);
 
@@ -619,9 +823,9 @@ function RemoveMemberDialog({
         Remove project access for {member.display_name} (@{member.username})? This
         takes effect immediately.
       </p>
-      {error ? (
+      {error || reconciliationError ? (
         <p className="confirmation-error" role="alert">
-          {error}
+          {error || reconciliationError}
         </p>
       ) : null}
       <div className="dialog-actions">
@@ -634,10 +838,20 @@ function RemoveMemberDialog({
         >
           Cancel
         </button>
+        {reconciliationError ? (
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={retryingReconciliation}
+            onClick={onRetryReconciliation}
+          >
+            {retryingReconciliation ? "Retrying register…" : "Retry register"}
+          </button>
+        ) : null}
         <button
           className="danger-button"
           type="button"
-          disabled={removing}
+          disabled={removing || awaitingReconciliation}
           onClick={onRemove}
         >
           {removing ? "Removing access…" : "Remove access"}

@@ -403,6 +403,192 @@ describe("ProjectMembers", () => {
     );
   });
 
+  it("applies an older authoritative refresh when the newer concurrent refresh fails", async () => {
+    const jane = {
+      user_id: "user-jane",
+      username: "jane.doe",
+      display_name: "Jane Doe",
+      permission: "editor" as const,
+    };
+    let currentMembers: TestMember[] = [alex];
+    let gets = 0;
+    const olderRefreshStarted = createDeferred<void>();
+    const releaseOlderRefresh = createDeferred<void>();
+    const newerRefreshFailed = createDeferred<void>();
+    server.use(
+      http.get("/api/v1/projects/shop/members", async () => {
+        gets += 1;
+        if (gets === 1) {
+          return HttpResponse.json({ members: [alex] });
+        }
+        if (gets === 2) {
+          olderRefreshStarted.resolve();
+          await releaseOlderRefresh.promise;
+          return HttpResponse.json({ members: currentMembers });
+        }
+        newerRefreshFailed.resolve();
+        return apiError(503, "service_unavailable");
+      }),
+      http.put("/api/v1/projects/shop/members/jane.doe", () => {
+        currentMembers = [...currentMembers, jane];
+        return new HttpResponse(null, { status: 204 });
+      }),
+      http.put("/api/v1/projects/shop/members/alex.smith", () => {
+        currentMembers = currentMembers.map((member) =>
+          member.username === alex.username
+            ? { ...member, permission: "editor" }
+            : member,
+        );
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    const alexRow = await screen.findByRole("listitem", {
+      name: "Alex Smith access",
+    });
+    const username = screen.getByLabelText("Synchronized username");
+
+    await user.type(username, "jane.doe");
+    await user.selectOptions(
+      screen.getByLabelText("New member permission"),
+      "editor",
+    );
+    await user.click(screen.getByRole("button", { name: "Add member" }));
+    await olderRefreshStarted.promise;
+
+    await user.selectOptions(
+      within(alexRow).getByLabelText("Permission for alex.smith"),
+      "editor",
+    );
+    await user.click(
+      within(alexRow).getByRole("button", { name: "Save permission" }),
+    );
+    await newerRefreshFailed.promise;
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "register has not confirmed",
+      ),
+    );
+
+    releaseOlderRefresh.resolve();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Add member" })).toBeEnabled(),
+    );
+
+    expect(screen.getByText("Jane Doe")).toBeInTheDocument();
+    expect(username).toHaveValue("");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Member access saved",
+    );
+    expect(
+      within(alexRow).getByLabelText("Permission for alex.smith"),
+    ).toHaveValue("editor");
+    expect(
+      screen.getByRole("button", { name: "Retry register" }),
+    ).toBeEnabled();
+  });
+
+  it("retains an unconfirmed add and retries the authoritative register", async () => {
+    const jane = {
+      user_id: "user-jane",
+      username: "jane.doe",
+      display_name: "Jane Doe",
+      permission: "editor" as const,
+    };
+    let currentMembers: TestMember[] = [alex];
+    let gets = 0;
+    server.use(
+      http.get("/api/v1/projects/shop/members", () => {
+        gets += 1;
+        return gets === 2
+          ? apiError(503, "service_unavailable")
+          : HttpResponse.json({ members: currentMembers });
+      }),
+      http.put("/api/v1/projects/shop/members/jane.doe", () => {
+        currentMembers = [...currentMembers, jane];
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    await screen.findByText("Alex Smith");
+    const username = screen.getByLabelText("Synchronized username");
+
+    await user.type(username, "jane.doe");
+    await user.selectOptions(
+      screen.getByLabelText("New member permission"),
+      "editor",
+    );
+    await user.click(screen.getByRole("button", { name: "Add member" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /may have been saved.*register has not confirmed/iu,
+    );
+    expect(username).toHaveValue("jane.doe");
+    expect(screen.getByLabelText("New member permission")).toHaveValue("editor");
+    expect(screen.getByRole("status")).not.toHaveTextContent(
+      "Member access saved",
+    );
+    expect(screen.queryByText("SECRET")).not.toBeInTheDocument();
+
+    const retry = screen.getByRole("button", { name: "Retry register" });
+    retry.focus();
+    expect(retry).toHaveFocus();
+    await user.click(retry);
+
+    expect(await screen.findByText("Jane Doe")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(username).toHaveValue("");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Member access saved",
+    );
+    expect(gets).toBe(3);
+  });
+
+  it("retains an unconfirmed permission draft until a register retry applies it", async () => {
+    let currentMembers: TestMember[] = [alex];
+    let gets = 0;
+    server.use(
+      http.get("/api/v1/projects/shop/members", () => {
+        gets += 1;
+        return gets === 2
+          ? apiError(503, "service_unavailable")
+          : HttpResponse.json({ members: currentMembers });
+      }),
+      http.put("/api/v1/projects/shop/members/alex.smith", () => {
+        currentMembers = [{ ...alex, permission: "editor" }];
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    const row = await screen.findByRole("listitem", { name: "Alex Smith access" });
+    const permission = within(row).getByLabelText("Permission for alex.smith");
+
+    await user.selectOptions(permission, "editor");
+    await user.click(within(row).getByRole("button", { name: "Save permission" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /may have been saved.*register has not confirmed/iu,
+    );
+    expect(permission).toHaveValue("editor");
+    expect(screen.getByRole("status")).not.toHaveTextContent(
+      "updated to Editor",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Retry register" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Permission for Alex Smith updated to Editor.",
+      ),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(permission).toHaveValue("editor");
+    expect(gets).toBe(3);
+  });
+
   it("reconciles an uncertain permission save from the authoritative register", async () => {
     let currentMembers: TestMember[] = [alex];
     let gets = 0;
@@ -555,6 +741,48 @@ describe("ProjectMembers", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       "Access removed for Alex Smith.",
     );
+  });
+
+  it("keeps removal confirmation reachable until a register retry applies it", async () => {
+    let currentMembers: TestMember[] = [alex];
+    let gets = 0;
+    server.use(
+      http.get("/api/v1/projects/shop/members", () => {
+        gets += 1;
+        return gets === 2
+          ? apiError(503, "service_unavailable")
+          : HttpResponse.json({ members: currentMembers });
+      }),
+      http.delete("/api/v1/projects/shop/members/alex.smith", () => {
+        currentMembers = [];
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    const row = await screen.findByRole("listitem", { name: "Alex Smith access" });
+    await user.click(within(row).getByRole("button", { name: "Remove access" }));
+    const dialog = screen.getByRole("dialog", { name: "Remove Alex Smith access" });
+    await user.click(within(dialog).getByRole("button", { name: "Remove access" }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      /may have been saved.*register has not confirmed/iu,
+    );
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(
+      within(dialog).getByRole("button", { name: "Remove access" }),
+    ).toBeDisabled();
+    const retry = within(dialog).getByRole("button", { name: "Retry register" });
+    retry.focus();
+    expect(retry).toHaveFocus();
+    await user.click(retry);
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(screen.queryByText("Alex Smith")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Access removed for Alex Smith.",
+    );
+    expect(gets).toBe(3);
   });
 
   it("discards a deferred removal response after switching projects", async () => {
