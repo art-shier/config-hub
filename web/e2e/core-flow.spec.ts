@@ -32,6 +32,19 @@ interface E2ERuntime {
   stop(): Promise<void>;
 }
 
+type MachineTokenCheck = "format" | "clipboard" | "dismissed" | "reopened";
+
+const machineTokenFailureMessages: Record<MachineTokenCheck, string> = {
+  format: "issued machine token had an unexpected format",
+  clipboard: "issued machine token was not copied to the clipboard",
+  dismissed: "issued machine token remained visible after confirmation",
+  reopened: "issued machine token was shown after reopening its metadata",
+};
+
+function assertMachineTokenCheck(passed: boolean, check: MachineTokenCheck): void {
+  if (!passed) throw new Error(machineTokenFailureMessages[check]);
+}
+
 let runtimeServer: E2ERuntime;
 
 test.beforeAll(async () => {
@@ -53,6 +66,30 @@ test.afterAll(async () => {
       }
     }
     if (stopFailed) throw new Error("runtime resources did not stop cleanly");
+  }
+});
+
+test("machine-token assertion failures omit the token value", () => {
+  const syntheticToken = "synthetic-machine-token-secret";
+  const failingChecks: Array<readonly [boolean, MachineTokenCheck]> = [
+    [/^ch_[A-Za-z0-9_-]{43}$/u.test(syntheticToken), "format"],
+    [`clipboard:${syntheticToken}` === syntheticToken, "clipboard"],
+    [[syntheticToken].length === 0, "dismissed"],
+    [!`dialog:${syntheticToken}`.includes(syntheticToken), "reopened"],
+  ];
+  for (const [passed, check] of failingChecks) {
+    let failure: unknown;
+    try {
+      assertMachineTokenCheck(passed, check);
+    } catch (error) {
+      failure = error;
+    }
+    if (!(failure instanceof Error)) {
+      throw new Error("machine-token assertion did not fail");
+    }
+    if (failure.message.includes(syntheticToken)) {
+      throw new Error("machine-token assertion error disclosed the token value");
+    }
   }
 });
 
@@ -137,14 +174,23 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
   await page.getByRole("dialog").getByRole("button", { name: "Issue Token", exact: true }).click();
   const issuedToken = await page.getByLabel("Issued Token").textContent();
   issuedMachineToken = issuedToken ?? "";
-  expect(issuedToken).toMatch(/^ch_[A-Za-z0-9_-]{43}$/u);
+  const tokenHasExpectedFormat = /^ch_[A-Za-z0-9_-]{43}$/u.test(issuedMachineToken);
+  assertMachineTokenCheck(tokenHasExpectedFormat, "format");
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: runtimeServer.origin });
   await page.getByRole("button", { name: "Copy Token" }).click();
-  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(issuedToken);
+  await expect.poll(async () => (await page.evaluate(() => navigator.clipboard.readText())) === issuedMachineToken, {
+    message: machineTokenFailureMessages.clipboard,
+  }).toBe(true);
   await page.getByRole("button", { name: "I have copied it" }).click();
-  await expect(page.getByLabel("Issued Token")).toHaveCount(0);
+  await expect.poll(async () => (await page.getByLabel("Issued Token").count()) === 0, {
+    message: machineTokenFailureMessages.dismissed,
+  }).toBe(true);
   await page.getByRole("button", { name: "View browser-token Token" }).click();
-  await expect(page.getByRole("dialog")).not.toContainText(issuedToken ?? "missing-token");
+  const reopenedDialog = page.getByRole("dialog");
+  await expect(reopenedDialog).toBeVisible();
+  const reopenedDialogText = await reopenedDialog.textContent() ?? "";
+  const reopenedDialogOmitsToken = !reopenedDialogText.includes(issuedMachineToken);
+  assertMachineTokenCheck(reopenedDialogOmitsToken, "reopened");
 });
 
 async function login(page: Page): Promise<void> {

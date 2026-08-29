@@ -409,35 +409,99 @@ func TestRuntimeServerRetriesAnOccupiedCandidatePort(t *testing.T) {
 }
 
 func TestRuntimeReadinessCancelsAndJoinsProbeWhenProcessExits(t *testing.T) {
-	requestStarted := make(chan struct{})
 	requestCanceled := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		response.WriteHeader(http.StatusServiceUnavailable)
 		response.(http.Flusher).Flush()
-		close(requestStarted)
 		<-request.Context().Done()
 		close(requestCanceled)
 	}))
-	defer server.Close()
+	defer func() {
+		server.CloseClientConnections()
+		server.Close()
+	}()
+
+	probeReadStarted := make(chan struct{})
+	probeBodyClosed := make(chan struct{})
+	client := server.Client()
+	client.Transport = &trackingRoundTripper{
+		base:             client.Transport,
+		probeReadStarted: probeReadStarted,
+		probeBodyClosed:  probeBodyClosed,
+	}
 
 	fixture := &runtimeFixture{
 		url:         server.URL,
-		client:      server.Client(),
+		client:      client,
 		processDone: make(chan struct{}),
 	}
 	result := make(chan error, 1)
 	go func() { result <- fixture.waitReady(context.Background()) }()
-	<-requestStarted
+	<-probeReadStarted
+	startedAt := time.Now()
+	deadline := time.NewTimer(time.Second)
+	defer stopTimer(deadline)
 	close(fixture.processDone)
 
-	if err := <-result; !errors.Is(err, errRuntimeServerExited) {
-		t.Fatalf("readiness error=%v", err)
+	var readinessErr error
+	select {
+	case readinessErr = <-result:
+	case <-deadline.C:
+		t.Fatal("waitReady did not stop within one second of process exit")
+	}
+	if !errors.Is(readinessErr, errRuntimeServerExited) {
+		t.Fatalf("readiness error=%v", readinessErr)
+	}
+	select {
+	case <-probeBodyClosed:
+	default:
+		t.Fatal("waitReady returned before joining and closing the client probe")
 	}
 	select {
 	case <-requestCanceled:
-	default:
-		t.Fatal("waitReady returned before the canceled probe and response completed")
+	case <-deadline.C:
+		t.Fatal("server did not observe readiness probe cancellation within one second")
 	}
+	if elapsed := time.Since(startedAt); elapsed >= time.Second {
+		t.Fatalf("readiness cancellation elapsed=%s, want less than one second", elapsed)
+	}
+}
+
+type trackingRoundTripper struct {
+	base             http.RoundTripper
+	probeReadStarted chan struct{}
+	probeBodyClosed  chan struct{}
+}
+
+func (t *trackingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	response.Body = &trackingResponseBody{
+		ReadCloser:       response.Body,
+		probeReadStarted: t.probeReadStarted,
+		probeBodyClosed:  t.probeBodyClosed,
+	}
+	return response, nil
+}
+
+type trackingResponseBody struct {
+	io.ReadCloser
+	readOnce         sync.Once
+	closeOnce        sync.Once
+	probeReadStarted chan struct{}
+	probeBodyClosed  chan struct{}
+}
+
+func (b *trackingResponseBody) Read(contents []byte) (int, error) {
+	b.readOnce.Do(func() { close(b.probeReadStarted) })
+	return b.ReadCloser.Read(contents)
+}
+
+func (b *trackingResponseBody) Close() error {
+	b.closeOnce.Do(func() { close(b.probeBodyClosed) })
+	return b.ReadCloser.Close()
 }
 
 type diagnosticLog struct {
