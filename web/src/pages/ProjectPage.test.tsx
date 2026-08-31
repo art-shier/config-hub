@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw";
 import { StrictMode } from "react";
 import { describe, expect, it } from "vitest";
 import { App } from "../app/App";
+import { changeLocale } from "../i18n";
 import { server } from "../test/setup";
 
 type Role = "admin" | "member";
@@ -62,20 +63,29 @@ function mockProjectPage(
         },
       }),
     ),
-    http.get("/api/v1/projects/shop/environments/:environment/config", ({ params }) =>
-      HttpResponse.json({
-        revision: {
-          id: params.environment === "prod" ? "revision-7" : "",
-          environment_id: `env-${String(params.environment)}`,
-          message: params.environment === "prod" ? "current values" : "",
-          created_by: "user-admin",
-          version: params.environment === "prod" ? 7 : 0,
-          created_at: "2026-08-29T08:00:00Z",
-          entries: params.environment === "prod"
-            ? [{ key: "API_URL", value: "https://example.test", service: "api" }]
-            : [],
-        },
-      }),
+    http.get(
+      "/api/v1/projects/shop/environments/:environment/config",
+      ({ params }) =>
+        HttpResponse.json({
+          revision: {
+            id: params.environment === "prod" ? "revision-7" : "",
+            environment_id: `env-${String(params.environment)}`,
+            message: params.environment === "prod" ? "current values" : "",
+            created_by: "user-admin",
+            version: params.environment === "prod" ? 7 : 0,
+            created_at: "2026-08-29T08:00:00Z",
+            entries:
+              params.environment === "prod"
+                ? [
+                    {
+                      key: "API_URL",
+                      value: "https://example.test",
+                      service: "api",
+                    },
+                  ]
+                : [],
+          },
+        }),
     ),
     http.get("/api/v1/projects/shop/environments/:environment/revisions", () =>
       HttpResponse.json({ revisions: [] }),
@@ -85,7 +95,15 @@ function mockProjectPage(
 
 function renderAppAt(path: string, { strict = false } = {}) {
   window.history.pushState({}, "", path);
-  return render(strict ? <StrictMode><App /></StrictMode> : <App />);
+  return render(
+    strict ? (
+      <StrictMode>
+        <App />
+      </StrictMode>
+    ) : (
+      <App />
+    ),
+  );
 }
 
 function createDeferred<T>() {
@@ -115,22 +133,41 @@ function apiError(
 }
 
 describe("ProjectPage", () => {
+  it("renders project environments in Simplified Chinese without translating data", async () => {
+    mockProjectPage("admin", "admin");
+    await changeLocale("zh-CN");
+    renderAppAt("/projects/shop?environment=prod&tab=versions");
+
+    expect(await screen.findByRole("heading", { name: "Shop" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "环境" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "新建环境" })).toBeVisible();
+    expect(screen.getByLabelText("当前环境")).toHaveValue("prod");
+    expect(screen.getAllByText("Production")).toHaveLength(2);
+    expect(screen.getByRole("tab", { name: "版本" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
   it("renders project metadata, environment state, and semantic tabs", async () => {
     mockProjectPage("admin", "admin");
 
     renderAppAt("/projects/shop", { strict: true });
 
-    expect(await screen.findByRole("heading", { name: "Shop" })).toBeInTheDocument();
-    expect(screen.getByText("Storefront runtime configuration.")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Shop" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Storefront runtime configuration."),
+    ).toBeInTheDocument();
     expect(screen.getByText("shop")).toBeInTheDocument();
     expect(screen.getAllByText("Production")).toHaveLength(2);
     expect(screen.getByText("Current revision revision-7")).toBeInTheDocument();
     expect(screen.getByText("No revision published")).toBeInTheDocument();
     const tabs = screen.getByRole("tablist", { name: "Project sections" });
-    expect(within(tabs).getByRole("tab", { name: "Configuration" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(
+      within(tabs).getByRole("tab", { name: "Configuration" }),
+    ).toHaveAttribute("aria-selected", "true");
     for (const [name, id] of [
       ["Configuration", "configuration"],
       ["Versions", "versions"],
@@ -140,9 +177,13 @@ describe("ProjectPage", () => {
         "aria-controls",
         `project-panel-${id}`,
       );
-      expect(document.getElementById(`project-panel-${id}`)).toBeInTheDocument();
+      expect(
+        document.getElementById(`project-panel-${id}`),
+      ).toBeInTheDocument();
     }
-    await waitFor(() => expect(window.location.search).toBe("?environment=prod"));
+    await waitFor(() =>
+      expect(window.location.search).toBe("?environment=prod"),
+    );
   });
 
   it("uses roving focus with automatic tab selection for arrows, Home, and End", async () => {
@@ -168,12 +209,12 @@ describe("ProjectPage", () => {
     expect(versions).toHaveAttribute("aria-selected", "true");
     expect(versions).toHaveAttribute("tabindex", "0");
     expect(configuration).toHaveAttribute("tabindex", "-1");
-    expect(document.getElementById("project-panel-versions")).not.toHaveAttribute(
-      "hidden",
-    );
-    expect(document.getElementById("project-panel-configuration")).toHaveAttribute(
-      "hidden",
-    );
+    expect(
+      document.getElementById("project-panel-versions"),
+    ).not.toHaveAttribute("hidden");
+    expect(
+      document.getElementById("project-panel-configuration"),
+    ).toHaveAttribute("hidden");
 
     await user.keyboard("{End}");
     expect(members).toHaveFocus();
@@ -190,10 +231,17 @@ describe("ProjectPage", () => {
     mockProjectPage("admin", "admin");
     renderAppAt("/projects/shop?environment=missing&extra=discarded");
 
-    expect(await screen.findByRole("heading", { name: "Shop" })).toBeInTheDocument();
-    await waitFor(() => expect(window.location.search).toBe("?environment=prod"));
+    expect(
+      await screen.findByRole("heading", { name: "Shop" }),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(window.location.search).toBe("?environment=prod"),
+    );
     const user = userEvent.setup();
-    await user.selectOptions(screen.getByLabelText("Active environment"), "stage");
+    await user.selectOptions(
+      screen.getByLabelText("Active environment"),
+      "stage",
+    );
     expect(window.location.search).toBe("?environment=stage");
 
     await user.click(screen.getByRole("tab", { name: "Versions" }));
@@ -202,7 +250,9 @@ describe("ProjectPage", () => {
       "aria-selected",
       "true",
     );
-    expect(await screen.findByRole("heading", { name: "No versions yet" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "No versions yet" }),
+    ).toBeInTheDocument();
   });
 
   it("renders the current grant register on the Members tab", async () => {
@@ -228,23 +278,31 @@ describe("ProjectPage", () => {
       await screen.findByRole("heading", { name: "Project members" }),
     ).toBeInTheDocument();
     expect(await screen.findByText("Alex Smith")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add member" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Add member" }),
+    ).toBeInTheDocument();
     expect(window.location.search).toBe("?environment=prod&tab=members");
   });
 
   it.each(["viewer", "editor"] as const)(
     "keeps %s project access free of administration actions",
     async (permission) => {
-    mockProjectPage("member", permission);
+      mockProjectPage("member", permission);
 
-    renderAppAt("/projects/shop");
+      renderAppAt("/projects/shop");
 
-    expect(await screen.findByRole("heading", { name: "Shop" })).toBeInTheDocument();
-    expect(screen.getByText(new RegExp(`${permission} access`, "iu"))).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "New environment" }),
-    ).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Add member" })).not.toBeInTheDocument();
+      expect(
+        await screen.findByRole("heading", { name: "Shop" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(new RegExp(`${permission} access`, "iu")),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "New environment" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Add member" }),
+      ).not.toBeInTheDocument();
     },
   );
 
@@ -252,33 +310,49 @@ describe("ProjectPage", () => {
     ["viewer", false],
     ["editor", true],
     ["admin", true],
-  ] as const)("applies %s configuration write access", async (permission, canWrite) => {
-    mockProjectPage(permission === "admin" ? "admin" : "member", permission);
-    renderAppAt("/projects/shop");
+  ] as const)(
+    "applies %s configuration write access",
+    async (permission, canWrite) => {
+      mockProjectPage(permission === "admin" ? "admin" : "member", permission);
+      renderAppAt("/projects/shop");
 
-    expect(await screen.findByText("API_URL")).toBeInTheDocument();
-    const edit = screen.queryByRole("button", { name: "Edit configuration" });
-    if (canWrite) expect(edit).toBeInTheDocument();
-    else expect(edit).not.toBeInTheDocument();
-  });
+      expect(await screen.findByText("API_URL")).toBeInTheDocument();
+      const edit = screen.queryByRole("button", { name: "Edit configuration" });
+      if (canWrite) expect(edit).toBeInTheDocument();
+      else expect(edit).not.toBeInTheDocument();
+    },
+  );
 
   it("blocks environment and tab query navigation while a configuration draft is dirty", async () => {
     mockProjectPage("admin", "admin");
     renderAppAt("/projects/shop?environment=prod");
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "Edit configuration" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Edit configuration" }),
+    );
     await user.type(screen.getByLabelText("Value for API_URL"), " draft");
 
-    await user.selectOptions(screen.getByLabelText("Active environment"), "stage");
-    expect(screen.getByRole("dialog", { name: "Leave without saving?" })).toBeInTheDocument();
+    await user.selectOptions(
+      screen.getByLabelText("Active environment"),
+      "stage",
+    );
+    expect(
+      screen.getByRole("dialog", { name: "Leave without saving?" }),
+    ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Stay" }));
     expect(window.location.search).toBe("?environment=prod");
-    expect(screen.getByLabelText("Value for API_URL")).toHaveValue("https://example.test draft");
+    expect(screen.getByLabelText("Value for API_URL")).toHaveValue(
+      "https://example.test draft",
+    );
 
     await user.click(screen.getByRole("tab", { name: "Versions" }));
-    expect(screen.getByRole("dialog", { name: "Leave without saving?" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: "Leave without saving?" }),
+    ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Discard and leave" }));
-    expect(await screen.findByRole("heading", { name: "No versions yet" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "No versions yet" }),
+    ).toBeInTheDocument();
     expect(window.location.search).toBe("?environment=prod&tab=versions");
   });
 
@@ -287,36 +361,64 @@ describe("ProjectPage", () => {
     let historyRequests = 0;
     let body: unknown;
     server.use(
-      http.put("/api/v1/projects/shop/environments/prod/config", async ({ request }) => {
-        body = await request.json();
-        return HttpResponse.json({
-          revision: {
-            id: "revision-8",
-            environment_id: "env-prod",
-            message: "update URL",
-            created_by: "user-admin",
-            version: 8,
-            created_at: "2026-08-29T09:00:00Z",
-            entries: [{ key: "API_URL", value: "https://next.test", service: "api" }],
-          },
-        }, { status: 201 });
-      }),
+      http.put(
+        "/api/v1/projects/shop/environments/prod/config",
+        async ({ request }) => {
+          body = await request.json();
+          return HttpResponse.json(
+            {
+              revision: {
+                id: "revision-8",
+                environment_id: "env-prod",
+                message: "update URL",
+                created_by: "user-admin",
+                version: 8,
+                created_at: "2026-08-29T09:00:00Z",
+                entries: [
+                  {
+                    key: "API_URL",
+                    value: "https://next.test",
+                    service: "api",
+                  },
+                ],
+              },
+            },
+            { status: 201 },
+          );
+        },
+      ),
       http.get("/api/v1/projects/shop/environments/prod/revisions", () => {
         historyRequests += 1;
         return HttpResponse.json({
-          revisions: [{ id: "revision-8", environment_id: "env-prod", message: "update URL", created_by: "user-admin", version: 8, created_at: "2026-08-29T09:00:00Z" }],
+          revisions: [
+            {
+              id: "revision-8",
+              environment_id: "env-prod",
+              message: "update URL",
+              created_by: "user-admin",
+              version: 8,
+              created_at: "2026-08-29T09:00:00Z",
+            },
+          ],
         });
       }),
     );
     renderAppAt("/projects/shop");
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "Edit configuration" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Edit configuration" }),
+    );
     await user.clear(screen.getByLabelText("Value for API_URL"));
-    await user.type(screen.getByLabelText("Value for API_URL"), "https://next.test");
+    await user.type(
+      screen.getByLabelText("Value for API_URL"),
+      "https://next.test",
+    );
     await user.type(screen.getByLabelText("Change message"), "update URL");
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
-    expect((await screen.findByTestId("configuration-value-API_URL")).textContent).toBe("https://next.test");
+    expect(
+      (await screen.findByTestId("configuration-value-API_URL")).textContent,
+    ).toBe("https://next.test");
     expect(body).toEqual({
       base_revision: 7,
       message: "update URL",
@@ -338,7 +440,9 @@ describe("ProjectPage", () => {
     );
     renderAppAt("/projects/shop");
 
-    expect(await screen.findByRole("heading", { name: "Choose an environment" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Choose an environment" }),
+    ).toBeInTheDocument();
     expect(revisionRequests).toBe(0);
   });
 
@@ -373,18 +477,24 @@ describe("ProjectPage", () => {
 
     renderAppAt("/projects/shop", { strict: true });
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New environment" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New environment" }),
+    );
     expect(screen.getByLabelText("Environment slug")).toHaveFocus();
     await user.type(screen.getByLabelText("Environment slug"), "Preview");
     await user.type(screen.getByLabelText("Environment name"), "Preview");
-    await user.click(screen.getByRole("button", { name: "Create environment" }));
+    await user.click(
+      screen.getByRole("button", { name: "Create environment" }),
+    );
 
     const slug = await screen.findByLabelText("Environment slug");
     expect(slug).toHaveValue("Preview");
-    expect(slug).toHaveAccessibleDescription("Use a lowercase environment slug.");
+    expect(slug).toHaveAccessibleDescription("Environment slug is invalid.");
     await user.clear(slug);
     await user.type(slug, "preview");
-    await user.click(screen.getByRole("button", { name: "Create environment" }));
+    await user.click(
+      screen.getByRole("button", { name: "Create environment" }),
+    );
 
     expect(await screen.findAllByText("Preview")).toHaveLength(2);
     expect(requests).toBe(2);
@@ -417,10 +527,14 @@ describe("ProjectPage", () => {
 
     renderAppAt("/projects/shop", { strict: true });
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New environment" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New environment" }),
+    );
     await user.type(screen.getByLabelText("Environment slug"), "preview");
     await user.type(screen.getByLabelText("Environment name"), "Preview");
-    await user.click(screen.getByRole("button", { name: "Create environment" }));
+    await user.click(
+      screen.getByRole("button", { name: "Create environment" }),
+    );
     await requestStarted.promise;
 
     expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
@@ -444,13 +558,21 @@ describe("ProjectPage", () => {
 
     renderAppAt("/projects/shop");
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New environment" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New environment" }),
+    );
     await user.type(screen.getByLabelText("Environment slug"), "prod");
     await user.type(screen.getByLabelText("Environment name"), "Second prod");
-    await user.click(screen.getByRole("button", { name: "Create environment" }));
+    await user.click(
+      screen.getByRole("button", { name: "Create environment" }),
+    );
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Choose another slug");
-    expect(screen.getByLabelText("Environment name")).toHaveValue("Second prod");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Choose another slug",
+    );
+    expect(screen.getByLabelText("Environment name")).toHaveValue(
+      "Second prod",
+    );
     expect(screen.getAllByText("Production")).toHaveLength(2);
     expect(screen.queryByText("SECRET")).not.toBeInTheDocument();
   });
@@ -477,7 +599,9 @@ describe("ProjectPage", () => {
 
     renderAppAt("/projects/shop");
 
-    expect(await screen.findByRole("heading", { name: heading })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: heading }),
+    ).toBeInTheDocument();
     expect(screen.queryByText("SECRET")).not.toBeInTheDocument();
   });
 
@@ -516,7 +640,9 @@ describe("ProjectPage", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Loading project");
     releaseRetry.resolve();
 
-    expect(await screen.findByRole("heading", { name: "Shop" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Shop" }),
+    ).toBeInTheDocument();
     const result = screen.getByText("Project loaded.");
     expect(result).toHaveAttribute("aria-live", "polite");
   });
@@ -569,12 +695,18 @@ describe("ProjectPage", () => {
 
     window.history.pushState({}, "", "/projects/billing");
     window.dispatchEvent(new PopStateEvent("popstate"));
-    expect(await screen.findByRole("heading", { name: "Billing" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Billing" }),
+    ).toBeInTheDocument();
     releaseRetry.resolve();
 
     await waitFor(() =>
-      expect(screen.queryByRole("heading", { name: "Stale Shop" })).not.toBeInTheDocument(),
+      expect(
+        screen.queryByRole("heading", { name: "Stale Shop" }),
+      ).not.toBeInTheDocument(),
     );
-    expect(screen.getByRole("heading", { name: "Billing" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Billing" }),
+    ).toBeInTheDocument();
   });
 });

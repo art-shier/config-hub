@@ -6,10 +6,14 @@ import {
   type FormEvent,
 } from "react";
 import { Link } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { APIError } from "../api/client";
 import type { Project } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
 import { ModalDialog } from "../components/ModalDialog";
+import { localizePresentFields } from "../i18n/apiErrors";
+import { formatDate } from "../i18n/format";
+import type { SupportedLocale } from "../i18n/locales";
 
 interface ProjectListResponse {
   projects: Project[];
@@ -23,10 +27,17 @@ const projectSlugPattern = /^[a-z0-9][a-z0-9-]{0,62}$/u;
 
 export function ProjectsPage() {
   const { client, user } = useAuth();
+  const { i18n, t } = useTranslation("projects");
+  const locale: SupportedLocale =
+    i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en-US";
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState("");
-  const [loadAnnouncement, setLoadAnnouncement] = useState("Loading projects…");
+  const [loadError, setLoadError] = useState<"" | "errors.projectsUnavailable">(
+    "",
+  );
+  const [loadAnnouncement, setLoadAnnouncement] = useState<
+    "loadingProjects" | "projectsLoaded" | "projectsUnavailable"
+  >("loadingProjects");
   const [creating, setCreating] = useState(false);
   const newProjectButtonRef = useRef<HTMLButtonElement>(null);
   const loadGenerationRef = useRef(0);
@@ -35,19 +46,17 @@ export function ProjectsPage() {
     const generation = ++loadGenerationRef.current;
     setLoading(true);
     setLoadError("");
-    setLoadAnnouncement("Loading projects…");
+    setLoadAnnouncement("loadingProjects");
     try {
       const response = await client.get<ProjectListResponse>("/projects");
       if (loadGenerationRef.current === generation) {
         setProjects(response.projects);
-        setLoadAnnouncement("Projects loaded.");
+        setLoadAnnouncement("projectsLoaded");
       }
     } catch {
       if (loadGenerationRef.current === generation) {
-        setLoadError(
-          "Projects couldn’t be loaded. Check the server and try again.",
-        );
-        setLoadAnnouncement("Projects unavailable.");
+        setLoadError("errors.projectsUnavailable");
+        setLoadAnnouncement("projectsUnavailable");
       }
     } finally {
       if (loadGenerationRef.current === generation) {
@@ -70,9 +79,12 @@ export function ProjectsPage() {
 
   function addProject(project: Project) {
     setProjects((current) =>
-      [...current.filter((item) => item.id !== project.id && item.slug !== project.slug), project].sort(
-        (left, right) => left.name.localeCompare(right.name),
-      ),
+      [
+        ...current.filter(
+          (item) => item.id !== project.id && item.slug !== project.slug,
+        ),
+        project,
+      ].sort((left, right) => left.name.localeCompare(right.name)),
     );
   }
 
@@ -80,11 +92,9 @@ export function ProjectsPage() {
     <section className="resource-page" aria-labelledby="projects-title">
       <header className="resource-heading">
         <div>
-          <p className="eyebrow">Configuration inventory</p>
-          <h1 id="projects-title">Projects</h1>
-          <p>
-            Open a project to review its environments, revisions, and access.
-          </p>
+          <p className="eyebrow">{t("list.eyebrow")}</p>
+          <h1 id="projects-title">{t("list.title")}</h1>
+          <p>{t("list.summary")}</p>
         </div>
         {user?.role === "admin" ? (
           <button
@@ -93,54 +103,50 @@ export function ProjectsPage() {
             type="button"
             onClick={() => setCreating(true)}
           >
-            New project
+            {t("list.create")}
           </button>
         ) : null}
       </header>
 
       {loading ? (
         <p className="loading-line" role="status">
-          {loadAnnouncement}
+          {t(`states.${loadAnnouncement}`)}
         </p>
       ) : (
         <div className="sr-status" aria-live="polite" aria-atomic="true">
-          {loadAnnouncement}
+          {t(`states.${loadAnnouncement}`)}
         </div>
       )}
       {loadError ? (
-        <div
-          className="empty-state"
-          aria-live="polite"
-          aria-atomic="true"
-        >
-          <h2>Projects unavailable</h2>
-          <p>{loadError}</p>
+        <div className="empty-state" aria-live="polite" aria-atomic="true">
+          <h2>{t("states.projectsUnavailable")}</h2>
+          <p>{t(loadError)}</p>
           <button
             className="secondary-button"
             type="button"
             onClick={() => void loadProjects()}
           >
-            Retry
+            {t("actions.retry")}
           </button>
         </div>
       ) : null}
       {!loading && !loadError && projects.length === 0 ? (
         <div className="empty-state">
-          <p className="section-index">Project register / Empty</p>
-          <h2>No projects yet</h2>
+          <p className="section-index">{t("empty.listIndex")}</p>
+          <h2>{t("empty.listTitle")}</h2>
           <p>
             {user?.role === "admin"
-              ? "Create the first project to establish an environment ledger."
-              : "A project administrator can grant access when a workspace is ready."}
+              ? t("empty.adminList")
+              : t("empty.memberList")}
           </p>
         </div>
       ) : null}
       {!loading && !loadError && projects.length > 0 ? (
-        <div className="resource-register" aria-label="Visible projects">
+        <div className="resource-register" aria-label={t("list.register")}>
           <div className="register-header" aria-hidden="true">
-            <span>Project</span>
-            <span>Description</span>
-            <span>Last update</span>
+            <span>{t("list.project")}</span>
+            <span>{t("list.description")}</span>
+            <span>{t("list.lastUpdate")}</span>
           </div>
           <ul className="project-list">
             {projects.map((project) => (
@@ -150,10 +156,16 @@ export function ProjectsPage() {
                   <span className="code-label">{project.slug}</span>
                 </div>
                 <p className="project-description">
-                  {project.description || "No description provided."}
+                  {project.description || t("list.noDescription")}
                 </p>
                 <time dateTime={project.updated_at}>
-                  Updated {formatUpdatedAt(project.updated_at)}
+                  {t("list.updated", {
+                    date: formatDate(
+                      project.updated_at,
+                      locale,
+                      t("states.unavailable"),
+                    ),
+                  })}
                 </time>
               </li>
             ))}
@@ -184,6 +196,7 @@ function CreateProjectDialog({
   onCancel(): void;
   onCreated(project: Project): void;
 }) {
+  const { t } = useTranslation("projects");
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -224,17 +237,21 @@ function CreateProjectDialog({
         return;
       }
       if (error instanceof APIError && error.status === 422) {
-        setFieldErrors(error.fields);
-        setFormError("Check the marked fields and try again.");
+        setFieldErrors(
+          localizePresentFields(error.fields, {
+            slug: "validation.project.slug",
+            name: "validation.project.name",
+            description: "validation.project.description",
+          }),
+        );
+        setFormError("errors.checkFields");
       } else if (
         error instanceof APIError &&
         (error.status === 409 || error.code === "resource_conflict")
       ) {
-        setFormError("That project slug is already in use. Choose another slug.");
+        setFormError("errors.projectConflict");
       } else {
-        setFormError(
-          "The project couldn’t be created. Keep this draft and try again.",
-        );
+        setFormError("errors.projectUnavailableCreate");
       }
     } finally {
       if (operationGenerationRef.current === operationGeneration) {
@@ -253,8 +270,8 @@ function CreateProjectDialog({
     >
       <header className="dialog-heading">
         <div>
-          <p className="section-index">Project register / New</p>
-          <h2 id="new-project-title">New project</h2>
+          <p className="section-index">{t("projectForm.index")}</p>
+          <h2 id="new-project-title">{t("projectForm.title")}</h2>
         </div>
         <button
           className="text-button"
@@ -262,11 +279,19 @@ function CreateProjectDialog({
           disabled={submitting}
           onClick={onCancel}
         >
-          Cancel
+          {t("common:actions.cancel")}
         </button>
       </header>
-      <form className="resource-form" onSubmit={(event) => void handleSubmit(event)}>
-        <Field id="project-slug" label="Project slug" error={fieldErrors.slug}>
+      <form
+        noValidate
+        className="resource-form"
+        onSubmit={(event) => void handleSubmit(event)}
+      >
+        <Field
+          id="project-slug"
+          label={t("projectForm.slug")}
+          error={fieldErrors.slug ? t(fieldErrors.slug) : undefined}
+        >
           <input
             ref={slugRef}
             id="project-slug"
@@ -278,11 +303,17 @@ function CreateProjectDialog({
             disabled={submitting}
             value={slug}
             aria-invalid={fieldErrors.slug ? "true" : undefined}
-            aria-describedby={fieldErrors.slug ? "project-slug-error" : undefined}
+            aria-describedby={
+              fieldErrors.slug ? "project-slug-error" : undefined
+            }
             onChange={(event) => setSlug(event.currentTarget.value)}
           />
         </Field>
-        <Field id="project-name" label="Project name" error={fieldErrors.name}>
+        <Field
+          id="project-name"
+          label={t("projectForm.name")}
+          error={fieldErrors.name ? t(fieldErrors.name) : undefined}
+        >
           <input
             id="project-name"
             name="name"
@@ -290,14 +321,18 @@ function CreateProjectDialog({
             disabled={submitting}
             value={name}
             aria-invalid={fieldErrors.name ? "true" : undefined}
-            aria-describedby={fieldErrors.name ? "project-name-error" : undefined}
+            aria-describedby={
+              fieldErrors.name ? "project-name-error" : undefined
+            }
             onChange={(event) => setName(event.currentTarget.value)}
           />
         </Field>
         <Field
           id="project-description"
-          label="Description"
-          error={fieldErrors.description}
+          label={t("projectForm.description")}
+          error={
+            fieldErrors.description ? t(fieldErrors.description) : undefined
+          }
         >
           <textarea
             id="project-description"
@@ -313,10 +348,10 @@ function CreateProjectDialog({
           />
         </Field>
         <div className="form-message" aria-live="polite" aria-atomic="true">
-          {formError ? <p role="alert">{formError}</p> : null}
+          {formError ? <p role="alert">{t(formError)}</p> : null}
         </div>
         <button className="primary-button" type="submit" disabled={submitting}>
-          {submitting ? "Creating project…" : "Create project"}
+          {submitting ? t("projectForm.submitting") : t("projectForm.submit")}
         </button>
       </form>
     </ModalDialog>
@@ -351,19 +386,4 @@ function safeProjectPath(slug: string): string {
   return projectSlugPattern.test(slug)
     ? `/projects/${encodeURIComponent(slug)}`
     : "/projects";
-}
-
-function formatUpdatedAt(value: string): string {
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) {
-    return "time unavailable";
-  }
-  try {
-    return new Intl.DateTimeFormat(undefined, {
-      dateStyle: "medium",
-      timeStyle: "short",
-    }).format(date);
-  } catch {
-    return date.toISOString().replace("T", " ").replace(".000Z", " UTC");
-  }
 }

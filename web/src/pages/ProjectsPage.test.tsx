@@ -4,6 +4,7 @@ import { delay, http, HttpResponse } from "msw";
 import { StrictMode } from "react";
 import { describe, expect, it } from "vitest";
 import { App } from "../app/App";
+import { changeLocale } from "../i18n";
 import { server } from "../test/setup";
 
 type Role = "admin" | "member";
@@ -34,7 +35,7 @@ function mockSession({ role }: { role: Role }) {
   );
 }
 
-function mockProjects(projects: typeof shop[]) {
+function mockProjects(projects: (typeof shop)[]) {
   server.use(
     http.get("/api/v1/projects", () => HttpResponse.json({ projects })),
   );
@@ -42,7 +43,15 @@ function mockProjects(projects: typeof shop[]) {
 
 function renderAppAt(path: string, { strict = false } = {}) {
   window.history.pushState({}, "", path);
-  return render(strict ? <StrictMode><App /></StrictMode> : <App />);
+  return render(
+    strict ? (
+      <StrictMode>
+        <App />
+      </StrictMode>
+    ) : (
+      <App />
+    ),
+  );
 }
 
 function createDeferred<T>() {
@@ -71,7 +80,54 @@ function apiError(
   );
 }
 
+function mockCreateFailure() {
+  server.use(
+    http.post("/api/v1/projects", () =>
+      HttpResponse.json(
+        {
+          error: {
+            code: "validation_failed",
+            message: "RAW MESSAGE",
+            request_id: "req-project",
+            fields: { slug: "RAW FIELD" },
+          },
+        },
+        { status: 422 },
+      ),
+    ),
+  );
+}
+
 describe("ProjectsPage", () => {
+  it("renders and creates projects in Simplified Chinese without translating data", async () => {
+    mockSession({ role: "admin" });
+    mockProjects([shop]);
+    await changeLocale("zh-CN");
+    renderAppAt("/projects");
+
+    expect(await screen.findByRole("heading", { name: "项目" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "新建项目" }));
+    expect(screen.getByLabelText("项目标识")).toBeVisible();
+    expect(screen.getByText("Storefront runtime configuration.")).toBeVisible();
+  });
+
+  it("localizes project validation by field key and hides server text", async () => {
+    mockSession({ role: "admin" });
+    mockProjects([shop]);
+    mockCreateFailure();
+    await changeLocale("zh-CN");
+    renderAppAt("/projects");
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "新建项目" }));
+    await user.type(screen.getByLabelText("项目标识"), "shop");
+    await user.type(screen.getByLabelText("项目名称"), "Shop");
+    await user.click(screen.getByRole("button", { name: "创建项目" }));
+
+    expect(await screen.findByText("项目标识不符合要求。")).toBeVisible();
+    expect(screen.queryByText(/RAW/)).not.toBeInTheDocument();
+  });
+
   it("does not render project creation for a member", async () => {
     mockSession({ role: "member" });
     mockProjects([shop]);
@@ -95,7 +151,7 @@ describe("ProjectsPage", () => {
       screen.getByText("Storefront runtime configuration."),
     ).toBeInTheDocument();
     expect(screen.getByText(/Updated.+2026/u)).toBeInTheDocument();
-    expect(screen.queryByText("Hidden payroll")) .not.toBeInTheDocument();
+    expect(screen.queryByText("Hidden payroll")).not.toBeInTheDocument();
   });
 
   it("teaches the next step when there are no visible projects", async () => {
@@ -107,7 +163,9 @@ describe("ProjectsPage", () => {
     expect(
       await screen.findByRole("heading", { name: "No projects yet" }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/administrator can grant access/u)).toBeInTheDocument();
+    expect(
+      screen.getByText(/administrator can grant access/u),
+    ).toBeInTheDocument();
   });
 
   it("announces a failed project load and retries it successfully", async () => {
@@ -135,7 +193,9 @@ describe("ProjectsPage", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Loading projects");
 
     releaseRetry.resolve();
-    expect(await screen.findByRole("link", { name: "Shop" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("link", { name: "Shop" }),
+    ).toBeInTheDocument();
     const result = screen.getByText("Projects loaded.");
     expect(result).toHaveAttribute("aria-live", "polite");
   });
@@ -165,7 +225,9 @@ describe("ProjectsPage", () => {
 
     renderAppAt("/projects", { strict: true });
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New project" }),
+    );
     const dialog = screen.getByRole("dialog", { name: "New project" });
     expect(within(dialog).getByLabelText("Project slug")).toHaveFocus();
     await user.type(within(dialog).getByLabelText("Project slug"), "payments");
@@ -174,7 +236,9 @@ describe("ProjectsPage", () => {
       within(dialog).getByLabelText("Description"),
       "Payment controls",
     );
-    await user.click(within(dialog).getByRole("button", { name: "Create project" }));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create project" }),
+    );
     expect(
       within(dialog).getByRole("button", { name: "Creating project…" }),
     ).toBeDisabled();
@@ -182,10 +246,9 @@ describe("ProjectsPage", () => {
       within(dialog).getByRole("button", { name: "Creating project…" }),
     );
 
-    expect(await screen.findByRole("link", { name: "Payments" })).toHaveAttribute(
-      "href",
-      "/projects/payments",
-    );
+    expect(
+      await screen.findByRole("link", { name: "Payments" }),
+    ).toHaveAttribute("href", "/projects/payments");
     expect(requests).toBe(1);
     expect(csrf).toBe("csrf-admin");
     expect(requestBody).toEqual({
@@ -237,14 +300,20 @@ describe("ProjectsPage", () => {
 
     renderAppAt("/projects");
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New project" }),
+    );
     await user.type(screen.getByLabelText("Project slug"), "payments");
     await user.type(screen.getByLabelText("Project name"), "Payments");
-    expect(await screen.findByRole("link", { name: "Shop" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("link", { name: "Shop" }),
+    ).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Create project" }));
 
-    expect(await screen.findByRole("link", { name: "Payments" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("link", { name: "Payments" }),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -262,16 +331,16 @@ describe("ProjectsPage", () => {
 
     renderAppAt("/projects");
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New project" }),
+    );
     await user.type(screen.getByLabelText("Project slug"), "Bad Slug");
     await user.type(screen.getByLabelText("Project name"), " ");
     await user.click(screen.getByRole("button", { name: "Create project" }));
 
     const slug = await screen.findByLabelText("Project slug");
     expect(slug).toHaveValue("Bad Slug");
-    expect(slug).toHaveAccessibleDescription(
-      "Use lowercase letters, numbers, and hyphens.",
-    );
+    expect(slug).toHaveAccessibleDescription("Project slug is invalid.");
     expect(slug).toHaveAttribute("aria-invalid", "true");
     expect(screen.getByLabelText("Project name")).toHaveValue(" ");
   });
@@ -291,7 +360,9 @@ describe("ProjectsPage", () => {
 
     renderAppAt("/projects");
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New project" }),
+    );
     await user.type(screen.getByLabelText("Project slug"), "shop");
     await user.type(screen.getByLabelText("Project name"), "Second shop");
     await user.click(screen.getByRole("button", { name: "Create project" }));
@@ -335,7 +406,9 @@ describe("ProjectsPage", () => {
 
     renderAppAt("/projects", { strict: true });
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New project" }),
+    );
     await user.type(screen.getByLabelText("Project slug"), "payments");
     await user.type(screen.getByLabelText("Project name"), "Payments");
     await user.click(screen.getByRole("button", { name: "Create project" }));
@@ -347,7 +420,9 @@ describe("ProjectsPage", () => {
     expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Create project" }));
 
-    expect(await screen.findByRole("link", { name: "Payments" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("link", { name: "Payments" }),
+    ).toBeInTheDocument();
     expect(requests).toBe(2);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
@@ -377,7 +452,9 @@ describe("ProjectsPage", () => {
 
     renderAppAt("/projects", { strict: true });
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "New project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "New project" }),
+    );
     await user.type(screen.getByLabelText("Project slug"), "payments");
     await user.type(screen.getByLabelText("Project name"), "Payments");
     await user.click(screen.getByRole("button", { name: "Create project" }));
@@ -385,10 +462,14 @@ describe("ProjectsPage", () => {
 
     expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
     await user.keyboard("{Escape}");
-    expect(screen.getByRole("dialog", { name: "New project" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: "New project" }),
+    ).toBeInTheDocument();
 
     releaseRequest.resolve();
-    expect(await screen.findByRole("link", { name: "Payments" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("link", { name: "Payments" }),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 });

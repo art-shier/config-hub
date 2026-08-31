@@ -1,5 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { APIError } from "../api/client";
 import type {
   Environment as ProjectEnvironment,
@@ -11,6 +18,9 @@ import { ModalDialog } from "../components/ModalDialog";
 import { ConfigTable } from "../features/config/ConfigTable";
 import { ProjectMembers } from "../features/members/ProjectMembers";
 import { VersionList } from "../features/versions/VersionList";
+import { localizePresentFields } from "../i18n/apiErrors";
+import { formatDate } from "../i18n/format";
+import type { SupportedLocale } from "../i18n/locales";
 
 interface ProjectDetailResponse {
   project: ProjectDetail;
@@ -24,20 +34,24 @@ type ProjectTab = "configuration" | "versions" | "members";
 type LoadFailure = "not-found" | "unavailable" | null;
 
 const projectSlugPattern = /^[a-z0-9][a-z0-9-]{0,62}$/u;
-const projectTabs: Array<{ id: ProjectTab; label: string }> = [
-  { id: "configuration", label: "Configuration" },
-  { id: "versions", label: "Versions" },
-  { id: "members", label: "Members" },
-];
+const projectTabs: ProjectTab[] = ["configuration", "versions", "members"];
 
 export function ProjectPage() {
   const { client, user } = useAuth();
+  const { i18n, t } = useTranslation("projects");
+  const locale: SupportedLocale =
+    i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en-US";
   const { project: projectSlug = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [failure, setFailure] = useState<LoadFailure>(null);
-  const [loadAnnouncement, setLoadAnnouncement] = useState("Loading project…");
+  const [loadAnnouncement, setLoadAnnouncement] = useState<
+    | "loadingProject"
+    | "projectLoaded"
+    | "projectNotFound"
+    | "projectUnavailable"
+  >("loadingProject");
   const [creatingEnvironment, setCreatingEnvironment] = useState(false);
   const [revisionRefreshEpoch, setRevisionRefreshEpoch] = useState(0);
   const newEnvironmentButtonRef = useRef<HTMLButtonElement>(null);
@@ -48,11 +62,11 @@ export function ProjectPage() {
     setProject(null);
     setFailure(null);
     setLoading(true);
-    setLoadAnnouncement("Loading project…");
+    setLoadAnnouncement("loadingProject");
     if (!projectSlugPattern.test(projectSlug)) {
       setLoading(false);
       setFailure("not-found");
-      setLoadAnnouncement("Project not found.");
+      setLoadAnnouncement("projectNotFound");
       return;
     }
     try {
@@ -61,7 +75,7 @@ export function ProjectPage() {
       );
       if (loadGenerationRef.current === generation) {
         setProject(response.project);
-        setLoadAnnouncement("Project loaded.");
+        setLoadAnnouncement("projectLoaded");
       }
     } catch (error) {
       if (loadGenerationRef.current === generation) {
@@ -71,7 +85,9 @@ export function ProjectPage() {
             : "unavailable";
         setFailure(nextFailure);
         setLoadAnnouncement(
-          nextFailure === "not-found" ? "Project not found." : "Project unavailable.",
+          nextFailure === "not-found"
+            ? "projectNotFound"
+            : "projectUnavailable",
         );
       }
     } finally {
@@ -110,7 +126,9 @@ export function ProjectPage() {
 
   function closeEnvironmentCreation() {
     setCreatingEnvironment(false);
-    window.requestAnimationFrame(() => newEnvironmentButtonRef.current?.focus());
+    window.requestAnimationFrame(() =>
+      newEnvironmentButtonRef.current?.focus(),
+    );
   }
 
   function addEnvironment(environment: ProjectEnvironment) {
@@ -131,14 +149,18 @@ export function ProjectPage() {
   }
 
   function handleRevisionChanged(revision: Revision) {
-    setProject((current) => current === null ? current : {
-      ...current,
-      environments: current.environments.map((environment) =>
-        environment.slug === selectedEnvironment
-          ? { ...environment, current_revision_id: revision.id || null }
-          : environment,
-      ),
-    });
+    setProject((current) =>
+      current === null
+        ? current
+        : {
+            ...current,
+            environments: current.environments.map((environment) =>
+              environment.slug === selectedEnvironment
+                ? { ...environment, current_revision_id: revision.id || null }
+                : environment,
+            ),
+          },
+    );
     setRevisionRefreshEpoch((current) => current + 1);
   }
 
@@ -146,7 +168,7 @@ export function ProjectPage() {
     return (
       <section className="resource-page">
         <p className="loading-line" role="status">
-          {loadAnnouncement}
+          {t(`states.${loadAnnouncement}`)}
         </p>
       </section>
     );
@@ -155,29 +177,32 @@ export function ProjectPage() {
     const notFound = failure === "not-found";
     return (
       <section className="resource-page page-error-state">
-        <p className="eyebrow">Project register</p>
-        <h1>{notFound ? "Project not found" : "Project unavailable"}</h1>
+        <p className="eyebrow">{t("detail.projectIndex")}</p>
+        <h1>
+          {notFound ? t("detail.notFoundTitle") : t("detail.unavailableTitle")}
+        </h1>
         <p>
           {notFound
-            ? "This project address does not match an available project."
-            : "The project couldn’t be loaded. Check the server and try again."}
+            ? t("errors.projectNotFound")
+            : t("errors.projectUnavailable")}
         </p>
         <button
           className="secondary-button"
           type="button"
           onClick={() => void loadProject()}
         >
-          Retry
+          {t("actions.retry")}
         </button>
         <Link className="text-link" to="/projects">
-          Return to projects
+          {t("actions.returnToProjects")}
         </Link>
       </section>
     );
   }
 
   const canManage = user?.role === "admin" && project.permission === "admin";
-  const canWrite = project.permission === "admin" || project.permission === "editor";
+  const canWrite =
+    project.permission === "admin" || project.permission === "editor";
   const selectedEnvironmentRecord = project.environments.find(
     (environment) => environment.slug === selectedEnvironment,
   );
@@ -192,7 +217,8 @@ export function ProjectPage() {
         nextIndex = (currentIndex + 1) % projectTabs.length;
         break;
       case "ArrowLeft":
-        nextIndex = (currentIndex - 1 + projectTabs.length) % projectTabs.length;
+        nextIndex =
+          (currentIndex - 1 + projectTabs.length) % projectTabs.length;
         break;
       case "Home":
         nextIndex = 0;
@@ -205,46 +231,56 @@ export function ProjectPage() {
     }
     event.preventDefault();
     const nextTab = projectTabs[nextIndex];
-    setSearchParams(approvedSearch(selectedEnvironment, nextTab.id));
-    document.getElementById(`project-tab-${nextTab.id}`)?.focus();
+    setSearchParams(approvedSearch(selectedEnvironment, nextTab));
+    document.getElementById(`project-tab-${nextTab}`)?.focus();
   }
 
   return (
-    <article className="resource-page project-workspace" aria-labelledby="project-title">
+    <article
+      className="resource-page project-workspace"
+      aria-labelledby="project-title"
+    >
       <div className="sr-status" aria-live="polite" aria-atomic="true">
-        {loadAnnouncement}
+        {t(`states.${loadAnnouncement}`)}
       </div>
       <Link className="back-link" to="/projects">
-        ← Project register
+        {t("detail.back")}
       </Link>
       <header className="project-heading">
         <div>
-          <p className="eyebrow">Project / {project.slug}</p>
+          <p className="eyebrow">
+            {t("detail.eyebrow", { slug: project.slug })}
+          </p>
           <h1 id="project-title">{project.name}</h1>
-          <p>{project.description || "No project description provided."}</p>
+          <p>{project.description || t("detail.noDescription")}</p>
         </div>
         <dl className="project-facts">
           <div>
-            <dt>Slug</dt>
+            <dt>{t("detail.slug")}</dt>
             <dd className="code-label">{project.slug}</dd>
           </div>
           <div>
-            <dt>Access</dt>
-            <dd>{titleCase(project.permission)} access</dd>
+            <dt>{t("detail.access")}</dt>
+            <dd>{t(`permissions.${project.permission}`)}</dd>
           </div>
           <div>
-            <dt>Updated</dt>
-            <dd>{formatDate(project.updated_at)}</dd>
+            <dt>{t("detail.updated")}</dt>
+            <dd>
+              {formatDate(project.updated_at, locale, t("states.unavailable"))}
+            </dd>
           </div>
         </dl>
       </header>
 
-      <section className="environment-section" aria-labelledby="environments-title">
+      <section
+        className="environment-section"
+        aria-labelledby="environments-title"
+      >
         <header className="section-heading">
           <div>
-            <p className="section-index">Environment register</p>
-            <h2 id="environments-title">Environments</h2>
-            <p>Select the environment carried through every project section.</p>
+            <p className="section-index">{t("detail.environmentIndex")}</p>
+            <h2 id="environments-title">{t("detail.environments")}</h2>
+            <p>{t("detail.environmentSummary")}</p>
           </div>
           {canManage ? (
             <button
@@ -253,24 +289,26 @@ export function ProjectPage() {
               type="button"
               onClick={() => setCreatingEnvironment(true)}
             >
-              New environment
+              {t("detail.createEnvironment")}
             </button>
           ) : null}
         </header>
 
         {project.environments.length === 0 ? (
           <div className="empty-state compact-empty">
-            <h3>No environments yet</h3>
+            <h3>{t("empty.environmentTitle")}</h3>
             <p>
               {canManage
-                ? "Create an environment before publishing configuration."
-                : "A project administrator has not created an environment yet."}
+                ? t("empty.adminEnvironment")
+                : t("empty.memberEnvironment")}
             </p>
           </div>
         ) : (
           <>
             <div className="environment-picker">
-              <label htmlFor="active-environment">Active environment</label>
+              <label htmlFor="active-environment">
+                {t("detail.activeEnvironment")}
+              </label>
               <select
                 id="active-environment"
                 value={selectedEnvironment}
@@ -287,7 +325,10 @@ export function ProjectPage() {
                 ))}
               </select>
             </div>
-            <ul className="environment-list" aria-label="Project environments">
+            <ul
+              className="environment-list"
+              aria-label={t("detail.environmentList")}
+            >
               {project.environments.map((environment) => (
                 <li
                   key={environment.id}
@@ -303,8 +344,10 @@ export function ProjectPage() {
                   </div>
                   <span>
                     {environment.current_revision_id
-                      ? `Current revision ${environment.current_revision_id}`
-                      : "No revision published"}
+                      ? t("detail.currentRevision", {
+                          revision: environment.current_revision_id,
+                        })
+                      : t("detail.noRevision")}
                   </span>
                 </li>
               ))}
@@ -313,34 +356,40 @@ export function ProjectPage() {
         )}
       </section>
 
-      <nav className="project-tabs" role="tablist" aria-label="Project sections">
+      <nav
+        className="project-tabs"
+        role="tablist"
+        aria-label={t("detail.tabList")}
+      >
         {projectTabs.map((tab, index) => (
           <Link
-            key={tab.id}
-            id={`project-tab-${tab.id}`}
+            key={tab}
+            id={`project-tab-${tab}`}
             role="tab"
-            aria-controls={`project-panel-${tab.id}`}
-            aria-selected={activeTab === tab.id}
-            tabIndex={activeTab === tab.id ? 0 : -1}
-            className={activeTab === tab.id ? "project-tab active-tab" : "project-tab"}
-            to={{ search: `?${approvedSearch(selectedEnvironment, tab.id)}` }}
+            aria-controls={`project-panel-${tab}`}
+            aria-selected={activeTab === tab}
+            tabIndex={activeTab === tab ? 0 : -1}
+            className={
+              activeTab === tab ? "project-tab active-tab" : "project-tab"
+            }
+            to={{ search: `?${approvedSearch(selectedEnvironment, tab)}` }}
             onKeyDown={(event) => handleTabKeyDown(event, index)}
           >
-            {tab.label}
+            {t(`tabs.${tab}`)}
           </Link>
         ))}
       </nav>
 
       {projectTabs.map((tab) => (
         <section
-          key={tab.id}
-          id={`project-panel-${tab.id}`}
+          key={tab}
+          id={`project-panel-${tab}`}
           className="project-tab-panel"
           role="tabpanel"
-          aria-labelledby={`project-tab-${tab.id}`}
-          hidden={activeTab !== tab.id}
+          aria-labelledby={`project-tab-${tab}`}
+          hidden={activeTab !== tab}
         >
-          {activeTab === tab.id && tab.id === "configuration" ? (
+          {activeTab === tab && tab === "configuration" ? (
             <ConfigTable
               client={client}
               projectSlug={project.slug}
@@ -350,7 +399,7 @@ export function ProjectPage() {
               onRevisionChanged={handleRevisionChanged}
             />
           ) : null}
-          {activeTab === tab.id && tab.id === "versions" ? (
+          {activeTab === tab && tab === "versions" ? (
             <VersionList
               client={client}
               projectSlug={project.slug}
@@ -360,7 +409,7 @@ export function ProjectPage() {
               onRevisionChanged={handleRevisionChanged}
             />
           ) : null}
-          {activeTab === tab.id && tab.id === "members" ? (
+          {activeTab === tab && tab === "members" ? (
             <ProjectMembers projectSlug={project.slug} canManage={canManage} />
           ) : null}
         </section>
@@ -392,6 +441,7 @@ function CreateEnvironmentDialog({
   onCreated(environment: ProjectEnvironment): void;
   projectSlug: string;
 }) {
+  const { t } = useTranslation("projects");
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -430,19 +480,20 @@ function CreateEnvironmentDialog({
         return;
       }
       if (error instanceof APIError && error.status === 422) {
-        setFieldErrors(error.fields);
-        setFormError("Check the marked fields and try again.");
+        setFieldErrors(
+          localizePresentFields(error.fields, {
+            slug: "validation.environment.slug",
+            name: "validation.environment.name",
+          }),
+        );
+        setFormError("errors.checkFields");
       } else if (
         error instanceof APIError &&
         (error.status === 409 || error.code === "resource_conflict")
       ) {
-        setFormError(
-          "That environment slug is already in use. Choose another slug.",
-        );
+        setFormError("errors.environmentConflict");
       } else {
-        setFormError(
-          "The environment couldn’t be created. Keep this draft and try again.",
-        );
+        setFormError("errors.environmentUnavailableCreate");
       }
     } finally {
       if (operationGenerationRef.current === operationGeneration) {
@@ -461,8 +512,8 @@ function CreateEnvironmentDialog({
     >
       <header className="dialog-heading">
         <div>
-          <p className="section-index">Environment register / New</p>
-          <h2 id="new-environment-title">New environment</h2>
+          <p className="section-index">{t("environmentForm.index")}</p>
+          <h2 id="new-environment-title">{t("environmentForm.title")}</h2>
         </div>
         <button
           className="text-button"
@@ -470,12 +521,16 @@ function CreateEnvironmentDialog({
           disabled={submitting}
           onClick={onCancel}
         >
-          Cancel
+          {t("common:actions.cancel")}
         </button>
       </header>
-      <form className="resource-form" onSubmit={(event) => void handleSubmit(event)}>
+      <form
+        noValidate
+        className="resource-form"
+        onSubmit={(event) => void handleSubmit(event)}
+      >
         <div className="form-field">
-          <label htmlFor="environment-slug">Environment slug</label>
+          <label htmlFor="environment-slug">{t("environmentForm.slug")}</label>
           <input
             ref={slugRef}
             id="environment-slug"
@@ -494,12 +549,12 @@ function CreateEnvironmentDialog({
           />
           {fieldErrors.slug ? (
             <p className="field-error" id="environment-slug-error">
-              {fieldErrors.slug}
+              {t(fieldErrors.slug)}
             </p>
           ) : null}
         </div>
         <div className="form-field">
-          <label htmlFor="environment-name">Environment name</label>
+          <label htmlFor="environment-name">{t("environmentForm.name")}</label>
           <input
             id="environment-name"
             name="name"
@@ -514,15 +569,17 @@ function CreateEnvironmentDialog({
           />
           {fieldErrors.name ? (
             <p className="field-error" id="environment-name-error">
-              {fieldErrors.name}
+              {t(fieldErrors.name)}
             </p>
           ) : null}
         </div>
         <div className="form-message" aria-live="polite">
-          {formError ? <p role="alert">{formError}</p> : null}
+          {formError ? <p role="alert">{t(formError)}</p> : null}
         </div>
         <button className="primary-button" type="submit" disabled={submitting}>
-          {submitting ? "Creating environment…" : "Create environment"}
+          {submitting
+            ? t("environmentForm.submitting")
+            : t("environmentForm.submit")}
         </button>
       </form>
     </ModalDialog>
@@ -530,9 +587,7 @@ function CreateEnvironmentDialog({
 }
 
 function safeTab(value: string | null): ProjectTab {
-  return value === "versions" || value === "members"
-    ? value
-    : "configuration";
+  return value === "versions" || value === "members" ? value : "configuration";
 }
 
 function approvedSearch(environment: string, tab: ProjectTab): URLSearchParams {
@@ -544,22 +599,4 @@ function approvedSearch(environment: string, tab: ProjectTab): URLSearchParams {
     next.set("tab", tab);
   }
   return next;
-}
-
-function titleCase(value: string): string {
-  return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
-}
-
-function formatDate(value: string): string {
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) {
-    return "Time unavailable";
-  }
-  try {
-    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(
-      date,
-    );
-  } catch {
-    return date.toISOString().slice(0, 10);
-  }
 }
