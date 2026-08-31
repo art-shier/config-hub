@@ -7,11 +7,11 @@ ConfigHub 是面向单个内部研发团队的轻量配置中心。管理员和�
 - `dist/confighub-server`：Web、HTTP API、账号同步、SQLite 与在线备份；
 - `dist/confighub`：只读 CLI，不直接访问 SQLite。
 
-仓库提供 Linux GitHub Release、独立安装/部署脚本和 systemd unit；不提供 Docker、Caddy 或外部数据库。
+仓库通过 GitHub Release 提供 Linux Server+Web 和跨平台 CLI，并分别提供命令行安装/部署脚本；不提供 Docker、Caddy 或外部数据库。
 
 ## 前置条件
 
-- Linux 和 Bash；
+- 源码构建、完整质量门禁与 Server 部署使用 Linux 和 Bash；CLI 安装平台见下文；
 - Go `1.25.x`；
 - Node.js `^22.22.2`、`^24.15.0` 或 `>=26.0.0`，以及随 Node 提供的 npm；
 - 执行浏览器验收时需要 OpenSSL 和 Chromium。测试会依次使用 `PLAYWRIGHT_CHROMIUM_EXECUTABLE`、系统 Chrome/Chromium，最后使用 Playwright 安装的 Chromium。没有系统浏览器时可执行 `cd web && npx playwright install chromium`。
@@ -20,17 +20,32 @@ Node.js 23、25 以及低于上述 patch 下限的版本不受支持，构建脚
 
 ## Release 产物与安装
 
-推送严格格式的 `vMAJOR.MINOR.PATCH` 标签后，GitHub Release 会发布两个彼此独立的产品，支持 Linux `amd64` 和 `arm64`：
+推送严格格式的 `vMAJOR.MINOR.PATCH` 标签后，GitHub Release 会发布两个彼此独立的产品：
 
-- `config-hub-server_VERSION_linux_ARCH.tar.gz`：`confighub-server`、内嵌 Web、配置示例和 systemd unit；
-- `config-hub-cli_VERSION_linux_ARCH.tar.gz`：独立的 `confighub` CLI；
-- `checksums.txt`：四个归档的 SHA-256 校验值。
+| 产品 | 支持平台 | 部署方式 |
+| --- | --- | --- |
+| Server + Web | Linux `amd64`、Linux `arm64` | `deploy-server.sh` + systemd |
+| CLI | Linux `amd64`/`arm64`、macOS `arm64`、Windows `amd64` | 平台对应的命令行安装脚本 |
 
-Server 安装不会附带 CLI；需要在哪台机器使用 CLI，就在那台机器单独安装。两个脚本只从 `art-shier/config-hub` 的 GitHub Release 下载匹配当前 Linux 架构的归档，并在安装前验证校验值、归档结构和二进制版本。
+每个 Release 正好包含六个归档和一个校验清单：
+
+```text
+config-hub-server_VERSION_linux_amd64.tar.gz
+config-hub-server_VERSION_linux_arm64.tar.gz
+config-hub-cli_VERSION_linux_amd64.tar.gz
+config-hub-cli_VERSION_linux_arm64.tar.gz
+config-hub-cli_VERSION_darwin_arm64.tar.gz
+config-hub-cli_VERSION_windows_amd64.zip
+checksums.txt
+```
+
+Server 安装不会附带 CLI；需要在哪台机器使用 CLI，就在那台机器单独安装。安装器只从 `art-shier/config-hub` 的 GitHub Release 下载当前平台的归档，并在替换现有程序前验证 SHA-256、归档结构和二进制版本。
 
 ### 安装 CLI
 
-先下载并审阅安装脚本：
+#### Linux amd64/arm64
+
+先下载并审阅 Bash 安装脚本：
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/art-shier/config-hub/main/scripts/install-cli.sh
@@ -51,7 +66,74 @@ mkdir -p "$HOME/.local/bin"
 bash install-cli.sh --version v1.2.3 --install-dir "$HOME/.local/bin"
 ```
 
-安装后可用 `confighub version` 核对版本。自定义目录需要加入 `PATH`。
+安装后用 `confighub version` 核对版本。自定义目录需要自行加入 `PATH`。
+
+#### macOS arm64
+
+macOS 使用同一个 Bash 脚本，并兼容系统自带的 `/bin/bash` 3.2。先下载和审阅，再安装最新版本到 `/usr/local/bin`：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/art-shier/config-hub/main/scripts/install-cli.sh
+less install-cli.sh
+sudo /bin/bash install-cli.sh
+confighub version
+```
+
+也可以固定版本，或安装到当前用户可写的绝对目录：
+
+```bash
+sudo /bin/bash install-cli.sh --version v1.2.3
+mkdir -p "$HOME/.local/bin"
+/bin/bash install-cli.sh --version v1.2.3 --install-dir "$HOME/.local/bin"
+```
+
+自定义目录需要自行加入 `PATH`。
+
+#### Windows amd64
+
+Windows 安装器是 PowerShell 脚本，没有图形安装界面、快捷方式或“程序和功能”注册项。建议先下载到本地并审阅；下面的执行策略调整只作用于当前 PowerShell 进程：
+
+```powershell
+Invoke-WebRequest `
+  https://raw.githubusercontent.com/art-shier/config-hub/main/scripts/install-cli.ps1 `
+  -OutFile .\install-cli.ps1
+Get-Content -Raw .\install-cli.ps1
+Unblock-File .\install-cli.ps1
+Set-ExecutionPolicy -Scope Process Bypass -Force
+& .\install-cli.ps1
+```
+
+默认安装到 `%LOCALAPPDATA%\ConfigHub\bin`。安装成功后，脚本会把这个绝对目录加入用户 `PATH`，并同步更新当前 PowerShell 的 `PATH`；已打开的其他终端需要重新启动。固定版本和自定义目录示例：
+
+```powershell
+& .\install-cli.ps1 -Version v1.2.3
+& .\install-cli.ps1 -Version v1.2.3 -InstallDir C:\Tools\ConfigHub
+confighub version
+```
+
+### 未签名程序与下载来源标记
+
+首批跨平台 CLI Release 不做 Apple 公证，也不做 Windows Authenticode 签名。安装器只在下载 URL、SHA-256 和归档成员全部验证通过后，才从待执行的暂存二进制按需移除 macOS `com.apple.quarantine` 或 Windows Mark-of-the-Web；校验失败时不会处理来源标记或替换现有 CLI。
+
+安装器不会关闭 Gatekeeper、SmartScreen、Defender、杀毒软件，也不会全局放宽 PowerShell 执行策略。手动解压或绕过安装器运行未签名二进制时，操作系统仍可能按自身安全策略提示或阻止执行。
+
+### 升级与卸载 CLI
+
+重新运行当前平台的安装脚本即可原子升级；固定版本时继续传入同一个版本参数。Linux/macOS 卸载只删除实际安装位置的 `confighub`，例如：
+
+```bash
+sudo rm -f /usr/local/bin/confighub
+rm -f "$HOME/.local/bin/confighub"
+```
+
+Windows 默认安装的 CLI 可这样删除；自定义安装则只删除对应绝对路径下的 `confighub.exe`：
+
+```powershell
+Remove-Item -LiteralPath "$env:LOCALAPPDATA\ConfigHub\bin\confighub.exe"
+Remove-Item -LiteralPath 'C:\Tools\ConfigHub\confighub.exe'
+```
+
+是否从用户 `PATH` 移除安装目录由用户明确决定。不要递归删除仍包含其他文件的默认或自定义目录。
 
 ### 首次部署 Server + Web
 
@@ -99,7 +181,7 @@ curl -fsS http://127.0.0.1:8080/api/v1/health/live
 curl -fsS http://127.0.0.1:8080/api/v1/health/ready
 ```
 
-`reload` 发送 `SIGHUP`，用于重新载入 `/etc/confighub/users.yaml`。若要卸载 CLI，只需删除实际安装目录中的 `confighub`。保守卸载 Server 时先停止并禁用服务，再移除 unit 和已安装二进制；默认保留配置、数据库和备份：
+`reload` 发送 `SIGHUP`，用于重新载入 `/etc/confighub/users.yaml`。保守卸载 Server 时先停止并禁用服务，再移除 unit 和已安装二进制；默认保留配置、数据库和备份：
 
 ```bash
 sudo systemctl disable --now confighub.service
@@ -314,7 +396,17 @@ git tag v1.2.3
 git push origin v1.2.3
 ```
 
-标签推送会触发发布流水线：重新执行质量门禁，构建四个归档，核对资产与校验清单，在验证全部上传资产后才公开 GitHub Release。标签必须严格匹配 `vMAJOR.MINOR.PATCH`。
+标签推送会触发发布流水线：重新执行质量门禁，在 Ubuntu 上一次性构建六个归档，再让 `macos-14` Apple Silicon 和 `windows-2025` x64 原生运行同一份内部产物。两个原生 smoke 都通过后，最终作业才会公开 GitHub Release。标签必须严格匹配 `vMAJOR.MINOR.PATCH`，公开资产应正好是：
+
+```text
+checksums.txt
+config-hub-cli_VERSION_darwin_arm64.tar.gz
+config-hub-cli_VERSION_linux_amd64.tar.gz
+config-hub-cli_VERSION_linux_arm64.tar.gz
+config-hub-cli_VERSION_windows_amd64.zip
+config-hub-server_VERSION_linux_amd64.tar.gz
+config-hub-server_VERSION_linux_arm64.tar.gz
+```
 
 ## MVP 明确不包含
 
