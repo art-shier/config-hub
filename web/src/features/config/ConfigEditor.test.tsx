@@ -1,9 +1,10 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Link, RouterProvider, createMemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import { APIError } from "../../api/client";
 import type { APIClientContract, Revision } from "../../api/types";
+import { changeLocale } from "../../i18n";
 import { ConfigEditor } from "./ConfigEditor";
 
 const revision: Revision = {
@@ -107,7 +108,38 @@ describe("ConfigEditor", () => {
     renderEditor();
 
     expect(screen.getByLabelText("Value for EMPTY")).toHaveValue("");
+    expect(screen.getByLabelText<HTMLTextAreaElement>("Value for EMPTY").style.resize).toBe("none");
     expect(screen.getByLabelText("Service for EMPTY")).toHaveValue("api");
+  });
+
+  it("keeps the dirty editor tree, focus, selection, and leave protection when the locale changes", async () => {
+    renderEditor(client(), {
+      ...revision,
+      entries: [{ key: "DATABASE_URL", value: "postgres", service: "api" }],
+    });
+    const user = userEvent.setup();
+    const value = screen.getByLabelText<HTMLTextAreaElement>("Value for DATABASE_URL");
+    await user.type(value, "-draft");
+    value.setSelectionRange(3, 3);
+
+    await act(async () => {
+      await changeLocale("zh-CN");
+    });
+
+    const localizedValue = await screen.findByLabelText<HTMLTextAreaElement>("DATABASE_URL 的值");
+    expect(localizedValue).toBe(value);
+    expect(localizedValue).toHaveValue("postgres-draft");
+    expect(localizedValue).toHaveFocus();
+    expect(localizedValue.selectionStart).toBe(3);
+    expect(localizedValue.selectionEnd).toBe(3);
+    const dirtyEvent = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(dirtyEvent);
+    expect(dirtyEvent.defaultPrevented).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "取消编辑" }));
+    expect(screen.getByRole("dialog", { name: "不保存就离开？" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续编辑" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "放弃并离开" })).toBeInTheDocument();
   });
 
   it("adds, edits, and deletes rows then sends one complete trimmed snapshot", async () => {
@@ -289,6 +321,26 @@ describe("ConfigEditor", () => {
     expect(api.put).not.toHaveBeenCalled();
   });
 
+  it("relocalizes visible client validation without changing the invalid draft", async () => {
+    renderEditor();
+    const user = userEvent.setup();
+    const key = screen.getByLabelText("Key for EMPTY");
+    await user.clear(key);
+    await user.type(key, "invalid key");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(key).toHaveAccessibleDescription(/Use letters, numbers/u);
+
+    await act(async () => {
+      await changeLocale("zh-CN");
+    });
+
+    const localizedKey = screen.getByLabelText("invalid key 的键");
+    expect(localizedKey).toBe(key);
+    expect(localizedKey).toHaveValue("invalid key");
+    expect(localizedKey).toHaveAccessibleDescription("请使用字母、数字和下划线，并以字母或下划线开头。");
+    expect(screen.getByRole("alert")).toHaveTextContent("请检查标记的字段后重试。");
+  });
+
   it("maps 422 entry fields back to stable draft rows and retains all input", async () => {
     const api = client();
     vi.mocked(api.put).mockRejectedValue(
@@ -311,11 +363,37 @@ describe("ConfigEditor", () => {
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     expect(await screen.findByLabelText("Value for SECOND")).toHaveValue("two retained");
-    expect(screen.getByLabelText("Value for SECOND")).toHaveAccessibleDescription("Value is too long.");
-    expect(screen.getByLabelText("Service for SECOND")).toHaveAccessibleDescription("Service is too long.");
-    expect(screen.getByLabelText("Change message")).toHaveAccessibleDescription("Message is required.");
+    expect(screen.getByLabelText("Value for SECOND")).toHaveAccessibleDescription("The submitted value is invalid.");
+    expect(screen.getByLabelText("Service for SECOND")).toHaveAccessibleDescription("The submitted service is invalid.");
+    expect(screen.getByLabelText("Change message")).toHaveAccessibleDescription("Review the change message.");
     expect(screen.getByRole("alert")).toHaveTextContent("Review the marked fields");
     expect(screen.queryByText("SECRET")).not.toBeInTheDocument();
+    expect(screen.queryByText("Value is too long.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Service is too long.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Message is required.")).not.toBeInTheDocument();
+  });
+
+  it("relocalizes safe server validation without recovering API-provided values", async () => {
+    const api = client();
+    vi.mocked(api.put).mockRejectedValue(
+      new APIError(422, "validation_failed", "RAW ENVELOPE", "req", {
+        "entries[0].value": "RAW FIELD VALUE",
+        message: "RAW MESSAGE VALUE",
+      }),
+    );
+    renderEditor(api);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText("Value for EMPTY"), "draft");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByLabelText("Value for EMPTY")).toHaveAccessibleDescription("The submitted value is invalid.");
+
+    await act(async () => {
+      await changeLocale("zh-CN");
+    });
+
+    expect(screen.getByLabelText("EMPTY 的值")).toHaveAccessibleDescription("提交的值无效。");
+    expect(screen.getByLabelText("变更说明")).toHaveAccessibleDescription("请检查变更说明。");
+    expect(document.body.textContent).not.toContain("RAW");
   });
 
   it("shows only expected top-level 422 fields inline and keeps the exact draft", async () => {
@@ -334,13 +412,15 @@ describe("ConfigEditor", () => {
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     const entriesEditor = await screen.findByRole("group", { name: "Configuration entries" });
-    expect(within(entriesEditor).getByText("Combined entry content must be at most 1 byte.")).toBeInTheDocument();
-    expect(entriesEditor).toHaveAccessibleDescription("Combined entry content must be at most 1 byte.");
+    expect(within(entriesEditor).getByText("Review the configuration entries.")).toBeInTheDocument();
+    expect(entriesEditor).toHaveAccessibleDescription("Review the configuration entries.");
     expect(screen.getByLabelText("Value for EMPTY")).toHaveValue(" exact retained value ");
     expect(screen.getByLabelText("Change message")).toHaveValue("retained message");
-    expect(screen.getByLabelText("Change message")).toHaveAccessibleDescription("Change message must be shorter.");
+    expect(screen.getByLabelText("Change message")).toHaveAccessibleDescription("Review the change message.");
     expect(screen.queryByText("RAW ENVELOPE SECRET")).not.toBeInTheDocument();
     expect(screen.queryByText("UNKNOWN FIELD SECRET")).not.toBeInTheDocument();
+    expect(screen.queryByText("Combined entry content must be at most 1 byte.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Change message must be shorter.")).not.toBeInTheDocument();
   });
 
   it("installs dirty unload and router guards and supports Stay or Discard and leave", async () => {
@@ -417,6 +497,17 @@ describe("ConfigEditor", () => {
     expect(screen.getByTestId("conflict-local-EMPTY").textContent).toBe("local draft  ");
     expect(screen.getByRole("textbox", { name: "Latest server value for SERVER_ONLY" }).textContent).toBe("");
     expect(screen.getByText("Absent", { selector: "span" })).toBeInTheDocument();
+
+    await act(async () => {
+      await changeLocale("zh-CN");
+    });
+    expect(screen.getByRole("heading", { name: "最新服务器版本与你的草稿对比" })).toBeInTheDocument();
+    expect(screen.getByLabelText("EMPTY 的值")).toHaveValue("local draft  ");
+    expect(screen.getByRole("button", { name: "将版本 8 用作新基准" })).toBeEnabled();
+    await act(async () => {
+      await changeLocale("en-US");
+    });
+
     await user.click(screen.getByRole("button", { name: "Use version 8 as new base" }));
     expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
     const dirtyEvent = new Event("beforeunload", { cancelable: true });

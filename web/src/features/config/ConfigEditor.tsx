@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { useBlocker } from "react-router-dom";
 import { APIError } from "../../api/client";
 import type { APIClientContract, ConfigEntry, Revision } from "../../api/types";
@@ -25,9 +26,13 @@ interface CurrentRevisionResponse {
 }
 
 type ConflictState = "none" | "needs-refresh" | "refreshing" | "ready" | "refresh-error";
-
-const unsupportedValueEditMessage =
-  "That edit wasn’t applied because the browser did not provide a reliable text range. The original line endings are unchanged.";
+type FormErrorKey =
+  | "editor.validation.review"
+  | "editor.conflict.changed"
+  | "editor.saveUnavailable";
+type ValidationSource =
+  | { kind: "local" }
+  | { kind: "server"; fields: Record<string, string>; submittedIds: string[] };
 
 export function ConfigEditor({
   client,
@@ -46,6 +51,7 @@ export function ConfigEditor({
   onCancel(): void;
   onSaved(revision: Revision): void;
 }) {
+  const { i18n, t } = useTranslation(["config", "common"]);
   const [draft, setDraft] = useState<DraftEntry[]>(() =>
     revision.entries.map(toDraftEntry),
   );
@@ -55,7 +61,7 @@ export function ConfigEditor({
   const [entryErrors, setEntryErrors] = useState<Record<string, EntryErrors>>({});
   const [entriesError, setEntriesError] = useState("");
   const [messageError, setMessageError] = useState("");
-  const [formError, setFormError] = useState("");
+  const [formError, setFormError] = useState<FormErrorKey | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<DraftEntry | null>(null);
@@ -67,6 +73,7 @@ export function ConfigEditor({
   const deleteFocusFrameRef = useRef<number | null>(null);
   const editorHeadingRef = useRef<HTMLHeadingElement>(null);
   const addEntryRef = useRef<HTMLButtonElement>(null);
+  const validationSourceRef = useRef<ValidationSource | null>(null);
 
   const dirty = useMemo(
     () => message !== "" || !sameSnapshot(draft, baselineEntries),
@@ -88,6 +95,30 @@ export function ConfigEditor({
   }, [dirty]);
 
   useEffect(() => {
+    const source = validationSourceRef.current;
+    if (source === null) {
+      return;
+    }
+    if (source.kind === "local") {
+      setEntryErrors(validateEntries(draft, {
+        invalidKey: t("editor.validation.invalidKey"),
+        duplicateKey: t("editor.validation.duplicateKey"),
+      }));
+      return;
+    }
+    const mapped = mapServerValidation(source.fields, source.submittedIds, {
+      entries: t("editor.validation.entries"),
+      message: t("editor.validation.message"),
+      key: t("editor.validation.key"),
+      value: t("editor.validation.value"),
+      service: t("editor.validation.service"),
+    });
+    setEntryErrors(mapped.entryErrors);
+    setEntriesError(mapped.entriesError);
+    setMessageError(mapped.messageError);
+  }, [i18n.resolvedLanguage]);
+
+  useEffect(() => {
     return () => {
       operationGenerationRef.current += 1;
       refreshGenerationRef.current += 1;
@@ -106,12 +137,23 @@ export function ConfigEditor({
       return next;
     });
     setEntriesError("");
-    setFormError("");
+    setFormError(null);
+    const source = validationSourceRef.current;
+    if (source?.kind === "server") {
+      const submittedIndex = source.submittedIds.indexOf(id);
+      if (submittedIndex >= 0) {
+        const fields = { ...source.fields };
+        delete fields[`entries[${submittedIndex}].${field}`];
+        delete fields.entries;
+        validationSourceRef.current = { ...source, fields };
+      }
+    }
   }
 
   function addEntry() {
     setDraft((current) => [...current, toDraftEntry({ key: "", value: "", service: "" })]);
     setEntriesError("");
+    clearServerEntriesError();
   }
 
   function deleteEntry(id: string) {
@@ -122,6 +164,17 @@ export function ConfigEditor({
       return next;
     });
     setEntriesError("");
+    clearServerEntriesError();
+  }
+
+  function clearServerEntriesError() {
+    const source = validationSourceRef.current;
+    if (source?.kind !== "server") {
+      return;
+    }
+    const fields = { ...source.fields };
+    delete fields.entries;
+    validationSourceRef.current = { ...source, fields };
   }
 
   function confirmDeleteEntry() {
@@ -162,13 +215,17 @@ export function ConfigEditor({
       value: entry.value,
       service: entry.service.trim(),
     }));
-    const localErrors = validateEntries(draft);
+    const localErrors = validateEntries(draft, {
+      invalidKey: t("editor.validation.invalidKey"),
+      duplicateKey: t("editor.validation.duplicateKey"),
+    });
+    validationSourceRef.current = Object.keys(localErrors).length > 0 ? { kind: "local" } : null;
     setEntryErrors(localErrors);
     setEntriesError("");
     setMessageError("");
-    setFormError("");
+    setFormError(null);
     if (Object.keys(localErrors).length > 0) {
-      setFormError("Review the marked fields and try again.");
+      setFormError("editor.validation.review");
       return;
     }
 
@@ -189,20 +246,28 @@ export function ConfigEditor({
         return;
       }
       if (error instanceof APIError && error.status === 422) {
-        const mapped = mapServerValidation(error.fields, submittedIds);
+        const safeFields = Object.fromEntries(Object.keys(error.fields).map((field) => [field, ""]));
+        validationSourceRef.current = { kind: "server", fields: safeFields, submittedIds };
+        const mapped = mapServerValidation(safeFields, submittedIds, {
+          entries: t("editor.validation.entries"),
+          message: t("editor.validation.message"),
+          key: t("editor.validation.key"),
+          value: t("editor.validation.value"),
+          service: t("editor.validation.service"),
+        });
         setEntryErrors(mapped.entryErrors);
         setEntriesError(mapped.entriesError);
         setMessageError(mapped.messageError);
-        setFormError("Review the marked fields and try again.");
+        setFormError("editor.validation.review");
       } else if (
         error instanceof APIError &&
         (error.status === 409 || error.code === "revision_conflict")
       ) {
         setConflictState("needs-refresh");
         setLatestRevision(null);
-        setFormError("Configuration changed since you loaded it");
+        setFormError("editor.conflict.changed");
       } else {
-        setFormError("The configuration couldn’t be saved. Your draft is still here; try again.");
+        setFormError("editor.saveUnavailable");
       }
     } finally {
       if (operationGenerationRef.current === generation) {
@@ -215,7 +280,7 @@ export function ConfigEditor({
   async function refreshConflict() {
     const generation = ++refreshGenerationRef.current;
     setConflictState("refreshing");
-    setFormError("Configuration changed since you loaded it");
+    setFormError("editor.conflict.changed");
     try {
       const response = await client.get<CurrentRevisionResponse>(
         configPath(projectSlug, environmentSlug),
@@ -246,9 +311,9 @@ export function ConfigEditor({
     >
       <header className="section-heading configuration-heading">
         <div>
-          <p className="section-index">Draft register / Base version {baseRevision}</p>
-          <h2 ref={editorHeadingRef} id="configuration-editor-title" tabIndex={-1}>Edit configuration</h2>
-          <p>Keys and services are trimmed when saved. Values remain exact.</p>
+          <p className="section-index">{t("editor.index", { version: baseRevision })}</p>
+          <h2 ref={editorHeadingRef} id="configuration-editor-title" tabIndex={-1}>{t("editor.title")}</h2>
+          <p>{t("editor.summary")}</p>
         </div>
         <button
           className="text-button"
@@ -256,15 +321,15 @@ export function ConfigEditor({
           disabled={submitting}
           onClick={requestCancel}
         >
-          Cancel editing
+          {t("editor.cancel")}
         </button>
       </header>
 
-      <form className="configuration-editor-form" onSubmit={(event) => void handleSubmit(event)}>
+      <form className="configuration-editor-form" noValidate onSubmit={(event) => void handleSubmit(event)}>
         <div
           className="configuration-draft-list"
           role="group"
-          aria-label="Configuration entries"
+          aria-label={t("editor.entries")}
           aria-describedby={entriesError ? "configuration-entries-error" : undefined}
         >
           {entriesError ? (
@@ -283,10 +348,10 @@ export function ConfigEditor({
           ))}
         </div>
         <button ref={addEntryRef} className="secondary-button add-entry-button" type="button" disabled={submitting} onClick={addEntry}>
-          Add entry
+          {t("editor.addEntry")}
         </button>
         <div className="form-field configuration-message-field">
-          <label htmlFor="configuration-message">Change message</label>
+          <label htmlFor="configuration-message">{t("editor.changeMessage")}</label>
           <input
             id="configuration-message"
             value={message}
@@ -296,15 +361,21 @@ export function ConfigEditor({
             onChange={(event) => {
               setMessage(event.currentTarget.value);
               setMessageError("");
+              const source = validationSourceRef.current;
+              if (source?.kind === "server") {
+                const fields = { ...source.fields };
+                delete fields.message;
+                validationSourceRef.current = { ...source, fields };
+              }
             }}
           />
           {messageError ? <p className="field-error" id="configuration-message-error">{messageError}</p> : null}
         </div>
 
         <div className="form-message configuration-save-message" aria-live="polite">
-          {formError ? <p role="alert">{formError}</p> : null}
+          {formError ? <p role="alert">{t(formError)}</p> : null}
           {conflictState === "refresh-error" ? (
-            <p>The latest configuration couldn’t be loaded. Your draft is unchanged.</p>
+            <p>{t("editor.conflict.latestUnavailable")}</p>
           ) : null}
         </div>
         {conflictState !== "none" ? (
@@ -314,7 +385,7 @@ export function ConfigEditor({
             disabled={conflictState === "refreshing" || submitting}
             onClick={() => void refreshConflict()}
           >
-            {conflictState === "refreshing" ? "Refreshing…" : "Refresh and compare"}
+            {t(conflictState === "refreshing" ? "editor.conflict.refreshing" : "editor.conflict.refresh")}
           </button>
         ) : null}
 
@@ -329,10 +400,10 @@ export function ConfigEditor({
               setBaseRevision(latestRevision.version);
               setBaselineEntries(latestRevision.entries);
               setConflictState("none");
-              setFormError("");
+              setFormError(null);
             }}
           >
-            Use version {latestRevision.version} as new base
+            {t("editor.conflict.useBase", { version: latestRevision.version })}
           </button>
         ) : null}
 
@@ -341,7 +412,7 @@ export function ConfigEditor({
           type="submit"
           disabled={submitting || !dirty || conflictState !== "none"}
         >
-          {submitting ? "Saving…" : "Save changes"}
+          {t(submitting ? "editor.saving" : "editor.save")}
         </button>
       </form>
 
@@ -353,21 +424,21 @@ export function ConfigEditor({
         >
           <header className="dialog-heading">
             <div>
-              <p className="section-index">Configuration draft</p>
+              <p className="section-index">{t("editor.remove.eyebrow")}</p>
               <h2 id="delete-configuration-entry-title">
-                Remove {pendingDelete.key.trim() || "new entry"} from this draft?
+                {t("editor.remove.title", { key: pendingDelete.key.trim() || t("editor.newEntry") })}
               </h2>
             </div>
           </header>
           <p id="delete-configuration-entry-description">
-            This entry will be removed from this draft only. The removal is not published until you save changes.
+            {t("editor.remove.description")}
           </p>
           <div className="dialog-actions">
             <button className="secondary-button" type="button" onClick={() => setPendingDelete(null)}>
-              Cancel
+              {t("common:actions.cancel")}
             </button>
             <button className="primary-button" type="button" onClick={confirmDeleteEntry}>
-              Remove {pendingDelete.key.trim() || "new entry"}
+              {t("editor.remove.action", { key: pendingDelete.key.trim() || t("editor.newEntry") })}
             </button>
           </div>
         </ModalDialog>
@@ -386,11 +457,11 @@ export function ConfigEditor({
         >
           <header className="dialog-heading">
             <div>
-              <p className="section-index">Unsaved configuration</p>
-              <h2 id="discard-configuration-title">Leave without saving?</h2>
+              <p className="section-index">{t("editor.leave.eyebrow")}</p>
+              <h2 id="discard-configuration-title">{t("editor.leave.title")}</h2>
             </div>
           </header>
-          <p id="discard-configuration-description">Your configuration draft and change message will be discarded.</p>
+          <p id="discard-configuration-description">{t("editor.leave.description")}</p>
           <div className="dialog-actions">
             <button
               className="secondary-button"
@@ -400,7 +471,7 @@ export function ConfigEditor({
                 if (navigationBlocked) blocker.reset();
                 setConfirmCancel(false);
               }}
-            >Stay</button>
+            >{t("editor.leave.stay")}</button>
             <button
               className="primary-button"
               type="button"
@@ -409,7 +480,7 @@ export function ConfigEditor({
                 if (navigationBlocked) blocker.proceed();
                 else onCancel();
               }}
-            >Discard and leave</button>
+            >{t("editor.leave.discard")}</button>
           </div>
         </ModalDialog>
       ) : null}
@@ -432,10 +503,11 @@ function DraftRow({
   onChange(field: keyof ConfigEntry, value: string): void;
   onDelete(): void;
 }) {
-  const label = entry.key.trim() || "new entry";
+  const { t } = useTranslation("config");
+  const label = entry.key.trim() || t("editor.newEntry");
   const errorId = (field: keyof ConfigEntry) => `draft-${entry.id}-${field}-error`;
   const valueEditNoticeId = `draft-${entry.id}-value-edit-notice`;
-  const [valueEditNotice, setValueEditNotice] = useState("");
+  const [valueEditNotice, setValueEditNotice] = useState(false);
   const pendingValueEditRef = useRef<(
     Pick<TextareaEditMetadata, "inputType" | "selectionStart" | "selectionEnd"> & {
       rawValue: string;
@@ -466,9 +538,9 @@ function DraftRow({
   ].filter(Boolean).join(" ") || undefined;
   return (
     <fieldset className="configuration-draft-row">
-      <legend>Entry {index + 1}</legend>
+      <legend>{t("editor.entry", { index: index + 1 })}</legend>
       <div className="form-field draft-key-field">
-        <label htmlFor={`draft-${entry.id}-key`}>Key for {label}</label>
+        <label htmlFor={`draft-${entry.id}-key`}>{t("editor.key", { key: label })}</label>
         <input
           id={`draft-${entry.id}-key`}
           autoCapitalize="none"
@@ -483,10 +555,12 @@ function DraftRow({
         {errors.key ? <p className="field-error" id={errorId("key")}>{errors.key}</p> : null}
       </div>
       <div className="form-field draft-value-field">
-        <label htmlFor={`draft-${entry.id}-value`}>Value for {label}</label>
+        <label htmlFor={`draft-${entry.id}-value`}>{t("editor.value", { key: label })}</label>
         <textarea
           ref={valueTextareaRef}
           id={`draft-${entry.id}-value`}
+          className="resize-none"
+          style={{ resize: "none" }}
           value={toTextareaDisplayValue(entry.value)}
           disabled={disabled}
           aria-invalid={errors.value ? "true" : undefined}
@@ -511,22 +585,22 @@ function DraftRow({
                 : null,
             );
             if (result.kind === "unsupported") {
-              setValueEditNotice(unsupportedValueEditMessage);
+              setValueEditNotice(true);
               return;
             }
-            setValueEditNotice("");
+            setValueEditNotice(false);
             onChange("value", result.value);
           }}
         />
         {errors.value ? <p className="field-error" id={errorId("value")}>{errors.value}</p> : null}
         {valueEditNotice ? (
           <p className="field-error" id={valueEditNoticeId} role="alert">
-            {valueEditNotice}
+            {t("editor.unsupportedValueEdit")}
           </p>
         ) : null}
       </div>
       <div className="form-field draft-service-field">
-        <label htmlFor={`draft-${entry.id}-service`}>Service for {label}</label>
+        <label htmlFor={`draft-${entry.id}-service`}>{t("editor.service", { key: label })}</label>
         <input
           id={`draft-${entry.id}-service`}
           value={entry.service}
@@ -538,31 +612,32 @@ function DraftRow({
         {errors.service ? <p className="field-error" id={errorId("service")}>{errors.service}</p> : null}
       </div>
       <button className="text-button draft-delete-button" type="button" disabled={disabled} onClick={onDelete}>
-        Delete {label}
+        {t("editor.delete", { key: label })}
       </button>
     </fieldset>
   );
 }
 
 function ConflictComparison({ comparisons, revision }: { comparisons: Comparison[]; revision: Revision }) {
+  const { t } = useTranslation("config");
   return (
     <section className="conflict-comparison" aria-labelledby="conflict-comparison-title">
-      <p className="section-index">Server version {revision.version} / Local draft</p>
-      <h3 id="conflict-comparison-title">Latest server compared with your draft</h3>
-      {comparisons.length === 0 ? <p>The snapshots contain the same entries.</p> : (
+      <p className="section-index">{t("editor.conflict.index", { version: revision.version })}</p>
+      <h3 id="conflict-comparison-title">{t("editor.conflict.title")}</h3>
+      {comparisons.length === 0 ? <p>{t("editor.conflict.same")}</p> : (
         <div className="difference-list">
           {comparisons.map((comparison) => (
             <article className="difference-row" key={comparison.key}>
               <h4 className="code-label">{comparison.key}</h4>
               <DifferenceSide
-                label="Latest server"
-                valueLabel={`Latest server value for ${comparison.key}`}
+                label={t("editor.conflict.latest")}
+                valueLabel={t("editor.conflict.latestValue", { key: comparison.key })}
                 entry={comparison.server}
                 testId={`conflict-server-${comparison.key}`}
               />
               <DifferenceSide
-                label="Your draft"
-                valueLabel={`Your draft value for ${comparison.key}`}
+                label={t("editor.conflict.draft")}
+                valueLabel={t("editor.conflict.draftValue", { key: comparison.key })}
                 entry={comparison.local}
                 testId={`conflict-local-${comparison.key}`}
               />
@@ -585,15 +660,16 @@ function DifferenceSide({
   testId: string;
   valueLabel: string;
 }) {
+  const { t } = useTranslation("config");
   return (
     <div className="difference-side">
       <p>{label}</p>
       {entry ? (
         <>
           <ExactValue label={valueLabel} testId={testId} value={entry.value} />
-          <span className="difference-service">Service: {entry.service || <span className="empty-value">Empty string</span>}</span>
+          <span className="difference-service">{t("editor.conflict.service")} {entry.service || <span className="empty-value">{t("editor.conflict.emptyString")}</span>}</span>
         </>
-      ) : <span className="absent-value" data-testid={testId}>Absent</span>}
+      ) : <span className="absent-value" data-testid={testId}>{t("editor.conflict.absent")}</span>}
     </div>
   );
 }

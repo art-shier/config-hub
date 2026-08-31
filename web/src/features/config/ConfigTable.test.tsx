@@ -4,6 +4,7 @@ import { StrictMode, useState } from "react";
 import { RouterProvider, createMemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import type { APIClientContract } from "../../api/types";
+import { changeLocale } from "../../i18n";
 import { ConfigTable } from "./ConfigTable";
 
 function client(): APIClientContract {
@@ -245,9 +246,56 @@ describe("ConfigTable", () => {
     await user.type(screen.getByRole("searchbox", { name: "Search configuration" }), "worker");
     expect(screen.queryByText("DATABASE_URL")).not.toBeInTheDocument();
     expect(screen.getByText("QUEUE")).toBeInTheDocument();
-    await user.clear(screen.getByRole("searchbox", { name: "Search configuration" }));
+    await user.click(screen.getByRole("button", { name: "Clear configuration search" }));
+    expect(screen.getByRole("searchbox", { name: "Search configuration" })).toHaveFocus();
+    expect(screen.getByText("DATABASE_URL")).toBeInTheDocument();
     await user.type(screen.getByRole("searchbox", { name: "Search configuration" }), "database");
     expect(screen.getByTestId("configuration-value-DATABASE_URL").textContent).toBe(" postgres://exact ");
+  });
+
+  it("localizes configuration copy and clear search without translating stored data", async () => {
+    const api = client();
+    vi.mocked(api.get).mockResolvedValue({
+      revision: {
+        id: "revision-2",
+        environment_id: "env-prod",
+        message: "business message",
+        created_by: "user-admin",
+        version: 2,
+        created_at: "2026-08-29T08:00:00Z",
+        entries: [{ key: "DATABASE_URL", value: " 原始业务值 ", service: "api-service" }],
+      },
+    });
+    await act(async () => {
+      await changeLocale("zh-CN");
+    });
+    render(
+      <ConfigTable
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+    const user = userEvent.setup();
+
+    const table = await screen.findByRole("table", { name: "当前配置" });
+    expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "键",
+      "值",
+      "服务",
+    ]);
+    expect(within(table).getByRole("textbox", { name: "DATABASE_URL 的存储值" }).textContent).toBe(" 原始业务值 ");
+    expect(within(table).getByText("api-service")).toBeInTheDocument();
+    const search = screen.getByRole("searchbox", { name: "搜索配置" });
+    await user.type(search, "no-match");
+    expect(screen.getByText("没有与此搜索匹配的键或服务。")).toBeInTheDocument();
+    const clear = screen.getByRole("button", { name: "清除配置搜索" });
+    await user.click(clear);
+    expect(search).toHaveFocus();
+    expect(screen.getByText("DATABASE_URL")).toBeInTheDocument();
   });
 
   it("shows a safe retry state and loads the empty snapshot on retry", async () => {

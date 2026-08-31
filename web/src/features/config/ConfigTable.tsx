@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { APIClientContract, Revision } from "../../api/types";
 import { ExactValue } from "../../components/ExactValue";
 import { ConfigEditor } from "./ConfigEditor";
@@ -24,20 +25,22 @@ export function ConfigTable({
   refreshEpoch: number;
   onRevisionChanged(revision: Revision): void;
 }) {
+  const { t } = useTranslation(["config", "common"]);
   const [revision, setRevision] = useState<Revision | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [editing, setEditing] = useState(false);
   const [search, setSearch] = useState("");
-  const [savedStatus, setSavedStatus] = useState("");
+  const [savedVersion, setSavedVersion] = useState<number | null>(null);
   const requiresDesktop = useMediaQuery("(max-width: 759px)");
   const generationRef = useRef(0);
   const skipOwnRefreshRef = useRef(false);
   const editButtonRef = useRef<HTMLButtonElement>(null);
   const configurationHeadingRef = useRef<HTMLHeadingElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const focusTargetRef = useRef<"editor" | "edit" | "saved" | null>(null);
 
   const loadCurrent = useCallback(async () => {
-    setSavedStatus("");
+    setSavedVersion(null);
     if (!environmentSlug) {
       setRevision(null);
       setLoadState("idle");
@@ -106,23 +109,23 @@ export function ConfigTable({
   if (!environmentSlug) {
     return (
       <div className="empty-state compact-empty">
-        <h2>Choose an environment</h2>
-        <p>Select an environment above to view its current configuration.</p>
+        <h2>{t("states.chooseEnvironment")}</h2>
+        <p>{t("states.chooseEnvironmentDescription")}</p>
       </div>
     );
   }
 
   if (loadState === "loading" || loadState === "idle") {
-    return <p className="loading-line" role="status">Loading configuration…</p>;
+    return <p className="loading-line" role="status">{t("states.loading")}</p>;
   }
 
   if (loadState === "error" || revision === null) {
     return (
       <div className="inline-error-state">
-        <h2>Configuration unavailable</h2>
-        <p>The current configuration couldn’t be loaded. Try again.</p>
+        <h2>{t("states.unavailable")}</h2>
+        <p>{t("states.unavailableDescription")}</p>
         <button className="secondary-button" type="button" onClick={() => void loadCurrent()}>
-          Retry
+          {t("common:actions.retry")}
         </button>
       </div>
     );
@@ -144,7 +147,7 @@ export function ConfigTable({
           focusTargetRef.current = "saved";
           setRevision(saved);
           setEditing(false);
-          setSavedStatus(`Revision ${saved.version} saved.`);
+          setSavedVersion(saved.version);
           onRevisionChanged(saved);
         }}
       />
@@ -154,10 +157,10 @@ export function ConfigTable({
     <section className="configuration-register" aria-labelledby="configuration-title">
       <header className="section-heading configuration-heading">
         <div>
-          <p className="section-index">Current register / Version {revision.version}</p>
-          <h2 ref={configurationHeadingRef} id="configuration-title" tabIndex={-1}>Configuration</h2>
-          <p>Plain values are shown exactly as stored in this environment.</p>
-          {savedStatus ? <p className="form-message" role="status">{savedStatus}</p> : null}
+          <p className="section-index">{t("table.index", { version: revision.version })}</p>
+          <h2 ref={configurationHeadingRef} id="configuration-title" tabIndex={-1}>{t("table.title")}</h2>
+          <p>{t("table.summary")}</p>
+          {savedVersion !== null ? <p className="form-message" role="status">{t("table.saved", { version: savedVersion })}</p> : null}
         </div>
         {canEdit ? (
           <button
@@ -166,63 +169,75 @@ export function ConfigTable({
             type="button"
             onClick={() => {
               focusTargetRef.current = "editor";
-              setSavedStatus("");
+              setSavedVersion(null);
               setEditing(true);
             }}
           >
-            Edit configuration
+            {t("table.edit")}
           </button>
         ) : null}
       </header>
 
       {canWrite && requiresDesktop ? (
         <p className="desktop-edit-note">
-          {editing
-            ? "A desktop viewport is required to edit configuration. Your unsaved draft is retained and will return unchanged when desktop editing is available. Values and revision history remain available here."
-            : "A desktop viewport is required to edit configuration. Values and revision history remain available here."}
+          {t(editing ? "table.desktopOnlyDraft" : "table.desktopOnly")}
         </p>
       ) : null}
 
       {revision.entries.length === 0 ? (
         <div className="empty-state compact-empty">
-          <h3>No configuration entries</h3>
-          <p>{canEdit ? "Edit configuration to add the first entry." : "This environment has an empty configuration."}</p>
+          <h3>{t("table.emptyTitle")}</h3>
+          <p>{t(canEdit ? "table.emptyEditable" : "table.emptyReadOnly")}</p>
         </div>
       ) : (
         <>
           <div className="configuration-tools">
-            <label htmlFor="configuration-search">Search configuration</label>
+            <label htmlFor="configuration-search">{t("table.search")}</label>
             <input
+              ref={searchInputRef}
               id="configuration-search"
               type="search"
               value={search}
               onChange={(event) => setSearch(event.currentTarget.value)}
             />
+            {search ? (
+              <button
+                className="text-button"
+                type="button"
+                aria-label={t("table.clearSearch")}
+                onClick={() => {
+                  setSearch("");
+                  searchInputRef.current?.focus();
+                }}
+              >
+                {t("table.clearSearch")}
+              </button>
+            ) : null}
           </div>
           {visibleEntries.length === 0 ? (
-            <p className="filter-empty">No keys or services match this search.</p>
+            <p className="filter-empty">{t("table.noResults")}</p>
           ) : (
             <div className="data-table-wrap">
-              <table className="data-table configuration-table" aria-label="Current configuration">
+              <table className="data-table configuration-table" aria-label={t("table.accessibleName")}>
                 <thead>
                   <tr>
-                    <th scope="col">Key</th>
-                    <th scope="col">Value</th>
-                    <th scope="col">Service</th>
+                    <th scope="col">{t("table.key")}</th>
+                    <th scope="col">{t("table.value")}</th>
+                    <th scope="col">{t("table.service")}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {visibleEntries.map((entry) => (
                     <tr key={entry.key}>
-                      <th scope="row" data-label="Key"><span className="code-label">{entry.key}</span></th>
-                      <td data-label="Value">
+                      <th scope="row" data-label={t("table.key")}><span className="code-label">{entry.key}</span></th>
+                      <td data-label={t("table.value")}>
                         <ExactValue
-                          label={`Stored value for ${entry.key}`}
+                          label={t("table.storedValue", { key: entry.key })}
                           testId={`configuration-value-${entry.key}`}
                           value={entry.value}
                         />
                       </td>
-                      <td data-label="Service"><span className="code-label">{entry.service}</span></td>
+                      <td data-label={t("table.service")}><span className="code-label">{entry.service}</span></td>
                     </tr>
                   ))}
                 </tbody>

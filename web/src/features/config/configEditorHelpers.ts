@@ -10,6 +10,19 @@ export interface EntryErrors {
   service?: string;
 }
 
+export interface EntryValidationMessages {
+  invalidKey: string;
+  duplicateKey: string;
+}
+
+export interface ServerValidationMessages {
+  entries: string;
+  message: string;
+  key: string;
+  value: string;
+  service: string;
+}
+
 export interface Comparison {
   key: string;
   server?: ConfigEntry;
@@ -53,16 +66,19 @@ function hasDuplicateNormalizedKey(entries: ConfigEntry[]): boolean {
   return false;
 }
 
-export function validateEntries(draft: DraftEntry[]): Record<string, EntryErrors> {
+export function validateEntries(
+  draft: DraftEntry[],
+  messages: EntryValidationMessages,
+): Record<string, EntryErrors> {
   const errors: Record<string, EntryErrors> = {};
   const seen = new Set<string>();
   for (const entry of draft) {
     const key = entry.key.trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) {
-      errors[entry.id] = { key: "Use letters, numbers, and underscores; start with a letter or underscore." };
+      errors[entry.id] = { key: messages.invalidKey };
     }
     if (seen.has(key)) {
-      errors[entry.id] = { ...errors[entry.id], key: "Each key must be unique." };
+      errors[entry.id] = { ...errors[entry.id], key: messages.duplicateKey };
     }
     seen.add(key);
   }
@@ -72,24 +88,25 @@ export function validateEntries(draft: DraftEntry[]): Record<string, EntryErrors
 export function mapServerValidation(
   fields: Record<string, string>,
   submittedIds: string[],
+  messages: ServerValidationMessages,
 ): { entriesError: string; entryErrors: Record<string, EntryErrors>; messageError: string } {
   let entriesError = "";
   const entryErrors: Record<string, EntryErrors> = {};
   let messageError = "";
-  for (const [field, value] of Object.entries(fields)) {
+  for (const field of Object.keys(fields)) {
     if (field === "entries") {
-      entriesError = value;
+      entriesError = messages.entries;
       continue;
     }
     if (field === "message") {
-      messageError = value;
+      messageError = messages.message;
       continue;
     }
     const match = /^entries\[(\d+)\]\.(key|value|service)$/u.exec(field);
     if (match) {
       const id = submittedIds[Number(match[1])];
       const entryField = match[2] as keyof EntryErrors;
-      if (id) entryErrors[id] = { ...entryErrors[id], [entryField]: value };
+      if (id) entryErrors[id] = { ...entryErrors[id], [entryField]: messages[entryField] };
     }
   }
   return { entriesError, entryErrors, messageError };
