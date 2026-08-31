@@ -26,15 +26,15 @@ validate_release_tag() {
   [[ "$tag" =~ $release_tag_pattern ]] || die 'version must match vMAJOR.MINOR.PATCH'
 }
 
-detect_linux_arch() {
+detect_cli_target() {
   local operating_system="${1:-}"
   local machine="${2:-}"
 
-  [[ "$operating_system" == 'Linux' ]] || die 'only Linux is supported' || return
-  case "$machine" in
-  x86_64 | amd64) printf '%s\n' 'amd64' ;;
-  aarch64 | arm64) printf '%s\n' 'arm64' ;;
-  *) die "unsupported Linux architecture: $machine" ;;
+  case "$operating_system/$machine" in
+  Linux/x86_64 | Linux/amd64) printf '%s\n' 'linux amd64' ;;
+  Linux/aarch64 | Linux/arm64) printf '%s\n' 'linux arm64' ;;
+  Darwin/aarch64 | Darwin/arm64) printf '%s\n' 'darwin arm64' ;;
+  *) die "unsupported CLI target: $operating_system/$machine" ;;
   esac
 }
 
@@ -70,22 +70,36 @@ download_file() {
     --output "$output" "$url"
 }
 
+sha256_file() {
+  local file="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -- "$file" | awk '{ print tolower($1) }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -- "$file" | awk '{ print tolower($1) }'
+  else
+    die 'required SHA-256 command not found: sha256sum or shasum'
+  fi
+}
+
 verify_download_checksum() {
   local manifest="$1"
   local archive="$2"
   local archive_name="$3"
   local expected
   local actual
-  local -a matches=()
+  local match_count
 
-  mapfile -t matches < <(awk -v filename="$archive_name" \
-    'NF == 2 && $2 == filename { print $1 }' "$manifest")
-  [[ "${#matches[@]}" -eq 1 ]] || die 'checksum manifest must contain one exact archive entry' || return
-  expected="${matches[0]}"
+  match_count="$(awk -v filename="$archive_name" \
+    'NF == 2 && $2 == filename { count++ } END { print count + 0 }' "$manifest")"
+  [[ "$match_count" -eq 1 ]] || die 'checksum manifest must contain one exact archive entry' || return
+  expected="$(awk -v filename="$archive_name" \
+    'NF == 2 && $2 == filename { print $1 }' "$manifest")"
   [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || die 'checksum manifest contains an invalid digest' || return
-  actual="$(sha256sum -- "$archive")"
-  actual="${actual%% *}"
-  [[ "${actual,,}" == "${expected,,}" ]] || die 'archive checksum verification failed'
+  actual="$(sha256_file "$archive")" || return
+  actual="$(printf '%s\n' "$actual" | tr '[:upper:]' '[:lower:]')"
+  expected="$(printf '%s\n' "$expected" | tr '[:upper:]' '[:lower:]')"
+  [[ "$actual" == "$expected" ]] || die 'archive checksum verification failed'
 }
 
 validate_cli_archive() {
@@ -96,31 +110,58 @@ validate_cli_archive() {
   local listing_line
   local directory_count=0
   local binary_count=0
-  local -a members=()
+  local member_count=0
+  local members
+  local listing
 
-  mapfile -t members < <(LC_ALL=C tar -tzf "$archive")
-  [[ "${#members[@]}" -eq 2 ]] || die 'CLI archive contains an unexpected number of entries' || return
-  for member in "${members[@]}"; do
+  members="$(LC_ALL=C tar -tzf "$archive")" || die 'could not list CLI archive entries' || return
+  while IFS= read -r member; do
+    member_count=$((member_count + 1))
     case "$member" in
     "$archive_base/") directory_count=$((directory_count + 1)) ;;
     "$archive_base/confighub") binary_count=$((binary_count + 1)) ;;
     *) die "CLI archive contains an unsafe entry: $member" || return ;;
     esac
-  done
+  done <<<"$members"
+  [[ "$member_count" -eq 2 ]] || die 'CLI archive contains an unexpected number of entries' || return
   [[ "$directory_count" -eq 1 && "$binary_count" -eq 1 ]] ||
     die 'CLI archive entries are missing or duplicated' || return
 
+  listing="$(LC_ALL=C tar -tvzf "$archive")" || die 'could not inspect CLI archive entries' || return
   while IFS= read -r listing_line; do
     case "${listing_line:0:1}" in
     d | -) ;;
     *) die 'CLI archive contains a link or special file' || return ;;
     esac
-  done < <(LC_ALL=C tar -tvzf "$archive")
+  done <<<"$listing"
 
-  mkdir -p -- "$extract_root"
-  tar --no-same-owner --no-same-permissions -xzf "$archive" -C "$extract_root"
+  mkdir -p -- "$extract_root/$archive_base"
+  tar -xzf "$archive" -C "$extract_root" "$archive_base/confighub"
   [[ -f "$extract_root/$archive_base/confighub" && ! -L "$extract_root/$archive_base/confighub" ]] ||
-    die 'extracted CLI is not a regular file'
+    die 'extracted CLI is not a regular file' || return
+  chmod 0755 -- "$extract_root/$archive_base/confighub"
+}
+
+remove_download_origin_mark() {
+  local operating_system="$1"
+  local file="$2"
+  local attributes
+  local attribute
+
+  case "$operating_system" in
+  linux) return 0 ;;
+  darwin)
+    require_command xattr || return
+    attributes="$(xattr "$file")" || die 'could not inspect downloaded CLI attributes' || return
+    while IFS= read -r attribute; do
+      if [[ "$attribute" == 'com.apple.quarantine' ]]; then
+        xattr -d com.apple.quarantine "$file" || die 'could not remove CLI quarantine attribute'
+        return
+      fi
+    done <<<"$attributes"
+    ;;
+  *) die "unsupported origin-mark platform: $operating_system" ;;
+  esac
 }
 
 verify_cli_version() {
@@ -146,7 +187,9 @@ cleanup_cli_install() {
 install_cli_release() {
   local tag="$1"
   local destination="$2"
-  local arch
+  local target
+  local operating_system
+  local architecture
   local version
   local archive_base
   local archive_name
@@ -157,9 +200,10 @@ install_cli_release() {
 
   validate_release_tag "$tag" || return
   [[ "$destination" == /* ]] || die 'install directory must be an absolute path' || return
-  arch="$(detect_linux_arch "$(uname -s)" "$(uname -m)")" || return
+  target="$(detect_cli_target "$(uname -s)" "$(uname -m)")" || return
+  read -r operating_system architecture <<<"$target"
   version="${tag#v}"
-  archive_base="config-hub-cli_${version}_linux_${arch}"
+  archive_base="config-hub-cli_${version}_${operating_system}_${architecture}"
   archive_name="$archive_base.tar.gz"
   release_url="$github_web_root/releases/download/$tag"
 
@@ -173,7 +217,7 @@ install_cli_release() {
   validate_cli_archive "$archive_path" "$archive_base" "$cli_temp_root/extracted" || return
 
   extracted_binary="$cli_temp_root/extracted/$archive_base/confighub"
-  chmod 0755 -- "$extracted_binary"
+  remove_download_origin_mark "$operating_system" "$extracted_binary" || return
   verify_cli_version "$extracted_binary" "$tag" || return
 
   mkdir -p -- "$destination"
@@ -233,10 +277,10 @@ main() {
     usage
     return 0
   fi
-  for command_name in curl sha256sum tar awk mktemp install; do
+  for command_name in curl tar awk tr mktemp install; do
     require_command "$command_name" || return
   done
-  detect_linux_arch "$(uname -s)" "$(uname -m)" >/dev/null || return
+  detect_cli_target "$(uname -s)" "$(uname -m)" >/dev/null || return
   if [[ -n "$requested_version" ]]; then
     tag="$requested_version"
   else
