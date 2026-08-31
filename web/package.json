@@ -10,8 +10,10 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "i18next": "26.4.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "react-i18next": "17.0.12",
     "react-router-dom": "^7.9.5"
   },
   "devDependencies": {
