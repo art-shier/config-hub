@@ -6,6 +6,8 @@ import {
   useState,
   type FormEvent,
 } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import type {
   Environment,
   IssuedMachineToken,
@@ -20,8 +22,32 @@ import type { APIClient } from "../api/client";
 import { APIError } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 import { ModalDialog } from "../components/ModalDialog";
+import { localizePresentFields } from "../i18n/apiErrors";
+import { formatDateTime } from "../i18n/format";
+import type { SupportedLocale } from "../i18n/locales";
 
 type LoadState = "loading" | "ready" | "error";
+type ValidationErrorKey =
+  | "machineNameRequired"
+  | "tokenNameRequired"
+  | "machineNameTooLong"
+  | "tokenNameTooLong"
+  | "descriptionTooLong"
+  | "expiryInvalid"
+  | "expiryPast"
+  | "expiryTooFar"
+  | "serverName"
+  | "serverTokenName"
+  | "serverDescription"
+  | "serverExpiry";
+type MachineField = "name" | "description" | "expires_at";
+type FieldErrors = Partial<Record<MachineField, ValidationErrorKey>>;
+type IdentityErrorKey = "reviewField" | "saveFailed";
+type GrantErrorKey = "invalid" | "saveFailed";
+type CreateErrorKey = "reviewFields" | "fieldFailure" | "failure";
+type IssueErrorKey = "reviewFields" | "fieldFailure" | "failure";
+type TokenState = "active" | "expired" | "revoked";
+type CopyState = "idle" | "copied" | "failed";
 
 interface ProjectOption extends Project {
   environments: Environment[];
@@ -29,6 +55,7 @@ interface ProjectOption extends Project {
 
 export function MachineAccessPage() {
   const { client } = useAuth();
+  const { t } = useTranslation("machineAccess");
   const [identities, setIdentities] = useState<MachineIdentity[]>([]);
   const [identityState, setIdentityState] = useState<LoadState>("loading");
   const [selectedID, setSelectedID] = useState("");
@@ -121,34 +148,34 @@ export function MachineAccessPage() {
     <section className="resource-page machine-access-page" aria-labelledby="machine-access-title">
       <header className="resource-heading">
         <div>
-          <p className="eyebrow">Scoped credential register</p>
-          <h1 id="machine-access-title">Machine Access</h1>
-          <p>Issue identities to builds, grant exact environments, and control one-time Tokens.</p>
+          <p className="eyebrow">{t("page.eyebrow")}</p>
+          <h1 id="machine-access-title">{t("page.title")}</h1>
+          <p>{t("page.summary")}</p>
         </div>
         <button className="primary-button action-button" type="button" onClick={() => setCreateOpen(true)}>
-          New identity
+          {t("page.newIdentity")}
         </button>
       </header>
 
-      {identityState === "loading" ? <p className="loading-line" role="status">Loading machine identities…</p> : null}
+      {identityState === "loading" ? <p className="loading-line" role="status">{t("page.loading")}</p> : null}
       {identityState === "error" ? (
         <div className="inline-error-state administration-error" role="alert">
-          <h2>Machine identities unavailable</h2>
-          <p>The identity register couldn’t be loaded. Check the service and try again.</p>
-          <button className="secondary-button" type="button" onClick={() => void loadIdentities()}>Retry identities</button>
+          <h2>{t("page.errorTitle")}</h2>
+          <p>{t("page.errorDescription")}</p>
+          <button className="secondary-button" type="button" onClick={() => void loadIdentities()}>{t("page.retry")}</button>
         </div>
       ) : null}
       {identityState === "ready" && identities.length === 0 ? (
         <div className="empty-state">
-          <p className="section-index">Identity register / Empty</p>
-          <h2>No machine identities</h2>
-          <p>Create an identity before granting environments or issuing a Token.</p>
+          <p className="section-index">{t("page.emptyIndex")}</p>
+          <h2>{t("page.emptyTitle")}</h2>
+          <p>{t("page.emptyDescription")}</p>
         </div>
       ) : null}
       {identityState === "ready" && identities.length > 0 ? (
         <div className="machine-workspace">
-          <aside className="machine-index" aria-label="Machine identities">
-            <p className="nav-label">Identity register</p>
+          <aside className="machine-index" aria-label={t("page.identitiesLabel")}>
+            <p className="nav-label">{t("page.register")}</p>
             <ul>
               {identities.map((identity) => (
                 <li key={identity.id}>
@@ -159,7 +186,7 @@ export function MachineAccessPage() {
                     onClick={() => setSelectedID(identity.id)}
                   >
                     <strong>{identity.name}</strong>
-                    <span>{identity.enabled ? "Enabled" : "Disabled"}</span>
+                    <span>{t(identity.enabled ? "states.enabled" : "states.disabled")}</span>
                   </button>
                 </li>
               ))}
@@ -199,6 +226,8 @@ function IdentityPanel({
   onRetryProjects(): void;
   onIdentityChanged(identity: MachineIdentity): void;
 }) {
+  const { i18n, t } = useTranslation(["machineAccess", "common"]);
+  const locale = resolvedLocale(i18n.resolvedLanguage);
   const [detail, setDetail] = useState<MachineIdentityDetail | null>(null);
   const [state, setState] = useState<LoadState>("loading");
   const [description, setDescription] = useState("");
@@ -206,11 +235,11 @@ function IdentityPanel({
   const [grants, setGrants] = useState<MachineEnvironmentGrant[]>([]);
   const [projectID, setProjectID] = useState("");
   const [environmentID, setEnvironmentID] = useState("");
-  const [identityMessage, setIdentityMessage] = useState("");
-  const [identityError, setIdentityError] = useState("");
-  const [identityFieldErrors, setIdentityFieldErrors] = useState<Record<string, string>>({});
-  const [grantMessage, setGrantMessage] = useState("");
-  const [grantError, setGrantError] = useState("");
+  const [identityMessage, setIdentityMessage] = useState<"saved" | null>(null);
+  const [identityError, setIdentityError] = useState<IdentityErrorKey | null>(null);
+  const [identityFieldErrors, setIdentityFieldErrors] = useState<FieldErrors>({});
+  const [grantMessage, setGrantMessage] = useState<"saved" | null>(null);
+  const [grantError, setGrantError] = useState<GrantErrorKey | null>(null);
   const [savingIdentity, setSavingIdentity] = useState(false);
   const [savingGrants, setSavingGrants] = useState(false);
   const [issueOpen, setIssueOpen] = useState(false);
@@ -272,14 +301,14 @@ function IdentityPanel({
     const descriptionError = validateDescription(description);
     setIdentityFieldErrors(descriptionError ? { description: descriptionError } : {});
     if (descriptionError) {
-      setIdentityError("Review the marked field and try again.");
-      setIdentityMessage("");
+      setIdentityError("reviewField");
+      setIdentityMessage(null);
       return;
     }
     identitySavingRef.current = true;
     setSavingIdentity(true);
-    setIdentityError("");
-    setIdentityMessage("");
+    setIdentityError(null);
+    setIdentityMessage(null);
     try {
       const response = await client.put<{ identity: MachineIdentity }>(
         `/machine-identities/${encodeURIComponent(identityID)}`,
@@ -293,18 +322,20 @@ function IdentityPanel({
       setEnabled(response.identity.enabled);
       setIdentityFieldErrors({});
       onIdentityChanged(response.identity);
-      setIdentityMessage("Identity saved.");
+      setIdentityMessage("saved");
     } catch (caught) {
       if (caught instanceof APIError && caught.status === 422) {
-        const mapped = mapFieldErrors(caught.fields, ["description"]);
+        const mapped = mapFieldErrors(caught.fields, {
+          description: "serverDescription",
+        });
         setIdentityFieldErrors(mapped.fields);
         setIdentityError(
           Object.keys(mapped.fields).length > 0 && !mapped.hasUnknown
-            ? "Review the marked field and try again."
-            : "We couldn’t save the identity. Your changes are still here; check the service and try again.",
+            ? "reviewField"
+            : "saveFailed",
         );
       } else {
-        setIdentityError("We couldn’t save the identity. Your changes are still here; check the service and try again.");
+        setIdentityError("saveFailed");
       }
     } finally {
       identitySavingRef.current = false;
@@ -318,16 +349,25 @@ function IdentityPanel({
     }
     grantSavingRef.current = true;
     setSavingGrants(true);
-    setGrantError("");
-    setGrantMessage("");
+    setGrantError(null);
+    setGrantMessage(null);
     try {
       await client.putNoContent(
         `/machine-identities/${encodeURIComponent(identityID)}/grants`,
         { grants },
       );
-      setGrantMessage("Grants saved.");
-    } catch {
-      setGrantError("The grants couldn’t be saved. Your selections are still here; check the service and try again.");
+      setGrantMessage("saved");
+    } catch (caught) {
+      if (caught instanceof APIError && caught.status === 422) {
+        const mapped = mapFieldErrors(caught.fields, { grants: "invalid" });
+        setGrantError(
+          mapped.fields.grants !== undefined && !mapped.hasUnknown
+            ? mapped.fields.grants
+            : "saveFailed",
+        );
+      } else {
+        setGrantError("saveFailed");
+      }
     } finally {
       grantSavingRef.current = false;
       setSavingGrants(false);
@@ -338,20 +378,20 @@ function IdentityPanel({
     if (!projectID || !environmentID || grants.some((grant) => grant.project_id === projectID && grant.environment_id === environmentID)) {
       return;
     }
-    setGrantError("");
-    setGrantMessage("");
+    setGrantError(null);
+    setGrantMessage(null);
     setGrants((current) => [...current, { project_id: projectID, environment_id: environmentID }]);
   }
 
   if (state === "loading") {
-    return <p className="loading-line machine-detail-state" role="status">Loading identity details…</p>;
+    return <p className="loading-line machine-detail-state" role="status">{t("identity.loading")}</p>;
   }
   if (state === "error" || detail === null) {
     return (
       <div className="inline-error-state machine-detail-state" role="alert">
-        <h2>Identity details unavailable</h2>
-        <p>The selected identity couldn’t be loaded. Try again.</p>
-        <button className="secondary-button" type="button" onClick={() => void loadDetail()}>Retry identity</button>
+        <h2>{t("identity.errorTitle")}</h2>
+        <p>{t("identity.errorDescription")}</p>
+        <button className="secondary-button" type="button" onClick={() => void loadDetail()}>{t("identity.retry")}</button>
       </div>
     );
   }
@@ -360,25 +400,44 @@ function IdentityPanel({
     <article className="machine-detail" aria-labelledby="machine-detail-title">
       <header className="section-heading machine-detail-heading">
         <div>
-          <p className="section-index">Machine identity / {detail.enabled ? "Enabled" : "Disabled"}</p>
+          <p className="section-index">
+            {t("identity.index", {
+              state: t(detail.enabled ? "states.enabled" : "states.disabled"),
+            })}
+          </p>
           <h2 id="machine-detail-title">{detail.name}</h2>
-          <p>Created {formatDateTime(detail.created_at)} · Updated {formatDateTime(detail.updated_at)}</p>
+          <p>
+            {t("identity.dates", {
+              created: formatDateTime(
+                detail.created_at,
+                locale,
+                t("tokens.timeUnavailable"),
+              ),
+              updated: formatDateTime(
+                detail.updated_at,
+                locale,
+                t("tokens.timeUnavailable"),
+              ),
+            })}
+          </p>
         </div>
       </header>
 
-      <form className="machine-section machine-identity-form" onSubmit={(event) => void saveIdentity(event)}>
+      <form className="machine-section machine-identity-form" noValidate onSubmit={(event) => void saveIdentity(event)}>
         <div className="section-heading compact-section-heading">
           <div>
-            <p className="section-index">01 / Identity</p>
-            <h3>Identity state</h3>
-            <p>The immutable name anchors grants and Tokens.</p>
+            <p className="section-index">{t("identity.sectionIndex")}</p>
+            <h3>{t("identity.title")}</h3>
+            <p>{t("identity.summary")}</p>
           </div>
         </div>
         <div className="form-field">
-          <label htmlFor={`machine-description-${identityID}`}>Description</label>
+          <label htmlFor={`machine-description-${identityID}`}>{t("identity.description")}</label>
           <textarea
+            className="resize-none"
             id={`machine-description-${identityID}`}
             value={description}
+            style={{ resize: "none" }}
             disabled={savingIdentity}
             aria-invalid={identityFieldErrors.description ? "true" : undefined}
             aria-describedby={fieldDescription(
@@ -388,107 +447,107 @@ function IdentityPanel({
             onChange={(event) => {
               setDescription(event.currentTarget.value);
               setIdentityFieldErrors((current) => withoutField(current, "description"));
-              setIdentityError("");
+              setIdentityError(null);
             }}
           />
           <p className="field-help" id={`machine-description-${identityID}-help`}>
-            {byteLimitHelp(description, machineDescriptionLimit)}
+            {byteLimitHelp(t, description, machineDescriptionLimit)}
           </p>
           {identityFieldErrors.description ? (
             <p className="field-error" id={`machine-description-${identityID}-error`}>
-              {identityFieldErrors.description}
+              {validationMessage(t, identityFieldErrors.description)}
             </p>
           ) : null}
         </div>
         <label className="checkbox-field">
           <input type="checkbox" checked={enabled} disabled={savingIdentity} onChange={(event) => setEnabled(event.currentTarget.checked)} />
-          <span>Enabled</span>
+          <span>{t("identity.enabled")}</span>
         </label>
-        {identityError ? <p className="form-message" role="alert">{identityError}</p> : null}
-        {identityMessage ? <p className="form-message" role="status">{identityMessage}</p> : null}
+        {identityError ? <p className="form-message" role="alert">{t(`identity.${identityError}`)}</p> : null}
+        {identityMessage ? <p className="form-message" role="status">{t(`identity.${identityMessage}`)}</p> : null}
         <button className="secondary-button compact-control" type="submit" disabled={savingIdentity}>
-          {savingIdentity ? "Saving identity…" : "Save identity"}
+          {t(savingIdentity ? "identity.saving" : "identity.save")}
         </button>
       </form>
 
       <section className="machine-section" aria-labelledby={`grants-title-${identityID}`}>
         <div className="section-heading compact-section-heading">
           <div>
-            <p className="section-index">02 / Grants</p>
-            <h3 id={`grants-title-${identityID}`}>Environment grants</h3>
-            <p>Each grant names one existing project and one environment.</p>
+            <p className="section-index">{t("grants.sectionIndex")}</p>
+            <h3 id={`grants-title-${identityID}`}>{t("grants.title")}</h3>
+            <p>{t("grants.summary")}</p>
           </div>
         </div>
-        {projectState === "loading" ? <p className="loading-line" role="status">Loading projects and environments…</p> : null}
+        {projectState === "loading" ? <p className="loading-line" role="status">{t("grants.loading")}</p> : null}
         {projectState === "error" ? (
           <div className="inline-error-state compact-inline-error" role="alert">
-            <p>Projects and environments couldn’t be loaded. Existing grant IDs remain unchanged.</p>
-            <button className="secondary-button" type="button" onClick={onRetryProjects}>Retry grant options</button>
+            <p>{t("grants.optionsError")}</p>
+            <button className="secondary-button" type="button" onClick={onRetryProjects}>{t("grants.retryOptions")}</button>
           </div>
         ) : null}
         {projectState === "ready" && projects.length === 0 ? (
-          <p className="read-only-note">Create a project and environment before adding a grant.</p>
+          <p className="read-only-note">{t("grants.noOptions")}</p>
         ) : null}
         {projectState === "ready" && projects.length > 0 ? (
           <div className="grant-picker">
             <div className="form-field">
-              <label htmlFor={`grant-project-${identityID}`}>Project</label>
+              <label htmlFor={`grant-project-${identityID}`}>{t("grants.project")}</label>
               <select id={`grant-project-${identityID}`} value={projectID} onChange={(event) => setProjectID(event.currentTarget.value)}>
                 {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
               </select>
             </div>
             <div className="form-field">
-              <label htmlFor={`grant-environment-${identityID}`}>Environment</label>
+              <label htmlFor={`grant-environment-${identityID}`}>{t("grants.environment")}</label>
               <select id={`grant-environment-${identityID}`} value={environmentID} disabled={(selectedProject?.environments.length ?? 0) === 0} onChange={(event) => setEnvironmentID(event.currentTarget.value)}>
                 {(selectedProject?.environments ?? []).map((environment) => <option key={environment.id} value={environment.id}>{environment.name}</option>)}
               </select>
             </div>
-            <button className="secondary-button" type="button" disabled={!environmentID} onClick={addGrant}>Add grant</button>
+            <button className="secondary-button" type="button" disabled={!environmentID} onClick={addGrant}>{t("grants.add")}</button>
           </div>
         ) : null}
-        {grants.length === 0 ? <p className="read-only-note">This identity has no environment grants.</p> : (
+        {grants.length === 0 ? <p className="read-only-note">{t("grants.empty")}</p> : (
           <ul className="grant-list">
             {grants.map((grant) => (
               <li key={`${grant.project_id}:${grant.environment_id}`}>
-                <span>{grantLabel(projects, grant)}</span>
-                <button className="text-button" type="button" disabled={savingGrants} onClick={() => setGrants((current) => current.filter((candidate) => candidate.project_id !== grant.project_id || candidate.environment_id !== grant.environment_id))}>
-                  Remove grant
+                <span>{grantLabel(t, projects, grant)}</span>
+                <button className="text-button" type="button" aria-label={t("grants.removeLabel", { grant: grantLabel(t, projects, grant) })} disabled={savingGrants} onClick={() => setGrants((current) => current.filter((candidate) => candidate.project_id !== grant.project_id || candidate.environment_id !== grant.environment_id))}>
+                  {t("grants.remove")}
                 </button>
               </li>
             ))}
           </ul>
         )}
-        {grantError ? <p className="form-message" role="alert">{grantError}</p> : null}
-        {grantMessage ? <p className="form-message" role="status">{grantMessage}</p> : null}
+        {grantError ? <p className="form-message" role="alert">{t(`grants.${grantError}`)}</p> : null}
+        {grantMessage ? <p className="form-message" role="status">{t(`grants.${grantMessage}`)}</p> : null}
         <button className="secondary-button compact-control" type="button" disabled={savingGrants} onClick={() => void saveGrants()}>
-          {savingGrants ? "Saving grants…" : "Save grants"}
+          {t(savingGrants ? "grants.saving" : "grants.save")}
         </button>
       </section>
 
       <section className="machine-section" aria-labelledby={`tokens-title-${identityID}`}>
         <div className="section-heading compact-section-heading">
           <div>
-            <p className="section-index">03 / Tokens</p>
-            <h3 id={`tokens-title-${identityID}`}>Token register</h3>
-            <p>Plaintext appears once at issue time. The register keeps metadata only.</p>
+            <p className="section-index">{t("tokens.sectionIndex")}</p>
+            <h3 id={`tokens-title-${identityID}`}>{t("tokens.title")}</h3>
+            <p>{t("tokens.summary")}</p>
           </div>
-          <button className="secondary-button" type="button" disabled={!detail.enabled} onClick={() => setIssueOpen(true)}>Issue Token</button>
+          <button className="secondary-button" type="button" disabled={!detail.enabled} onClick={() => setIssueOpen(true)}>{t("tokens.issue")}</button>
         </div>
-        {detail.tokens.length === 0 ? <p className="read-only-note">No Tokens have been issued for this identity.</p> : (
+        {detail.tokens.length === 0 ? <p className="read-only-note">{t("tokens.empty")}</p> : (
           <div className="data-table-wrap token-table-wrap">
-            <table className="data-table token-table" aria-label={`${detail.name} Tokens`}>
-              <thead><tr><th scope="col">Token</th><th scope="col">Prefix</th><th scope="col">Expires</th><th scope="col">State</th><th scope="col">Actions</th></tr></thead>
+            <table className="data-table token-table" aria-label={t("tokens.tableLabel", { identity: detail.name })}>
+              <thead><tr><th scope="col">{t("tokens.columns.token")}</th><th scope="col">{t("tokens.columns.prefix")}</th><th scope="col">{t("tokens.columns.expires")}</th><th scope="col">{t("tokens.columns.state")}</th><th scope="col">{t("tokens.columns.actions")}</th></tr></thead>
               <tbody>
                 {detail.tokens.map((token) => (
                   <tr key={token.id}>
                     <th scope="row">{token.name}</th>
                     <td><span className="code-label">{token.prefix}</span></td>
-                    <td>{formatDateTime(token.expires_at)}</td>
-                    <td><span className="state-label">{tokenState(token)}</span></td>
+                    <td>{formatDateTime(token.expires_at, locale, t("tokens.timeUnavailable"))}</td>
+                    <td><span className="state-label">{t(`states.${tokenState(token)}`)}</span></td>
                     <td>
                       <div className="table-actions">
-                        <button className="text-button" type="button" onClick={() => setViewToken(token)}>View {token.name} Token</button>
-                        {token.revoked_at === null ? <button className="danger-button" type="button" onClick={() => setRevokeToken(token)}>Revoke {token.name} Token</button> : null}
+                        <button className="text-button" type="button" onClick={() => setViewToken(token)}>{t("tokens.view", { name: token.name })}</button>
+                        {token.revoked_at === null ? <button className="danger-button" type="button" onClick={() => setRevokeToken(token)}>{t("tokens.revoke", { name: token.name })}</button> : null}
                       </div>
                     </td>
                   </tr>
@@ -530,12 +589,13 @@ function IdentityPanel({
 }
 
 function CreateIdentityDialog({ client, onClose, onCreated }: { client: APIClient; onClose(): void; onCreated(identity: MachineIdentity): void }) {
+  const { t } = useTranslation(["machineAccess", "common"]);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [enabled, setEnabled] = useState(true);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState("");
-  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [error, setError] = useState<CreateErrorKey | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const nameRef = useRef<HTMLInputElement>(null);
   const submittingRef = useRef(false);
 
@@ -545,12 +605,12 @@ function CreateIdentityDialog({ client, onClose, onCreated }: { client: APIClien
     const localErrors = validateIdentity(name, description);
     setFieldErrors(localErrors);
     if (Object.keys(localErrors).length > 0) {
-      setError("Review the marked fields and try again.");
+      setError("reviewFields");
       return;
     }
     submittingRef.current = true;
     setSubmitting(true);
-    setError("");
+    setError(null);
     setFieldErrors({});
     try {
       const response = await client.post<{ identity: MachineIdentity }>("/machine-identities", { name, description, enabled });
@@ -558,15 +618,18 @@ function CreateIdentityDialog({ client, onClose, onCreated }: { client: APIClien
       onCreated(response.identity);
     } catch (caught) {
       if (caught instanceof APIError && caught.status === 422) {
-        const mapped = mapFieldErrors(caught.fields, ["name", "description"]);
+        const mapped = mapFieldErrors(caught.fields, {
+          name: "serverName",
+          description: "serverDescription",
+        });
         setFieldErrors(mapped.fields);
         setError(
           Object.keys(mapped.fields).length > 0 && !mapped.hasUnknown
-            ? "The identity couldn’t be created. Review the marked fields and try again."
-            : "The identity couldn’t be created. Your values are still here; try again.",
+            ? "fieldFailure"
+            : "failure",
         );
       } else {
-        setError("The identity couldn’t be created. Your values are still here; try again.");
+        setError("failure");
       }
     } finally {
       submittingRef.current = false;
@@ -576,10 +639,10 @@ function CreateIdentityDialog({ client, onClose, onCreated }: { client: APIClien
 
   return (
     <ModalDialog labelledBy="create-identity-title" describedBy="create-identity-description" initialFocusRef={nameRef} closeDisabled={submitting} onRequestClose={onClose}>
-      <header className="dialog-heading"><div><p className="section-index">Machine access / New</p><h2 id="create-identity-title">New machine identity</h2><p id="create-identity-description">Create the durable identity before assigning grants or Tokens.</p></div></header>
+      <header className="dialog-heading"><div><p className="section-index">{t("create.index")}</p><h2 id="create-identity-title">{t("create.title")}</h2><p id="create-identity-description">{t("create.description")}</p></div></header>
       <form className="resource-form" noValidate onSubmit={(event) => void submit(event)}>
         <div className="form-field">
-          <label htmlFor="machine-name">Machine name</label>
+          <label htmlFor="machine-name">{t("create.name")}</label>
           <input
             ref={nameRef}
             id="machine-name"
@@ -591,45 +654,48 @@ function CreateIdentityDialog({ client, onClose, onCreated }: { client: APIClien
             onChange={(event) => {
               setName(event.currentTarget.value);
               setFieldErrors((current) => withoutField(current, "name"));
-              setError("");
+              setError(null);
             }}
           />
-          <p className="field-help" id="machine-name-help">{byteLimitHelp(name, machineNameLimit)}</p>
-          {fieldErrors.name ? <p className="field-error" id="machine-name-error">{fieldErrors.name}</p> : null}
+          <p className="field-help" id="machine-name-help">{byteLimitHelp(t, name, machineNameLimit)}</p>
+          {fieldErrors.name ? <p className="field-error" id="machine-name-error">{validationMessage(t, fieldErrors.name)}</p> : null}
         </div>
         <div className="form-field">
-          <label htmlFor="machine-description">Description</label>
+          <label htmlFor="machine-description">{t("create.descriptionLabel")}</label>
           <textarea
+            className="resize-none"
             id="machine-description"
             value={description}
+            style={{ resize: "none" }}
             disabled={submitting}
             aria-invalid={fieldErrors.description ? "true" : undefined}
             aria-describedby={fieldDescription("machine-description-help", fieldErrors.description ? "machine-description-error" : undefined)}
             onChange={(event) => {
               setDescription(event.currentTarget.value);
               setFieldErrors((current) => withoutField(current, "description"));
-              setError("");
+              setError(null);
             }}
           />
-          <p className="field-help" id="machine-description-help">{byteLimitHelp(description, machineDescriptionLimit)}</p>
-          {fieldErrors.description ? <p className="field-error" id="machine-description-error">{fieldErrors.description}</p> : null}
+          <p className="field-help" id="machine-description-help">{byteLimitHelp(t, description, machineDescriptionLimit)}</p>
+          {fieldErrors.description ? <p className="field-error" id="machine-description-error">{validationMessage(t, fieldErrors.description)}</p> : null}
         </div>
-        <label className="checkbox-field"><input type="checkbox" checked={enabled} disabled={submitting} onChange={(event) => setEnabled(event.currentTarget.checked)} /><span>Enabled</span></label>
-        {error ? <p role="alert">{error}</p> : null}
-        <div className="dialog-actions"><button className="text-button" type="button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" type="submit" disabled={submitting}>{submitting ? "Creating identity…" : "Create identity"}</button></div>
+        <label className="checkbox-field"><input type="checkbox" checked={enabled} disabled={submitting} onChange={(event) => setEnabled(event.currentTarget.checked)} /><span>{t("create.enabled")}</span></label>
+        {error ? <p role="alert">{t(`create.${error}`)}</p> : null}
+        <div className="dialog-actions"><button className="text-button" type="button" disabled={submitting} onClick={onClose}>{t("common:actions.cancel")}</button><button className="primary-button" type="submit" disabled={submitting}>{t(submitting ? "create.pending" : "create.action")}</button></div>
       </form>
     </ModalDialog>
   );
 }
 
 export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { client: APIClient; identityID: string; onClose(): void; onIssued(token: MachineTokenMetadata): void }) {
+  const { t } = useTranslation(["machineAccess", "common"]);
   const [name, setName] = useState("");
   const [expiresAt, setExpiresAt] = useState(() => toDateTimeLocal(new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)));
   const [issued, setIssued] = useState<IssuedMachineToken | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState("");
-  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-  const [copyError, setCopyError] = useState("");
+  const [error, setError] = useState<IssueErrorKey | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
+  const [copyState, setCopyState] = useState<CopyState>("idle");
   const nameRef = useRef<HTMLInputElement>(null);
   const submittingRef = useRef(false);
   const activeRef = useRef(true);
@@ -640,19 +706,19 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
     event.preventDefault();
     if (submittingRef.current) return;
     const expiry = new Date(expiresAt);
-    const localErrors: Record<string, string> = {};
-    const nameError = validateName(name, "Token name");
+    const localErrors: FieldErrors = {};
+    const nameError = validateName(name, "token");
     const expiryError = validateExpiry(expiresAt, expiry);
     if (nameError) localErrors.name = nameError;
     if (expiryError) localErrors.expires_at = expiryError;
     setFieldErrors(localErrors);
     if (Object.keys(localErrors).length > 0) {
-      setError("Review the marked fields and try again.");
+      setError("reviewFields");
       return;
     }
     submittingRef.current = true;
     setSubmitting(true);
-    setError("");
+    setError(null);
     try {
       const response = await client.post<{ token: IssuedMachineToken }>(`/machine-identities/${encodeURIComponent(identityID)}/tokens`, { name, expires_at: expiry.toISOString() });
       if (!isIssuedTokenResponse(response)) throw new Error("invalid issued token response");
@@ -663,15 +729,18 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
     } catch (caught) {
       if (activeRef.current) {
         if (caught instanceof APIError && caught.status === 422) {
-          const mapped = mapFieldErrors(caught.fields, ["name", "expires_at"]);
+          const mapped = mapFieldErrors(caught.fields, {
+            name: "serverTokenName",
+            expires_at: "serverExpiry",
+          });
           setFieldErrors(mapped.fields);
           setError(
             Object.keys(mapped.fields).length > 0 && !mapped.hasUnknown
-              ? "The Token couldn’t be issued. Review the marked fields and try again."
-              : "The Token couldn’t be issued. Your values are still here; try again.",
+              ? "fieldFailure"
+              : "failure",
           );
         } else {
-          setError("The Token couldn’t be issued. Your values are still here; try again.");
+          setError("failure");
         }
       }
     } finally {
@@ -682,22 +751,23 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
 
   async function copyToken() {
     if (issued === null) return;
-    setCopyError("");
+    setCopyState("idle");
     try {
       if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(issued.plaintext);
+      if (activeRef.current) setCopyState("copied");
     } catch {
-      setCopyError("Copy failed. The Token remains visible; select and copy it manually before closing.");
+      if (activeRef.current) setCopyState("failed");
     }
   }
 
   return (
     <ModalDialog labelledBy="issue-token-title" describedBy="issue-token-description" initialFocusRef={issued === null ? nameRef : undefined} closeDisabled={submitting} onRequestClose={onClose}>
-      <header className="dialog-heading"><div><p className="section-index">Machine access / One-time value</p><h2 id="issue-token-title">Issue Token</h2><p id="issue-token-description">After this dialog closes, ConfigHub cannot show the plaintext again.</p></div></header>
+      <header className="dialog-heading"><div><p className="section-index">{t("issue.index")}</p><h2 id="issue-token-title">{t("issue.title")}</h2><p id="issue-token-description">{t("issue.description")}</p></div></header>
       {issued === null ? (
         <form className="resource-form" noValidate onSubmit={(event) => void submit(event)}>
           <div className="form-field">
-            <label htmlFor="token-name">Token name</label>
+            <label htmlFor="token-name">{t("issue.name")}</label>
             <input
               ref={nameRef}
               id="token-name"
@@ -709,14 +779,14 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
               onChange={(event) => {
                 setName(event.currentTarget.value);
                 setFieldErrors((current) => withoutField(current, "name"));
-                setError("");
+                setError(null);
               }}
             />
-            <p className="field-help" id="token-name-help">{byteLimitHelp(name, machineNameLimit)}</p>
-            {fieldErrors.name ? <p className="field-error" id="token-name-error">{fieldErrors.name}</p> : null}
+            <p className="field-help" id="token-name-help">{byteLimitHelp(t, name, machineNameLimit)}</p>
+            {fieldErrors.name ? <p className="field-error" id="token-name-error">{validationMessage(t, fieldErrors.name)}</p> : null}
           </div>
           <div className="form-field">
-            <label htmlFor="token-expiry">Expires at</label>
+            <label htmlFor="token-expiry">{t("issue.expiry")}</label>
             <input
               id="token-expiry"
               type="datetime-local"
@@ -728,20 +798,21 @@ export function IssueTokenDialog({ client, identityID, onClose, onIssued }: { cl
               onChange={(event) => {
                 setExpiresAt(event.currentTarget.value);
                 setFieldErrors((current) => withoutField(current, "expires_at"));
-                setError("");
+                setError(null);
               }}
             />
-            {fieldErrors.expires_at ? <p className="field-error" id="token-expiry-error">{fieldErrors.expires_at}</p> : null}
+            {fieldErrors.expires_at ? <p className="field-error" id="token-expiry-error">{validationMessage(t, fieldErrors.expires_at)}</p> : null}
           </div>
-          {error ? <p role="alert">{error}</p> : null}
-          <div className="dialog-actions"><button className="text-button" type="button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" type="submit" disabled={submitting}>{submitting ? "Issuing Token…" : "Issue Token"}</button></div>
+          {error ? <p role="alert">{t(`issue.${error}`)}</p> : null}
+          <div className="dialog-actions"><button className="text-button" type="button" disabled={submitting} onClick={onClose}>{t("common:actions.cancel")}</button><button className="primary-button" type="submit" disabled={submitting}>{t(submitting ? "issue.pending" : "issue.action")}</button></div>
         </form>
       ) : (
         <div className="one-time-token">
-          <p className="one-time-warning">Copy this Token now. Closing this dialog permanently removes it from the interface.</p>
-          <output className="token-plaintext" aria-label="Issued Token">{issued.plaintext}</output>
-          {copyError ? <p role="alert">{copyError}</p> : null}
-          <div className="dialog-actions"><button className="secondary-button" type="button" onClick={() => void copyToken()}>Copy Token</button><button className="primary-button" type="button" onClick={onClose}>I have copied it</button></div>
+          <p className="one-time-warning">{t("issue.warning")}</p>
+          <output className="token-plaintext" aria-label={t("issue.issuedLabel")}>{issued.plaintext}</output>
+          {copyState === "failed" ? <p role="alert">{t("issue.copyFailed")}</p> : null}
+          {copyState === "copied" ? <p role="status">{t("issue.copiedStatus")}</p> : null}
+          <div className="dialog-actions"><button className="secondary-button" type="button" onClick={() => void copyToken()}>{t(copyState === "copied" ? "issue.copied" : "issue.copy")}</button><button className="primary-button" type="button" onClick={onClose}>{t("issue.dismiss")}</button></div>
         </div>
       )}
     </ModalDialog>
@@ -760,19 +831,22 @@ function metadataFromIssuedToken(token: IssuedMachineToken): MachineTokenMetadat
 }
 
 function TokenMetadataDialog({ token, onClose }: { token: MachineTokenMetadata; onClose(): void }) {
+  const { i18n, t } = useTranslation("machineAccess");
+  const locale = resolvedLocale(i18n.resolvedLanguage);
   const closeRef = useRef<HTMLButtonElement>(null);
   return (
     <ModalDialog labelledBy="token-metadata-title" initialFocusRef={closeRef} onRequestClose={onClose}>
-      <header className="dialog-heading"><div><p className="section-index">Token metadata / Read only</p><h2 id="token-metadata-title">{token.name} Token</h2></div></header>
-      <dl className="metadata-ledger"><div><dt>Prefix</dt><dd className="code-label">{token.prefix}</dd></div><div><dt>Created</dt><dd>{formatDateTime(token.created_at)}</dd></div><div><dt>Expires</dt><dd>{formatDateTime(token.expires_at)}</dd></div><div><dt>State</dt><dd>{tokenState(token)}</dd></div></dl>
-      <div className="dialog-actions"><button ref={closeRef} className="primary-button" type="button" onClick={onClose}>Close metadata</button></div>
+      <header className="dialog-heading"><div><p className="section-index">{t("metadata.index")}</p><h2 id="token-metadata-title">{t("metadata.title", { name: token.name })}</h2></div></header>
+      <dl className="metadata-ledger"><div><dt>{t("metadata.prefix")}</dt><dd className="code-label">{token.prefix}</dd></div><div><dt>{t("metadata.created")}</dt><dd>{formatDateTime(token.created_at, locale, t("tokens.timeUnavailable"))}</dd></div><div><dt>{t("metadata.expires")}</dt><dd>{formatDateTime(token.expires_at, locale, t("tokens.timeUnavailable"))}</dd></div><div><dt>{t("metadata.state")}</dt><dd>{t(`states.${tokenState(token)}`)}</dd></div></dl>
+      <div className="dialog-actions"><button ref={closeRef} className="primary-button" type="button" onClick={onClose}>{t("metadata.close")}</button></div>
     </ModalDialog>
   );
 }
 
 function RevokeTokenDialog({ client, identityID, token, onClose, onRevoked }: { client: APIClient; identityID: string; token: MachineTokenMetadata; onClose(): void; onRevoked(): void }) {
+  const { t } = useTranslation(["machineAccess", "common"]);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(false);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const submittingRef = useRef(false);
   const activeRef = useRef(true);
@@ -782,12 +856,12 @@ function RevokeTokenDialog({ client, identityID, token, onClose, onRevoked }: { 
     if (submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
-    setError("");
+    setError(false);
     try {
       await client.delete(`/machine-identities/${encodeURIComponent(identityID)}/tokens/${encodeURIComponent(token.id)}`);
       if (activeRef.current) onRevoked();
     } catch {
-      if (activeRef.current) setError("The Token couldn’t be revoked. It remains active; check the service and try again.");
+      if (activeRef.current) setError(true);
     } finally {
       submittingRef.current = false;
       if (activeRef.current) setSubmitting(false);
@@ -796,11 +870,11 @@ function RevokeTokenDialog({ client, identityID, token, onClose, onRevoked }: { 
 
   return (
     <ModalDialog className="confirmation-panel" labelledBy="revoke-token-title" describedBy="revoke-token-description" initialFocusRef={cancelRef} closeDisabled={submitting} onRequestClose={onClose}>
-      <p className="section-index">Token control / Confirmation</p>
-      <h2 id="revoke-token-title">Revoke {token.name} Token?</h2>
-      <p id="revoke-token-description">Builds using this Token will lose access immediately. This action cannot be undone.</p>
-      {error ? <p className="confirmation-error" role="alert">{error}</p> : null}
-      <div className="dialog-actions"><button ref={cancelRef} className="text-button" type="button" disabled={submitting} onClick={onClose}>Cancel</button><button className="danger-button" type="button" disabled={submitting} onClick={() => void revoke()}>{submitting ? "Revoking…" : "Revoke Token"}</button></div>
+      <p className="section-index">{t("revoke.index")}</p>
+      <h2 id="revoke-token-title">{t("revoke.title", { name: token.name })}</h2>
+      <p id="revoke-token-description">{t("revoke.description")}</p>
+      {error ? <p className="confirmation-error" role="alert">{t("revoke.failure")}</p> : null}
+      <div className="dialog-actions"><button ref={cancelRef} className="text-button" type="button" disabled={submitting} onClick={onClose}>{t("common:actions.cancel")}</button><button className="danger-button" type="button" disabled={submitting} onClick={() => void revoke()}>{t(submitting ? "revoke.pending" : "revoke.action")}</button></div>
     </ModalDialog>
   );
 }
@@ -819,47 +893,62 @@ function trimGoSpace(value: string): string {
   return value.replace(goSpaceEdges, "");
 }
 
-function byteLimitHelp(value: string, limit: number): string {
-  return `UTF-8 size after trimming: ${utf8ByteLength(value)} bytes. Limit: ${limit} bytes.`;
+function byteLimitHelp(t: TFunction, value: string, limit: number): string {
+  return t("validation.byteLimit", { count: utf8ByteLength(value), limit });
 }
 
-function validateName(value: string, label: string): string {
+function validateName(
+  value: string,
+  kind: "machine" | "token",
+): ValidationErrorKey | null {
   const bytes = utf8ByteLength(value);
   if (trimGoSpace(value) === "") {
-    return `${label} is required.`;
+    return kind === "machine" ? "machineNameRequired" : "tokenNameRequired";
   }
   return bytes > machineNameLimit
-    ? `${label} must be between 1 and ${machineNameLimit} UTF-8 bytes after trimming.`
-    : "";
+    ? kind === "machine" ? "machineNameTooLong" : "tokenNameTooLong"
+    : null;
 }
 
-function validateDescription(value: string): string {
+function validateDescription(value: string): ValidationErrorKey | null {
   return utf8ByteLength(value) > machineDescriptionLimit
-    ? `Description must be at most ${machineDescriptionLimit} UTF-8 bytes after trimming.`
-    : "";
+    ? "descriptionTooLong"
+    : null;
 }
 
-function validateIdentity(name: string, description: string): Record<string, string> {
-  const fields: Record<string, string> = {};
-  const nameError = validateName(name, "Machine name");
+function validateIdentity(name: string, description: string): FieldErrors {
+  const fields: FieldErrors = {};
+  const nameError = validateName(name, "machine");
   const descriptionError = validateDescription(description);
   if (nameError) fields.name = nameError;
   if (descriptionError) fields.description = descriptionError;
   return fields;
 }
 
-function validateExpiry(value: string, expiry: Date): string {
+function validateExpiry(value: string, expiry: Date): ValidationErrorKey | null {
   const now = Date.now();
-  return !value || Number.isNaN(expiry.valueOf()) || expiry.valueOf() <= now || expiry.valueOf() > now + maxTokenLifetimeMilliseconds
-    ? "Choose an expiry in the future, no more than one year from now."
-    : "";
+  if (!value || Number.isNaN(expiry.valueOf())) {
+    return "expiryInvalid";
+  }
+  if (expiry.valueOf() <= now) {
+    return "expiryPast";
+  }
+  return expiry.valueOf() > now + maxTokenLifetimeMilliseconds
+    ? "expiryTooFar"
+    : null;
+}
+
+function validationMessage(t: TFunction, key: ValidationErrorKey): string {
+  return t(`validation.${key}`, {
+    limit: key === "descriptionTooLong" ? machineDescriptionLimit : machineNameLimit,
+  });
 }
 
 function fieldDescription(helpID: string, errorID?: string): string {
   return errorID ? `${helpID} ${errorID}` : helpID;
 }
 
-function withoutField(fields: Record<string, string>, field: string): Record<string, string> {
+function withoutField(fields: FieldErrors, field: MachineField): FieldErrors {
   if (!(field in fields)) {
     return fields;
   }
@@ -868,38 +957,34 @@ function withoutField(fields: Record<string, string>, field: string): Record<str
   return next;
 }
 
-function mapFieldErrors(
+function mapFieldErrors<K extends string, V extends string>(
   fields: Record<string, string>,
-  allowed: readonly string[],
-): { fields: Record<string, string>; hasUnknown: boolean } {
-  const mapped: Record<string, string> = {};
-  const allowedFields = new Set(allowed);
-  let hasUnknown = false;
-  for (const [field, message] of Object.entries(fields)) {
-    if (allowedFields.has(field) && message.trim() !== "") {
-      mapped[field] = message;
-    } else {
-      hasUnknown = true;
-    }
-  }
-  return { fields: mapped, hasUnknown };
+  messages: Record<K, V>,
+): { fields: Partial<Record<K, V>>; hasUnknown: boolean } {
+  const mapped = localizePresentFields(fields, messages);
+  return {
+    fields: mapped as Partial<Record<K, V>>,
+    hasUnknown: Object.keys(fields).some((field) => !Object.hasOwn(messages, field)),
+  };
 }
 
-function grantLabel(projects: ProjectOption[], grant: MachineEnvironmentGrant): string {
+function grantLabel(t: TFunction, projects: ProjectOption[], grant: MachineEnvironmentGrant): string {
   const project = projects.find((candidate) => candidate.id === grant.project_id);
   const environment = project?.environments.find((candidate) => candidate.id === grant.environment_id);
-  return project && environment ? `${project.name} / ${environment.name}` : `${grant.project_id} / ${grant.environment_id}`;
+  return t("grants.label", {
+    project: project?.name ?? grant.project_id,
+    environment: environment?.name ?? grant.environment_id,
+  });
 }
 
-function tokenState(token: MachineTokenMetadata): "Active" | "Expired" | "Revoked" {
-  if (token.revoked_at !== null) return "Revoked";
+function tokenState(token: MachineTokenMetadata): TokenState {
+  if (token.revoked_at !== null) return "revoked";
   const expiry = new Date(token.expires_at);
-  return Number.isNaN(expiry.valueOf()) || expiry <= new Date() ? "Expired" : "Active";
+  return Number.isNaN(expiry.valueOf()) || expiry <= new Date() ? "expired" : "active";
 }
 
-function formatDateTime(value: string): string {
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.valueOf()) ? "Unavailable" : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(parsed);
+function resolvedLocale(language: string | undefined): SupportedLocale {
+  return language === "zh-CN" ? "zh-CN" : "en-US";
 }
 
 function toDateTimeLocal(value: Date): string {

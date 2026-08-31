@@ -4,6 +4,7 @@ import { delay, http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../app/App";
 import { APIClient, APIError } from "../api/client";
+import { changeLocale } from "../i18n";
 import { server } from "../test/setup";
 import { IssueTokenDialog } from "./MachineAccessPage";
 
@@ -112,6 +113,90 @@ function apiError(status: number, code: string, fields: Record<string, string> =
 }
 
 describe("MachineAccessPage", () => {
+  it("localizes identity and Token lifecycle while preserving machine data", async () => {
+    await changeLocale("zh-CN");
+    mockMachinePage();
+    renderAdminAt();
+
+    expect(await screen.findByRole("heading", { name: "机器访问" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "shop-ci" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "签发 Token" })).toBeVisible();
+    expect(screen.getByRole("table", { name: "shop-ci 的 Token" })).toBeVisible();
+    expect(screen.getByText("primary")).toBeVisible();
+    expect(screen.getByText("ch_abc1234")).toBeVisible();
+    expect(screen.getByText("有效")).toBeVisible();
+    expect(screen.getByRole("button", { name: "吊销 primary Token" })).toBeVisible();
+  });
+
+  it("substitutes Chinese Token validation without exposing API details", async () => {
+    await changeLocale("zh-CN");
+    const client = new APIClient(() => "csrf-admin");
+    vi.spyOn(client, "post").mockRejectedValue(
+      new APIError(422, "validation_failed", "RAW SECRET detail", "req-token", {
+        name: "RAW FIELD VALUE",
+        unexpected_internal_field: "RAW UNKNOWN VALUE",
+      }),
+    );
+    render(
+      <IssueTokenDialog
+        client={client}
+        identityID="machine-ci"
+        onClose={vi.fn()}
+        onIssued={vi.fn()}
+      />,
+    );
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText("Token 名称"), "primary");
+    await user.click(screen.getByRole("button", { name: "签发 Token" }));
+
+    expect(await screen.findByText("Token 名称不符合要求。")).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent("无法签发 Token");
+    expect(screen.queryByText(/RAW SECRET|RAW FIELD|RAW UNKNOWN/iu)).not.toBeInTheDocument();
+  });
+
+  it("retranslates a visible Token failure without resetting entered values", async () => {
+    const client = new APIClient(() => "csrf-admin");
+    vi.spyOn(client, "post").mockRejectedValue(
+      new APIError(503, "unavailable", "RAW SECRET detail", "req-token", {}),
+    );
+    render(
+      <IssueTokenDialog
+        client={client}
+        identityID="machine-ci"
+        onClose={vi.fn()}
+        onIssued={vi.fn()}
+      />,
+    );
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText("Token name"), "release-ci");
+    await user.click(screen.getByRole("button", { name: "Issue Token" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("couldn’t be issued");
+
+    await changeLocale("zh-CN");
+
+    expect(screen.getByRole("alert")).toHaveTextContent("无法签发 Token");
+    expect(screen.getByLabelText("Token 名称")).toHaveValue("release-ci");
+    expect(screen.queryByText("RAW SECRET detail")).not.toBeInTheDocument();
+  });
+
+  it("owns validation and textarea resizing on touched identity forms", async () => {
+    mockMachinePage({ tokens: [] });
+    renderAdminAt();
+    const user = userEvent.setup();
+
+    const editDescription = await screen.findByLabelText("Description");
+    expect(editDescription.closest("form")).toHaveAttribute("novalidate");
+    expect(editDescription).toHaveStyle({ resize: "none" });
+
+    await user.click(screen.getByRole("button", { name: "New identity" }));
+    const createDialog = screen.getByRole("dialog", { name: "New machine identity" });
+    const createDescription = within(createDialog).getByLabelText("Description");
+    expect(createDescription.closest("form")).toHaveAttribute("novalidate");
+    expect(createDescription).toHaveStyle({ resize: "none" });
+  });
+
   it("redirects a non-admin before loading machine administration", async () => {
     mockSession("member");
     let machineRequests = 0;
@@ -258,11 +343,13 @@ describe("MachineAccessPage", () => {
     await user.type(description, "retained description");
     await user.click(within(dialog).getByRole("button", { name: "Create identity" }));
 
-    expect(await within(dialog).findByText("The service rejected this machine name.")).toBeInTheDocument();
+    expect(await within(dialog).findByText("Machine name doesn’t meet the requirements.")).toBeInTheDocument();
+    expect(within(dialog).getByText("Description doesn’t meet the requirements.")).toBeInTheDocument();
     expect(name).toHaveValue("build-ci");
     expect(description).toHaveValue("retained description");
     expect(name).toHaveAttribute("aria-describedby", "machine-name-help machine-name-error");
     expect(description).toHaveAttribute("aria-describedby", "machine-description-help machine-description-error");
+    expect(screen.queryByText(/service rejected this machine name|service rejected this description/iu)).not.toBeInTheDocument();
     expect(screen.queryByText("remote SECRET detail")).not.toBeInTheDocument();
   });
 
@@ -289,6 +376,26 @@ describe("MachineAccessPage", () => {
     const environment = await screen.findByLabelText("Environment");
     expect(environment).toBeDisabled();
     expect(screen.getByRole("button", { name: "Add grant" })).toBeDisabled();
+  });
+
+  it("substitutes the supported grants field without exposing its API value", async () => {
+    mockMachinePage({ tokens: [] });
+    server.use(
+      http.put("/api/v1/machine-identities/machine-ci/grants", () =>
+        apiError(422, "validation_failed", {
+          grants: "RAW GRANT FIELD VALUE",
+        }),
+      ),
+    );
+    renderAdminAt();
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "Save grants" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "environment grants don’t meet the requirements",
+    );
+    expect(screen.queryByText("RAW GRANT FIELD VALUE")).not.toBeInTheDocument();
   });
 
   it("retains grant selections and bounds a failed save response", async () => {
@@ -329,6 +436,9 @@ describe("MachineAccessPage", () => {
     expect(await screen.findByText("ch_once_only")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Copy Token" }));
     expect(writeText).toHaveBeenCalledWith("ch_once_only");
+    const copyStatus = screen.getByText("Token copied.");
+    expect(copyStatus).toHaveAttribute("role", "status");
+    expect(copyStatus).not.toHaveTextContent("ch_once_only");
     await user.click(screen.getByRole("button", { name: "I have copied it" }));
     expect(screen.queryByText("ch_once_only")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "View primary Token" }));
@@ -399,10 +509,12 @@ describe("MachineAccessPage", () => {
     expect(name).toHaveAccessibleDescription(/128 bytes.*limit: 128 bytes/iu);
     await user.click(screen.getByRole("button", { name: "Issue Token" }));
 
-    expect(await screen.findByText("The service rejected this Token name.")).toBeInTheDocument();
+    expect(await screen.findByText("Token name doesn’t meet the requirements.")).toBeInTheDocument();
+    expect(screen.getByText("Expiration doesn’t meet the requirements.")).toBeInTheDocument();
     expect(name).toHaveValue(exactName);
     expect(name).toHaveAttribute("aria-describedby", "token-name-help token-name-error");
     expect(expiry).toHaveAttribute("aria-describedby", "token-expiry-error");
+    expect(screen.queryByText(/service rejected this Token name|service rejected this expiry/iu)).not.toBeInTheDocument();
     expect(screen.queryByText("remote SECRET detail")).not.toBeInTheDocument();
   });
 
@@ -523,10 +635,11 @@ describe("MachineAccessPage", () => {
     fireEvent.change(description, { target: { value: exactDescription } });
     await user.click(screen.getByRole("button", { name: "Save identity" }));
 
-    expect(await screen.findByText("The service rejected this edited description.")).toBeInTheDocument();
+    expect(await screen.findByText("Description doesn’t meet the requirements.")).toBeInTheDocument();
     expect(requests).toBe(1);
     expect(description).toHaveValue(exactDescription);
-    expect(description).toHaveAccessibleDescription(/1024 bytes.*The service rejected this edited description/iu);
+    expect(description).toHaveAccessibleDescription(/1024 bytes.*Description doesn’t meet the requirements/iu);
+    expect(screen.queryByText("The service rejected this edited description.")).not.toBeInTheDocument();
     expect(screen.queryByText("remote SECRET detail")).not.toBeInTheDocument();
   });
 });
