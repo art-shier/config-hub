@@ -72,13 +72,15 @@ make_release_fixture() {
   printf '%s\n' server-arm64 >"$output/config-hub-server_1.2.3_linux_arm64.tar.gz"
   printf '%s\n' cli-amd64 >"$output/config-hub-cli_1.2.3_linux_amd64.tar.gz"
   printf '%s\n' cli-arm64 >"$output/config-hub-cli_1.2.3_linux_arm64.tar.gz"
+  printf '%s\n' cli-darwin-arm64 >"$output/config-hub-cli_1.2.3_darwin_arm64.tar.gz"
+  printf '%s\n' cli-windows-amd64 >"$output/config-hub-cli_1.2.3_windows_amd64.zip"
   (
     cd "$output"
-    sha256sum config-hub-*.tar.gz | LC_ALL=C sort -k2 >checksums.txt
+    sha256sum config-hub-*.tar.gz config-hub-*.zip | LC_ALL=C sort -k2 >checksums.txt
   )
 }
 
-expected_assets=$'checksums.txt\nconfig-hub-cli_1.2.3_linux_amd64.tar.gz\nconfig-hub-cli_1.2.3_linux_arm64.tar.gz\nconfig-hub-server_1.2.3_linux_amd64.tar.gz\nconfig-hub-server_1.2.3_linux_arm64.tar.gz'
+expected_assets=$'checksums.txt\nconfig-hub-cli_1.2.3_darwin_arm64.tar.gz\nconfig-hub-cli_1.2.3_linux_amd64.tar.gz\nconfig-hub-cli_1.2.3_linux_arm64.tar.gz\nconfig-hub-cli_1.2.3_windows_amd64.zip\nconfig-hub-server_1.2.3_linux_amd64.tar.gz\nconfig-hub-server_1.2.3_linux_arm64.tar.gz'
 
 success_release="$fixture_root/success-release"
 success_state="$fixture_root/success-state"
@@ -102,13 +104,39 @@ assert_fails env FAKE_GH_STATE_DIR="$existing_state" PATH="$fake_bin:$PATH" \
 assert_file "$existing_state/release"
 assert_not_file "$existing_state/deleted"
 
-missing_release="$fixture_root/missing-release"
-missing_state="$fixture_root/missing-state"
-make_release_fixture "$missing_release"
-rm -f -- "$missing_release/config-hub-cli_1.2.3_linux_arm64.tar.gz"
-assert_fails env FAKE_GH_STATE_DIR="$missing_state" PATH="$fake_bin:$PATH" \
-  bash "$repo_root/scripts/publish-release.sh" v1.2.3 "$missing_release"
-assert_not_file "$missing_state/release"
+missing_darwin_release="$fixture_root/missing-darwin-release"
+missing_darwin_state="$fixture_root/missing-darwin-state"
+make_release_fixture "$missing_darwin_release"
+rm -f -- "$missing_darwin_release/config-hub-cli_1.2.3_darwin_arm64.tar.gz"
+assert_fails env FAKE_GH_STATE_DIR="$missing_darwin_state" PATH="$fake_bin:$PATH" \
+  bash "$repo_root/scripts/publish-release.sh" v1.2.3 "$missing_darwin_release"
+assert_not_file "$missing_darwin_state/release"
+
+missing_windows_release="$fixture_root/missing-windows-release"
+missing_windows_state="$fixture_root/missing-windows-state"
+make_release_fixture "$missing_windows_release"
+rm -f -- "$missing_windows_release/config-hub-cli_1.2.3_windows_amd64.zip"
+assert_fails env FAKE_GH_STATE_DIR="$missing_windows_state" PATH="$fake_bin:$PATH" \
+  bash "$repo_root/scripts/publish-release.sh" v1.2.3 "$missing_windows_release"
+assert_not_file "$missing_windows_state/release"
+
+extra_release="$fixture_root/extra-release"
+extra_state="$fixture_root/extra-state"
+make_release_fixture "$extra_release"
+printf '%s\n' old-style >"$extra_release/config-hub-cli_1.2.3_windows_amd64.tar.gz"
+assert_fails env FAKE_GH_STATE_DIR="$extra_state" PATH="$fake_bin:$PATH" \
+  bash "$repo_root/scripts/publish-release.sh" v1.2.3 "$extra_release"
+assert_not_file "$extra_state/release"
+
+missing_checksum_release="$fixture_root/missing-checksum-release"
+missing_checksum_state="$fixture_root/missing-checksum-state"
+make_release_fixture "$missing_checksum_release"
+awk '$2 != "config-hub-cli_1.2.3_windows_amd64.zip"' \
+  "$missing_checksum_release/checksums.txt" >"$missing_checksum_release/checksums.filtered"
+mv -- "$missing_checksum_release/checksums.filtered" "$missing_checksum_release/checksums.txt"
+assert_fails env FAKE_GH_STATE_DIR="$missing_checksum_state" PATH="$fake_bin:$PATH" \
+  bash "$repo_root/scripts/publish-release.sh" v1.2.3 "$missing_checksum_release"
+assert_not_file "$missing_checksum_state/release"
 
 upload_release="$fixture_root/upload-release"
 upload_state="$fixture_root/upload-state"

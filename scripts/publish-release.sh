@@ -39,8 +39,10 @@ expected_asset_names() {
   local version="${tag#v}"
   printf '%s\n' \
     checksums.txt \
+    "config-hub-cli_${version}_darwin_arm64.tar.gz" \
     "config-hub-cli_${version}_linux_amd64.tar.gz" \
     "config-hub-cli_${version}_linux_arm64.tar.gz" \
+    "config-hub-cli_${version}_windows_amd64.zip" \
     "config-hub-server_${version}_linux_amd64.tar.gz" \
     "config-hub-server_${version}_linux_arm64.tar.gz"
 }
@@ -56,12 +58,12 @@ validate_local_assets() {
   [[ -d "$release_dir" && ! -L "$release_dir" ]] || die 'release directory must be a regular directory' || return
   expected="$(expected_asset_names "$tag")"
   actual="$(find "$release_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
-  [[ "$actual" == "$expected" ]] || die 'release directory does not contain the exact five assets' || return
+  [[ "$actual" == "$expected" ]] || die 'release directory does not contain the exact seven assets' || return
 
   expected_archives="$(printf '%s\n' "$expected" | awk '$0 != "checksums.txt"')"
   manifest_archives="$(awk 'NF == 2 { print $2 }' "$release_dir/checksums.txt" | LC_ALL=C sort)"
   [[ "$manifest_archives" == "$expected_archives" ]] ||
-    die 'checksum manifest does not cover the exact four archives' || return
+    die 'checksum manifest does not cover the exact six archives' || return
   (
     cd "$release_dir"
     sha256sum --check --strict checksums.txt >/dev/null
@@ -113,7 +115,7 @@ publish_release() {
   owned_draft=0
   owned_tag=''
   trap - EXIT
-  printf 'Published ConfigHub Release %s with five verified assets.\n' "$tag"
+  printf 'Published ConfigHub Release %s with verified cross-platform assets.\n' "$tag"
 }
 
 main() {
