@@ -77,6 +77,37 @@ func TestExecuteRunPassesArgumentsAndFetchesSelectedConfiguration(t *testing.T) 
 	}
 }
 
+func TestExecuteRunUsesLayeredConfigurationFiles(t *testing.T) {
+	const token = "ch_project_run_token"
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		authorization = request.Header.Get("Authorization")
+		_, _ = io.WriteString(w, `{"project":"shop","environment":"production","revision":4,"values":{"REMOTE_FROM_FILE":"yes"}}`)
+	}))
+	defer server.Close()
+	snapshot := configSnapshot{
+		Server: configValue{Value: server.URL, Present: true, Source: configSource{Kind: sourceGlobal, Path: "/global/config.yaml"}},
+		Token:  configValue{Value: token, Present: true, Source: configSource{Kind: sourceLocal, Path: "/project/.confighub.yaml"}},
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := execute(context.Background(), []string{
+		"run", "--project", "shop", "--env", "production", "--", helperBinary(t),
+	}, mapEnvironment(nil), &stdout, &stderr, func() (configSnapshot, error) {
+		return snapshot, nil
+	})
+
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	if authorization != "Bearer "+token {
+		t.Fatalf("Authorization=%q", authorization)
+	}
+	if !strings.Contains(stdout.String(), "REMOTE_FROM_FILE=yes\n") {
+		t.Fatalf("stdout omitted layered value: %q", stdout.String())
+	}
+}
+
 func TestExecuteRunReturnsExactChildExitCodeWithoutDiagnostic(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"project":"shop","environment":"production","revision":1,"values":{}}`)

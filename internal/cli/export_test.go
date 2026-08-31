@@ -159,6 +159,37 @@ func TestExecuteExportUsesExplicitServerAndTokenFileBeforeEnvironment(t *testing
 	}
 }
 
+func TestExecuteExportUsesLayeredConfigurationFiles(t *testing.T) {
+	const token = "ch_project_token"
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		authorization = request.Header.Get("Authorization")
+		_, _ = io.WriteString(w, `{"project":"shop","environment":"production","revision":13,"values":{"PORT":"8080"}}`)
+	}))
+	defer server.Close()
+	snapshot := configSnapshot{
+		Server: configValue{Value: server.URL, Present: true, Source: configSource{Kind: sourceGlobal, Path: "/global/config.yaml"}},
+		Token:  configValue{Value: token, Present: true, Source: configSource{Kind: sourceLocal, Path: "/project/.confighub.yaml"}},
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := execute(context.Background(), []string{
+		"export", "--project", "shop", "--env", "production", "--format", "json",
+	}, mapEnvironment(nil), &stdout, &stderr, func() (configSnapshot, error) {
+		return snapshot, nil
+	})
+
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if authorization != "Bearer "+token {
+		t.Fatalf("Authorization=%q", authorization)
+	}
+	if !strings.Contains(stdout.String(), `"revision": 13`) {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
 func TestExecuteExportFallsBackToEnvironment(t *testing.T) {
 	const token = "environment-token"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

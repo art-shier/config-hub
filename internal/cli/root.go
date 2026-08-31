@@ -27,6 +27,18 @@ var (
 )
 
 func Execute(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+	return execute(ctx, args, getenv, stdout, stderr, func() (configSnapshot, error) {
+		return loadCLIConfig(defaultConfigLocations())
+	})
+}
+
+func execute(
+	ctx context.Context,
+	args []string,
+	getenv func(string) string,
+	stdout, stderr io.Writer,
+	loadConfig configLoader,
+) int {
 	if getenv == nil {
 		getenv = func(string) string { return "" }
 	}
@@ -36,10 +48,11 @@ func Execute(ctx context.Context, args []string, getenv func(string) string, std
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	command := newRootCommand(ctx, getenv, stdout, stderr)
+	command := newRootCommandWithLoader(ctx, getenv, stdout, stderr, loadConfig)
 	command.SetArgs(args)
 	err := command.Execute()
 	var childExit *childExitStatus
+	var loadFailure *configLoadError
 	switch {
 	case err == nil:
 		return 0
@@ -48,6 +61,9 @@ func Execute(ctx context.Context, args []string, getenv func(string) string, std
 	case errors.Is(err, errRuntime):
 		fmt.Fprintln(stderr, runtimeDiagnostic(err))
 		return 1
+	case errors.As(err, &loadFailure):
+		fmt.Fprintf(stderr, "confighub: %s\n", loadFailure.Error())
+		return 2
 	default:
 		fmt.Fprintln(stderr, "confighub: invalid command usage")
 		return 2
@@ -55,6 +71,17 @@ func Execute(ctx context.Context, args []string, getenv func(string) string, std
 }
 
 func newRootCommand(ctx context.Context, getenv func(string) string, stdout, stderr io.Writer) *cobra.Command {
+	return newRootCommandWithLoader(ctx, getenv, stdout, stderr, func() (configSnapshot, error) {
+		return loadCLIConfig(defaultConfigLocations())
+	})
+}
+
+func newRootCommandWithLoader(
+	ctx context.Context,
+	getenv func(string) string,
+	stdout, stderr io.Writer,
+	loadConfig configLoader,
+) *cobra.Command {
 	var serverURL, tokenFile string
 	root := &cobra.Command{
 		Use:           "confighub",
@@ -71,6 +98,13 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 	root.SetErr(stderr)
 	root.PersistentFlags().StringVar(&serverURL, "server", "", "ConfigHub server URL (or CONFIGHUB_URL)")
 	root.PersistentFlags().StringVar(&tokenFile, "token-file", "", "read the machine token from a restricted file")
+	resolveConfig := func() (configSnapshot, error) {
+		snapshot, err := loadConfig()
+		if err != nil {
+			return configSnapshot{}, err
+		}
+		return resolveConnectionConfig(root, snapshot, serverURL, tokenFile, getenv)
+	}
 
 	var project, environment, service, format string
 	export := &cobra.Command{
@@ -81,11 +115,11 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 			if (format != "json" && format != "dotenv") || !slugPattern.MatchString(project) || !slugPattern.MatchString(environment) || !validService(service) {
 				return errLocalInput
 			}
-			resolvedURL, err := resolveServerURL(root, serverURL, getenv)
+			snapshot, err := resolveConfig()
 			if err != nil {
-				return errLocalInput
+				return err
 			}
-			resolvedToken, err := resolveToken(root, tokenFile, getenv)
+			resolvedURL, resolvedToken, err := requireConnectionConfig(snapshot)
 			if err != nil {
 				return errLocalInput
 			}
@@ -127,11 +161,11 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 			if !slugPattern.MatchString(runProject) || !slugPattern.MatchString(runEnvironment) || !validService(runService) {
 				return errLocalInput
 			}
-			resolvedURL, err := resolveServerURL(root, serverURL, getenv)
+			snapshot, err := resolveConfig()
 			if err != nil {
-				return errLocalInput
+				return err
 			}
-			resolvedToken, err := resolveToken(root, tokenFile, getenv)
+			resolvedURL, resolvedToken, err := requireConnectionConfig(snapshot)
 			if err != nil {
 				return errLocalInput
 			}
@@ -159,6 +193,7 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 	_ = run.MarkFlagRequired("project")
 	_ = run.MarkFlagRequired("env")
 	root.AddCommand(run)
+	root.AddCommand(newConfigCommand(loadConfig, resolveConfig, stdout))
 
 	version := &cobra.Command{
 		Use:   "version",
@@ -270,31 +305,6 @@ func safeDiagnosticField(value string, maxBytes int) bool {
 func asciiLetterOrDigit(character byte) bool {
 	return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
 		(character >= '0' && character <= '9')
-}
-
-func resolveServerURL(root *cobra.Command, flagValue string, getenv func(string) string) (string, error) {
-	if root.PersistentFlags().Lookup("server").Changed {
-		if flagValue == "" {
-			return "", errLocalInput
-		}
-		return flagValue, nil
-	}
-	value := getenv("CONFIGHUB_URL")
-	if value == "" {
-		return "", errLocalInput
-	}
-	return value, nil
-}
-
-func resolveToken(root *cobra.Command, tokenFile string, getenv func(string) string) (string, error) {
-	if root.PersistentFlags().Lookup("token-file").Changed {
-		return readTokenFile(tokenFile)
-	}
-	token := getenv("CONFIGHUB_TOKEN")
-	if !validToken(token) {
-		return "", errLocalInput
-	}
-	return token, nil
 }
 
 func readTokenFile(path string) (string, error) {
