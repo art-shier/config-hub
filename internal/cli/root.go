@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"syscall"
 
 	"confighub.local/internal/buildinfo"
 
@@ -302,14 +301,14 @@ func readTokenFile(path string) (string, error) {
 	if path == "" {
 		return "", errLocalInput
 	}
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	file, err := openTokenFile(path)
 	if err != nil {
 		return "", errLocalInput
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if err != nil || !info.Mode().IsRegular() || !tokenFilePermissionsValid(info.Mode()) {
 		return "", errLocalInput
 	}
 	content, err := io.ReadAll(io.LimitReader(file, maxTokenFileBytes+1))

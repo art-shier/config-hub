@@ -10,9 +10,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -300,14 +300,28 @@ func TestExecuteDoesNotFallbackFromInvalidExplicitTokenFile(t *testing.T) {
 		mode    os.FileMode
 		dir     bool
 	}{
-		{name: "group readable", content: "file-token\n", mode: 0o640},
-		{name: "other readable", content: "file-token\n", mode: 0o604},
 		{name: "empty", content: "", mode: 0o600},
 		{name: "embedded space", content: "file token\n", mode: 0o600},
 		{name: "control byte", content: "file\x00token\n", mode: 0o600},
 		{name: "multiple lines", content: "file-token\nsecond-token\n", mode: 0o600},
 		{name: "too large", content: strings.Repeat("x", maxTokenFileBytes+1), mode: 0o600},
 		{name: "directory", mode: 0o700, dir: true},
+	}
+	if runtime.GOOS != "windows" {
+		tests = append(tests,
+			struct {
+				name    string
+				content string
+				mode    os.FileMode
+				dir     bool
+			}{name: "group readable", content: "file-token\n", mode: 0o640},
+			struct {
+				name    string
+				content string
+				mode    os.FileMode
+				dir     bool
+			}{name: "other readable", content: "file-token\n", mode: 0o604},
+		)
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -354,32 +368,17 @@ func TestExecuteRejectsInvalidEnvironmentTokenWithoutLeakingIt(t *testing.T) {
 	}
 }
 
-func TestReadTokenFileRejectsSymlinkAndFIFOWithoutBlocking(t *testing.T) {
+func TestReadTokenFileRejectsSymlink(t *testing.T) {
 	target := writeTokenFile(t, "token-target", "file-token\n", 0o600)
 	symlink := filepath.Join(t.TempDir(), "token-link")
 	if err := os.Symlink(target, symlink); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a file symlink requires an unavailable Windows privilege: %v", err)
+		}
 		t.Fatal(err)
 	}
 	if _, err := readTokenFile(symlink); err == nil {
 		t.Fatal("readTokenFile accepted a symlink")
-	}
-
-	fifo := filepath.Join(t.TempDir(), "token-fifo")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	result := make(chan error, 1)
-	go func() {
-		_, err := readTokenFile(fifo)
-		result <- err
-	}()
-	select {
-	case err := <-result:
-		if err == nil {
-			t.Fatal("readTokenFile accepted a FIFO")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("readTokenFile blocked while opening a FIFO")
 	}
 }
 

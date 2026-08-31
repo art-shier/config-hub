@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -65,6 +66,9 @@ func TestEncodeDotenvPreservesCarriageReturnAndUnicodeRoundTrip(t *testing.T) {
 	want := "CARRIAGE='before\rafter'\nUNICODE='雪-😃'\n"
 	if !bytes.Equal([]byte(encoded), []byte(want)) {
 		t.Fatalf("bytes=% x want=% x", []byte(encoded), []byte(want))
+	}
+	if runtime.GOOS == "windows" {
+		return
 	}
 	path := filepath.Join(t.TempDir(), "values.env")
 	if err := os.WriteFile(path, []byte(encoded), 0o600); err != nil {
