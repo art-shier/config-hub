@@ -55,10 +55,17 @@ var runBackup backupOperation = func(ctx context.Context, cfg config.Config, out
 }
 
 func main() {
-	os.Exit(runCommand(context.Background(), os.Args[1:], os.Stderr))
+	os.Exit(runCommandWithIO(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 }
 
 func runCommand(ctx context.Context, args []string, stderr io.Writer) int {
+	return runCommandWithIO(ctx, args, io.Discard, stderr)
+}
+
+func runCommandWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if stdout == nil {
+		stdout = io.Discard
+	}
 	if stderr == nil {
 		stderr = io.Discard
 	}
@@ -81,6 +88,13 @@ func runCommand(ctx context.Context, args []string, stderr io.Writer) int {
 		if err == nil {
 			err = backup(ctx, configPath, output)
 		}
+	case "version":
+		if len(args) != 1 {
+			err = errUsage
+		} else if err := writeBuildVersion(stdout); err != nil {
+			fmt.Fprintln(stderr, "confighub-server: version output failed")
+			return 1
+		}
 	default:
 		err = errUsage
 	}
@@ -101,6 +115,18 @@ func runCommand(ctx context.Context, args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "confighub-server: server runtime failure")
 		return 1
 	}
+}
+
+func writeBuildVersion(writer io.Writer) error {
+	output := []byte(buildinfo.Version + "\n")
+	written, err := writer.Write(output)
+	if err != nil {
+		return err
+	}
+	if written != len(output) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func parseServeFlags(args []string) (string, error) {
@@ -265,4 +291,5 @@ func writeUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "Usage:")
 	fmt.Fprintln(writer, "  confighub-server serve --config FILE")
 	fmt.Fprintln(writer, "  confighub-server backup --config FILE --output FILE")
+	fmt.Fprintln(writer, "  confighub-server version")
 }

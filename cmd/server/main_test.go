@@ -16,9 +16,41 @@ import (
 	"testing/synctest"
 	"time"
 
+	"confighub.local/internal/buildinfo"
 	"confighub.local/internal/config"
 	"confighub.local/internal/database"
 )
+
+func TestVersionCommandWritesBuildVersionToStdout(t *testing.T) {
+	original := buildinfo.Version
+	buildinfo.Version = "v1.2.3"
+	t.Cleanup(func() { buildinfo.Version = original })
+	var stdout, stderr bytes.Buffer
+	code := runCommandWithIO(context.Background(), []string{"version"}, &stdout, &stderr)
+	if code != 0 || stdout.String() != "v1.2.3\n" || stderr.Len() != 0 {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestVersionCommandRejectsArguments(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runCommandWithIO(context.Background(), []string{"version", "extra"}, &stdout, &stderr)
+	if code != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "confighub-server version") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestVersionCommandReportsStdoutWriteFailure(t *testing.T) {
+	var stderr bytes.Buffer
+	code := runCommandWithIO(context.Background(), []string{"version"}, versionFailingWriter{}, &stderr)
+	if code != 1 || stderr.String() != "confighub-server: version output failed\n" {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
+type versionFailingWriter struct{}
+
+func (versionFailingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
 
 func TestNewHTTPServerAppliesTimeouts(t *testing.T) {
 	httpServer := newHTTPServer("127.0.0.1:8080", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), io.Discard)

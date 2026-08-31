@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 
+	"confighub.local/internal/buildinfo"
+
 	"github.com/spf13/cobra"
 )
 
@@ -158,6 +160,24 @@ func newRootCommand(ctx context.Context, getenv func(string) string, stdout, std
 	_ = run.MarkFlagRequired("project")
 	_ = run.MarkFlagRequired("env")
 	root.AddCommand(run)
+
+	version := &cobra.Command{
+		Use:   "version",
+		Short: "Print the ConfigHub CLI version",
+		Args:  cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			output := []byte(buildinfo.Version + "\n")
+			written, err := stdout.Write(output)
+			if err != nil {
+				return markRuntime(fmt.Errorf("%w: %w", errOutputWrite, err))
+			}
+			if written != len(output) {
+				return markRuntime(fmt.Errorf("%w: %w", errOutputWrite, io.ErrShortWrite))
+			}
+			return nil
+		},
+	}
+	root.AddCommand(version)
 	return root
 }
 
