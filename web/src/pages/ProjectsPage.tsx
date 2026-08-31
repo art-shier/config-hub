@@ -335,6 +335,7 @@ function CreateProjectDialog({
           }
         >
           <textarea
+            className="resize-none"
             id="project-description"
             name="description"
             rows={4}

@@ -1,0 +1,23 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": ["web/src"],
+  "canonicalMap": "UX-CONTRACT.md",
+  "requiredCapabilities": [
+    "Select/Listbox",
+    "Date",
+    "Form",
+    "Scrollbar",
+    "CRUD"
+  ],
+  "ownership": {
+    "Select/Listbox": "native",
+    "Date": "native"
+  },
+  "requiredCommands": ["typecheck", "unit", "build", "e2e"],
+  "commands": {
+    "typecheck": "npm run typecheck --prefix web",
+    "unit": "npm test --prefix web",
+    "build": "npm run build --prefix web",
+    "e2e": "npm run e2e --prefix web"
+  }
+}

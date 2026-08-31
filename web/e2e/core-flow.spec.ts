@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
 import {
   AsyncCleanupStack,
   ChildExitedBeforeReadyError,
@@ -193,6 +193,132 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
   assertMachineTokenCheck(reopenedDialogOmitsToken, "reopened");
 });
 
+test("locale follows Chinese browser preference and persists an explicit English choice", async ({ browser }) => {
+  const context = await browser.newContext({
+    locale: "zh-CN",
+    ignoreHTTPSErrors: true,
+    viewport: { width: 390, height: 844 },
+  });
+  try {
+    const page = await context.newPage();
+    await page.goto(`${runtimeServer.origin}/login`);
+
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+    await expect(page.getByRole("button", { name: "登录" })).toBeVisible();
+    await page.getByRole("combobox", { name: "语言" }).selectOption("en-US");
+    await expect(page.locator("html")).toHaveAttribute("lang", "en-US");
+
+    await page.reload();
+
+    await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("confighub.locale")))
+      .toBe("en-US");
+  } finally {
+    await context.close();
+  }
+});
+
+test("Chinese authenticated narrow workflow preserves route and form value across keyboard locale switches", async ({ browser }) => {
+  const context = await browser.newContext({
+    locale: "zh-CN",
+    ignoreHTTPSErrors: true,
+    reducedMotion: "reduce",
+    viewport: { width: 390, height: 844 },
+  });
+  try {
+    const page = await context.newPage();
+    await loginInChinese(page);
+
+    const headerLanguage = page.locator(".app-header .language-switcher select");
+    const navigationButton = page.getByRole("button", { name: "打开导航" });
+    const signOutButton = page.getByRole("button", { name: "退出登录" });
+    await expectNonOverlapping([
+      { name: "language selector", locator: headerLanguage },
+      { name: "navigation button", locator: navigationButton },
+      { name: "sign-out button", locator: signOutButton },
+    ], 390);
+
+    await navigationButton.focus();
+    await navigationButton.press("Enter");
+    const projectsLink = page.getByRole("link", { name: "项目" });
+    await expect(projectsLink).toBeFocused();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Tab");
+    const systemLink = page.getByRole("link", { name: "系统" });
+    await expect(systemLink).toBeFocused();
+    await systemLink.press("Enter");
+    await expect(page).toHaveURL(`${runtimeServer.origin}/system`);
+    await expect(page.getByRole("heading", { name: "系统", level: 1 })).toBeVisible();
+
+    const systemURL = page.url();
+    await headerLanguage.focus();
+    await headerLanguage.press("ArrowUp");
+    await expect(headerLanguage).toHaveValue("en-US");
+    await expect(headerLanguage).toHaveAccessibleName("Language");
+    await expect(headerLanguage).toBeFocused();
+    await expect(page.locator("html")).toHaveAttribute("lang", "en-US");
+    await expect(page).toHaveURL(systemURL);
+    await expect(page.getByRole("heading", { name: "System", level: 1 })).toBeVisible();
+
+    await headerLanguage.press("ArrowDown");
+    await expect(headerLanguage).toHaveValue("zh-CN");
+    await expect(headerLanguage).toHaveAccessibleName("语言");
+    await expect(headerLanguage).toBeFocused();
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+    await expect(page).toHaveURL(systemURL);
+
+    const machineNavigationButton = page.getByRole("button", { name: "打开导航" });
+    await machineNavigationButton.focus();
+    await machineNavigationButton.press("Enter");
+    const projectsLinkFromSystem = page.getByRole("link", { name: "项目" });
+    await expect(projectsLinkFromSystem).toBeFocused();
+    await page.keyboard.press("Tab");
+    const machineAccessLink = page.getByRole("link", { name: "机器访问" });
+    await expect(machineAccessLink).toBeFocused();
+    await machineAccessLink.press("Enter");
+    await expect(page).toHaveURL(`${runtimeServer.origin}/machine-access`);
+    await expect(page.getByRole("heading", { name: "机器访问", level: 1 })).toBeVisible();
+
+    const newIdentityButton = page.getByRole("button", { name: "新建身份" });
+    await newIdentityButton.focus();
+    await newIdentityButton.press("Enter");
+    const identityDialog = page.getByRole("dialog", { name: "新建机器身份" });
+    await identityDialog.getByLabel("机器名称").fill("locale-browser-agent");
+    await identityDialog.getByLabel("描述").fill("初始身份说明");
+    await identityDialog.getByRole("button", { name: "创建身份" }).press("Enter");
+    await expect(page.getByRole("heading", { name: "locale-browser-agent" })).toBeVisible();
+
+    const identityForm = page.locator(".machine-identity-form");
+    const identityDescription = identityForm.locator("textarea");
+    await expect(identityDescription).toHaveAccessibleName("描述");
+    const exactDraft = "语言切换草稿 / DATABASE_URL";
+    await identityDescription.fill(exactDraft);
+    const machineAccessURL = page.url();
+
+    await headerLanguage.focus();
+    await headerLanguage.press("ArrowUp");
+    await expect(headerLanguage).toHaveValue("en-US");
+    await expect(headerLanguage).toBeFocused();
+    await expect(page.locator("html")).toHaveAttribute("lang", "en-US");
+    await expect(page).toHaveURL(machineAccessURL);
+    await expect(identityDescription).toHaveValue(exactDraft);
+    await expect(identityDescription).toHaveAccessibleName("Description");
+    await expect(page.getByRole("heading", { name: "Machine Access", level: 1 })).toBeVisible();
+
+    await headerLanguage.press("ArrowDown");
+    await expect(headerLanguage).toHaveValue("zh-CN");
+    await expect(headerLanguage).toBeFocused();
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+    await expect(page).toHaveURL(machineAccessURL);
+    await expect(identityDescription).toHaveValue(exactDraft);
+    await expect(identityDescription).toHaveAccessibleName("描述");
+  } finally {
+    await context.close();
+  }
+});
+
 async function login(page: Page): Promise<void> {
   await page.goto(`${runtimeServer.origin}/login`);
   await page.getByLabel("Username").fill("admin");
@@ -209,6 +335,52 @@ async function login(page: Page): Promise<void> {
   }
   await expect(page).toHaveURL(`${runtimeServer.origin}/projects`);
   await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+}
+
+async function loginInChinese(page: Page): Promise<void> {
+  await page.goto(`${runtimeServer.origin}/login`);
+  await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+  await page.getByLabel("用户名").fill("admin");
+  await page.getByLabel("密码").fill(adminPassword);
+  const [loginResponse] = await Promise.all([
+    page.waitForResponse((response) => new URL(response.url()).pathname === "/api/v1/auth/login" && response.request().method() === "POST"),
+    page.getByRole("button", { name: "登录" }).click(),
+  ]);
+  const sessionCookie = (await page.context().cookies(runtimeServer.origin)).find((cookie) => cookie.name === "confighub_session");
+  if (sessionCookie?.value) observedBrowserCredentials.add(sessionCookie.value);
+  const loginPayload = await loginResponse.json() as { csrf_token?: unknown };
+  if (typeof loginPayload.csrf_token === "string" && loginPayload.csrf_token !== "") {
+    observedBrowserCredentials.add(loginPayload.csrf_token);
+  }
+  await expect(page).toHaveURL(`${runtimeServer.origin}/projects`);
+  await expect(page.getByRole("heading", { name: "项目", exact: true })).toBeVisible();
+}
+
+async function expectNonOverlapping(
+  controls: Array<{ name: string; locator: Locator }>,
+  viewportWidth: number,
+): Promise<void> {
+  const boxes = await Promise.all(controls.map(async ({ name, locator }) => {
+    await expect(locator).toBeVisible();
+    const box = await locator.boundingBox();
+    if (box === null) throw new Error(`${name} did not expose a bounding box`);
+    expect(box.x, `${name} starts outside the viewport`).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width, `${name} extends beyond the viewport`).toBeLessThanOrEqual(viewportWidth);
+    return { name, box };
+  }));
+
+  for (let leftIndex = 0; leftIndex < boxes.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < boxes.length; rightIndex += 1) {
+      const left = boxes[leftIndex];
+      const right = boxes[rightIndex];
+      const overlaps =
+        left.box.x < right.box.x + right.box.width &&
+        left.box.x + left.box.width > right.box.x &&
+        left.box.y < right.box.y + right.box.height &&
+        left.box.y + left.box.height > right.box.y;
+      expect(overlaps, `${left.name} overlaps ${right.name}`).toBe(false);
+    }
+  }
 }
 
 async function createProject(page: Page): Promise<void> {

@@ -123,7 +123,7 @@ The application shell contains the brand lockup, session controls, a responsive 
 
 ### Forms and overlays
 
-Fields are labelled native controls with compact uppercase metadata labels, strong borders, inline error text, and retained drafts. Native selects are canonical because operating-system-owned popup geometry is accepted. The `datetime-local` control is likewise platform-owned; its browser/OS locale, popup, geometry, and behavior are accepted. `ModalDialog` owns app dialogs with focus placement, Escape behavior, trapping, and focus restoration; product flows do not use browser dialogs.
+Fields are labelled native controls with compact uppercase metadata labels, strong borders, inline error text, and retained drafts. Product textareas use the shared `resize-none` behavior with an adequate default or component-specific minimum height; the canonical form-field minimum remains `7rem`, and longer configuration values retain their established scrollable writing area. Native selects are canonical because operating-system-owned popup geometry is accepted. The `datetime-local` control is likewise platform-owned; its browser/OS locale, popup, geometry, and behavior are accepted. `ModalDialog` owns app dialogs with focus placement, Escape behavior, trapping, and focus restoration; product flows do not use browser dialogs.
 
 ### Iconography
 
@@ -141,5 +141,6 @@ Use precise, plain operational language: name the record, state, action, and rec
 
 - **Do:** Keep the ruled ledger, high-contrast type hierarchy, and square control grammar visible in every shared surface.
 - **Do:** Reuse `web/src/styles.css` variables and existing shared React primitives; treat runtime CSS as canonical.
+- **Do:** Keep product textareas non-resizable through the shared `resize-none` class and preserve enough visible writing space for their workflow.
 - **Don't:** Add a second theme, remote font, or unrelated visual accent for localization.
 - **Don't:** Treat platform-owned select or `datetime-local` popup geometry as authored UI, or hide a workflow-critical localized action through clipping.

@@ -111,6 +111,21 @@ describe("ProjectsPage", () => {
     expect(screen.getByText("Storefront runtime configuration.")).toBeVisible();
   });
 
+  it("keeps the project description fixed-size with adequate writing space", async () => {
+    mockSession({ role: "admin" });
+    mockProjects([]);
+    renderAppAt("/projects");
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", { name: "New project" }),
+    );
+
+    const description = screen.getByLabelText("Description");
+    expect(description).toHaveClass("resize-none");
+    expect(description).toHaveAttribute("rows", "4");
+  });
+
   it("localizes project validation by field key and hides server text", async () => {
     mockSession({ role: "admin" });
     mockProjects([shop]);

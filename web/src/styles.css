@@ -935,7 +935,10 @@ a {
 
 .form-field textarea {
   min-height: 7rem;
-  resize: vertical;
+}
+
+.resize-none {
+  resize: none;
 }
 
 .form-field input:hover:not(:disabled),

@@ -52,7 +52,7 @@
 | Input | Labelled native field with line border and canvas surface. | Stronger border. | Copper/line focus treatment plus global outline. | Native behavior. | Reduced opacity and `not-allowed`. | Existing forms preserve dimensions. | `aria-invalid` border plus inline text where implemented. |
 | Secret input | Masked native password input on login. | Same as input. | Same as input. | Native behavior. | Disabled during sign-in. | Password value clears after attempt in current login flow. | Inline alert communicates recovery. |
 | Search | Feature-local search controls; no shared cross-screen search primitive. | Current component behavior. | Native focus treatment. | Native behavior. | Feature-specific. | Feature-specific. | Feature-specific recovery text. |
-| Textarea | Native field with current vertical resize behavior. | Stronger border. | Same as input. | Native behavior. | Reduced opacity and `not-allowed`. | Feature-specific. | Inline field message where implemented. |
+| Textarea | Native field using the shared `resize-none` class with an adequate default or component-specific minimum height. | Stronger border. | Same as input. | Native editing and scrolling; manual resizing is disabled. | Reduced opacity and `not-allowed`. | Feature-specific. | Inline field message where implemented. |
 | Table/list | Ruled semantic records with explicit loading/empty/error treatments. | Linked/actionable cells use their control behavior. | Native link/button focus. | Native behavior. | Not applicable to static rows. | Loading text preserves the register context. | Inline alert/retry state where implemented. |
 
 ## Dataset navigation
@@ -120,6 +120,7 @@
 - Server error mapping: Later localization may map stable API codes/field keys only; this foundation does not expose server messages as translated copy.
 - Sensitive-value handling: Existing password and issued-token handling remain unchanged; locale storage holds only a locale choice.
 - `noValidate`, first-invalid focus, duplicate-submit prevention, unsaved changes, and submit recovery: Preserve current component behavior; no form behavior is altered in this task.
+- Textarea sizing: Product textareas use the shared `resize-none` runtime owner in `web/src/styles.css`, retain adequate visible height (`7rem` for canonical form fields or an established component-specific equivalent), and remain internally scrollable for longer values.
 
 ## Permission and clipboard
 
