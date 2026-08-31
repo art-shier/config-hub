@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 import { App } from "../app/App";
+import { changeLocale } from "../i18n";
 import { server } from "../test/setup";
 
 function mockSession(role: "admin" | "member") {
@@ -23,6 +24,37 @@ function renderAt(path: string) {
 }
 
 describe("MembersPage", () => {
+  it("localizes account labels without changing synchronized user data", async () => {
+    await changeLocale("zh-CN");
+    mockSession("admin");
+    server.use(
+      http.get("/api/v1/users", () =>
+        HttpResponse.json({
+          users: [
+            {
+              id: "user-dev",
+              username: "developer-a",
+              display_name: "开发者 A 🚀",
+              role: "member",
+              enabled: true,
+              updated_at: "2026-08-29T08:30:00Z",
+            },
+          ],
+          last_successful_user_sync_at: "2026-08-29T09:00:00Z",
+        }),
+      ),
+    );
+
+    renderAt("/members");
+
+    expect(await screen.findByRole("heading", { name: "成员" })).toBeVisible();
+    expect(await screen.findByRole("table", { name: "同步账户" })).toBeVisible();
+    expect(screen.getByText("developer-a")).toBeVisible();
+    expect(screen.getByText("开发者 A 🚀")).toBeVisible();
+    expect(screen.getByText("成员", { selector: "td" })).toBeVisible();
+    expect(screen.getByText("已启用")).toBeVisible();
+  });
+
   it("redirects non-admins without requesting the synchronized register", async () => {
     mockSession("member");
     let userRequests = 0;

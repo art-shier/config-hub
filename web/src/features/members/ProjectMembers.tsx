@@ -4,10 +4,13 @@ import {
   useState,
   type FormEvent,
 } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import { APIError } from "../../api/client";
 import type { MemberGrant, MemberPermission } from "../../api/types";
 import { useAuth } from "../../auth/AuthProvider";
 import { ModalDialog } from "../../components/ModalDialog";
+import { localizePresentFields } from "../../i18n/apiErrors";
 
 interface MemberListResponse {
   members: MemberGrant[];
@@ -39,9 +42,48 @@ type PendingReconciliation = (
     }
 ) & { minimumRequest: number };
 
+type MemberErrorKey =
+  | "project.validation.username"
+  | "project.validation.permission"
+  | "project.validation.checkFields"
+  | "project.errors.reconciliation"
+  | "project.errors.alreadyInProgress"
+  | "project.errors.addNotConfirmed"
+  | "project.errors.saveNotConfirmed"
+  | "project.errors.removeNotConfirmed"
+  | "project.errors.addNotFound"
+  | "project.errors.grantNotFound"
+  | "project.errors.conflict"
+  | "project.errors.addFailed"
+  | "project.errors.saveFailed"
+  | "project.errors.removeFailed";
+type MemberStatus =
+  | {
+      kind:
+        | "loading"
+        | "refreshing"
+        | "loaded"
+        | "unavailable"
+        | "confirmationRequired"
+        | "accessSaved";
+    }
+  | { kind: "permissionUpdated"; name: string; permission: MemberPermission }
+  | { kind: "accessRemoved"; name: string }
+  | null;
+type MutationAction = "add" | "save" | "remove";
+type MemberMutationErrorState = {
+  kind: "mutation";
+  action: MutationAction;
+  status: number | null;
+  code: string | null;
+};
+type MemberError = MemberErrorKey | MemberMutationErrorState;
+type MemberMutationMessages = Record<
+  MutationAction,
+  { notFound: string; conflict: string; failure: string }
+>;
+
 const usernamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
-const reconciliationMessage =
-  "An access change may have been saved, but the member register has not confirmed it. Retry the register to load the authoritative grants.";
 
 export function ProjectMembers({
   canManage,
@@ -51,16 +93,19 @@ export function ProjectMembers({
   projectSlug: string;
 }) {
   const { client } = useAuth();
+  const { t } = useTranslation(["members", "common"]);
   const [members, setMembers] = useState<MemberGrant[]>([]);
   const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState("");
+  const [loadError, setLoadError] = useState(false);
   const [username, setUsername] = useState("");
   const [newPermission, setNewPermission] =
     useState<MemberPermission>("viewer");
   const [addSubmitting, setAddSubmitting] = useState(false);
   const addSubmittingRef = useRef(false);
-  const [addError, setAddError] = useState("");
-  const [addFields, setAddFields] = useState<Record<string, string>>({});
+  const [addError, setAddError] = useState<MemberError | null>(null);
+  const [addFields, setAddFields] = useState<
+    Partial<Record<"username" | "permission", MemberErrorKey>>
+  >({});
   const [permissionDrafts, setPermissionDrafts] = useState<
     Record<string, MemberPermission>
   >({});
@@ -75,11 +120,14 @@ export function ProjectMembers({
     new Map<string, PendingReconciliation>(),
   );
   const operationTokenRef = useRef(0);
-  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  const [rowErrors, setRowErrors] = useState<
+    Record<string, MemberError | null>
+  >({});
   const [confirmation, setConfirmation] = useState<MemberGrant | null>(null);
-  const [removeError, setRemoveError] = useState("");
-  const [status, setStatus] = useState("");
-  const [reconciliationError, setReconciliationError] = useState("");
+  const [removeError, setRemoveError] = useState<MemberError | null>(null);
+  const [status, setStatus] = useState<MemberStatus>({ kind: "loading" });
+  const [reconciliationError, setReconciliationError] =
+    useState<MemberErrorKey | null>(null);
   const statusRef = useRef<HTMLDivElement>(null);
   const projectGenerationRef = useRef(0);
   const memberListRequestRef = useRef(0);
@@ -98,22 +146,20 @@ export function ProjectMembers({
     setPermissionDrafts({});
     setRowErrors({});
     setConfirmation(null);
-    setRemoveError("");
-    setReconciliationError("");
+    setRemoveError(null);
+    setReconciliationError(null);
     appliedMemberListRequestRef.current = 0;
     appliedMembersRef.current = [];
-    setStatus("Loading project members…");
+    setStatus({ kind: "loading" });
     setLoading(true);
-    setLoadError("");
+    setLoadError(false);
     void refreshMembers(projectSlug, projectGeneration).then((result) => {
       if (projectGenerationRef.current === projectGeneration) {
         if (result.kind === "failed") {
-          setLoadError(
-            "Project members couldn’t be loaded. Check the server and try again.",
-          );
-          setStatus("Project members unavailable.");
+          setLoadError(true);
+          setStatus({ kind: "unavailable" });
         } else if (result.kind === "applied") {
-          setStatus("Project members loaded.");
+          setStatus({ kind: "loaded" });
         }
         setLoading(false);
       }
@@ -153,7 +199,7 @@ export function ProjectMembers({
         setPermissionDrafts,
         preservedUsernames,
       );
-      setLoadError("");
+      setLoadError(false);
       resolvePendingReconciliations(
         response.members,
         request,
@@ -174,29 +220,23 @@ export function ProjectMembers({
     const projectGeneration = projectGenerationRef.current;
     const reconcilingMutation = pendingReconciliationsRef.current.size > 0;
     setLoading(true);
-    setLoadError("");
-    setStatus(
-      reconcilingMutation
-        ? "Refreshing the member register…"
-        : "Loading project members…",
-    );
+    setLoadError(false);
+    setStatus({ kind: reconcilingMutation ? "refreshing" : "loading" });
     const result = await refreshMembers(projectSlug, projectGeneration);
     if (projectGenerationRef.current !== projectGeneration) {
       return;
     }
     if (result.kind === "applied" || result.kind === "superseded") {
       if (!reconcilingMutation) {
-        setStatus("Project members loaded.");
+        setStatus({ kind: "loaded" });
       }
     } else if (result.kind === "failed") {
       if (reconcilingMutation) {
-        setReconciliationError(reconciliationMessage);
-        setStatus("Member register confirmation required.");
+        setReconciliationError("project.errors.reconciliation");
+        setStatus({ kind: "confirmationRequired" });
       } else {
-        setLoadError(
-          "Project members couldn’t be loaded. Check the server and try again.",
-        );
-        setStatus("Project members unavailable.");
+        setLoadError(true);
+        setStatus({ kind: "unavailable" });
       }
     }
     setLoading(false);
@@ -211,8 +251,8 @@ export function ProjectMembers({
       ...current,
       [reconciliation.username]: reconciliation,
     }));
-    setReconciliationError(reconciliationMessage);
-    setStatus("Member register confirmation required.");
+    setReconciliationError("project.errors.reconciliation");
+    setStatus({ kind: "confirmationRequired" });
   }
 
   function resolvePendingReconciliations(
@@ -239,7 +279,7 @@ export function ProjectMembers({
       Object.fromEntries(pendingReconciliationsRef.current.entries()),
     );
     if (pendingReconciliationsRef.current.size === 0) {
-      setReconciliationError("");
+      setReconciliationError(null);
     }
 
     for (const reconciliation of pending) {
@@ -252,12 +292,10 @@ export function ProjectMembers({
         if (confirmed) {
           setUsername("");
           setNewPermission("viewer");
-          setAddError("");
-          setStatus("Member access saved.");
+          setAddError(null);
+          setStatus({ kind: "accessSaved" });
         } else {
-          setAddError(
-            "The refreshed register did not confirm this member grant. Review it and try again if needed.",
-          );
+          setAddError("project.errors.addNotConfirmed");
         }
         continue;
       }
@@ -271,13 +309,15 @@ export function ProjectMembers({
         setRowErrors((current) => ({
           ...current,
           [reconciliation.username]: confirmed
-            ? ""
-            : "The refreshed register did not confirm this permission change. Review it and try again if needed.",
+            ? null
+            : "project.errors.saveNotConfirmed",
         }));
         if (confirmed) {
-          setStatus(
-            `Permission for ${reconciliation.displayName} updated to ${titleCase(reconciliation.permission)}.`,
-          );
+          setStatus({
+            kind: "permissionUpdated",
+            name: reconciliation.displayName,
+            permission: reconciliation.permission,
+          });
         }
         continue;
       }
@@ -289,13 +329,14 @@ export function ProjectMembers({
         setConfirmation((current) =>
           current?.username === reconciliation.username ? null : current,
         );
-        setRemoveError("");
-        setStatus(`Access removed for ${reconciliation.displayName}.`);
+        setRemoveError(null);
+        setStatus({
+          kind: "accessRemoved",
+          name: reconciliation.displayName,
+        });
         window.requestAnimationFrame(() => statusRef.current?.focus());
       } else {
-        setRemoveError(
-          "The refreshed register still includes this grant. Review it before trying again.",
-        );
+        setRemoveError("project.errors.removeNotConfirmed");
       }
     }
   }
@@ -351,20 +392,18 @@ export function ProjectMembers({
     if (addSubmittingRef.current) {
       return;
     }
-    setStatus("");
-    setAddError("");
+    setStatus(null);
+    setAddError(null);
     setAddFields({});
     if (!usernamePattern.test(username)) {
-      const message =
-        "Enter a valid synchronized username using letters, numbers, dots, underscores, or hyphens.";
-      setAddFields({ username: message });
-      setAddError(message);
+      setAddFields({ username: "project.validation.username" });
+      setAddError("project.validation.username");
       return;
     }
 
     const operation = startRowOperation(username, "adding");
     if (operation === null) {
-      setAddError("An access change for this username is already in progress.");
+      setAddError("project.errors.alreadyInProgress");
       return;
     }
     const operationUsername = username;
@@ -413,12 +452,19 @@ export function ProjectMembers({
     if (confirmed) {
       setUsername("");
       setNewPermission("viewer");
-      setStatus("Member access saved.");
+      setStatus({ kind: "accessSaved" });
     } else if (mutationError instanceof APIError && mutationError.status === 422) {
-      setAddFields(mutationError.fields);
-      setAddError("Check the marked member fields and try again.");
+      setAddFields(
+        localizePresentFields(mutationError.fields, {
+          username: "project.validation.username",
+          permission: "project.validation.permission",
+        }) as Partial<
+          Record<"username" | "permission", MemberErrorKey>
+        >,
+      );
+      setAddError("project.validation.checkFields");
     } else if (refresh.kind === "failed") {
-      setAddError("");
+      setAddError(null);
       queueReconciliation({
         kind: "add",
         username: operationUsername,
@@ -426,11 +472,9 @@ export function ProjectMembers({
         minimumRequest: refresh.request,
       });
     } else if (mutationError !== null) {
-      setAddError(memberMutationError(mutationError, "add"));
+      setAddError(toMemberMutationErrorState(mutationError, "add"));
     } else if (mutationSucceeded) {
-      setAddError(
-        "The server did not confirm this member grant. Review the refreshed register and try again if needed.",
-      );
+      setAddError("project.errors.addNotConfirmed");
     }
     finishRowOperation(operationUsername, operation, projectGeneration);
     if (projectGenerationRef.current === projectGeneration) {
@@ -447,8 +491,8 @@ export function ProjectMembers({
     const permission = permissionDrafts[member.username] ?? member.permission;
     const requestedProjectSlug = projectSlug;
     const projectGeneration = projectGenerationRef.current;
-    setStatus("");
-    setRowErrors((current) => ({ ...current, [member.username]: "" }));
+    setStatus(null);
+    setRowErrors((current) => ({ ...current, [member.username]: null }));
     let mutationError: unknown = null;
     try {
       await client.putNoContent(memberPath(requestedProjectSlug, member.username), {
@@ -473,11 +517,13 @@ export function ProjectMembers({
           item.username === member.username && item.permission === permission,
       );
     if (confirmed) {
-      setStatus(
-        `Permission for ${member.display_name} updated to ${titleCase(permission)}.`,
-      );
+      setStatus({
+        kind: "permissionUpdated",
+        name: member.display_name,
+        permission,
+      });
     } else if (refresh.kind === "failed") {
-      setRowErrors((current) => ({ ...current, [member.username]: "" }));
+      setRowErrors((current) => ({ ...current, [member.username]: null }));
       queueReconciliation({
         kind: "save",
         username: member.username,
@@ -492,13 +538,12 @@ export function ProjectMembers({
       }));
       setRowErrors((current) => ({
         ...current,
-        [member.username]: memberMutationError(mutationError, "save"),
+        [member.username]: toMemberMutationErrorState(mutationError, "save"),
       }));
     } else {
       setRowErrors((current) => ({
         ...current,
-        [member.username]:
-          "The refreshed register did not confirm this permission change. Review it and try again if needed.",
+        [member.username]: "project.errors.saveNotConfirmed",
       }));
     }
     finishRowOperation(member.username, operation, projectGeneration);
@@ -515,8 +560,8 @@ export function ProjectMembers({
     }
     const requestedProjectSlug = projectSlug;
     const projectGeneration = projectGenerationRef.current;
-    setRemoveError("");
-    setStatus("");
+    setRemoveError(null);
+    setStatus(null);
     let mutationError: unknown = null;
     try {
       await client.delete(memberPath(requestedProjectSlug, member.username));
@@ -537,10 +582,10 @@ export function ProjectMembers({
       !refresh.members.some((item) => item.username === member.username);
     if (confirmedRemoved) {
       setConfirmation(null);
-      setStatus(`Access removed for ${member.display_name}.`);
+      setStatus({ kind: "accessRemoved", name: member.display_name });
       window.requestAnimationFrame(() => statusRef.current?.focus());
     } else if (refresh.kind === "failed") {
-      setRemoveError("");
+      setRemoveError(null);
       queueReconciliation({
         kind: "remove",
         username: member.username,
@@ -548,11 +593,11 @@ export function ProjectMembers({
         minimumRequest: refresh.request,
       });
     } else if (mutationError !== null) {
-      setRemoveError(memberMutationError(mutationError, "remove"));
-    } else {
       setRemoveError(
-        "The refreshed register still includes this grant. Review it before trying again.",
+        toMemberMutationErrorState(mutationError, "remove"),
       );
+    } else {
+      setRemoveError("project.errors.removeNotConfirmed");
     }
     finishRowOperation(member.username, operation, projectGeneration);
   }
@@ -560,21 +605,37 @@ export function ProjectMembers({
   const addAwaitingConfirmation = Object.values(pendingReconciliations).some(
     (reconciliation) => reconciliation.kind === "add",
   );
+  const permissionLabel = (permission: MemberPermission) =>
+    t(`permissions.${permission}`);
+  const statusMessage = status === null
+    ? ""
+    : status.kind === "permissionUpdated"
+      ? t("project.status.permissionUpdated", {
+          name: status.name,
+          permission: permissionLabel(status.permission),
+        })
+      : status.kind === "accessRemoved"
+        ? t("project.status.accessRemoved", { name: status.name })
+        : t(`project.status.${status.kind}`);
 
   return (
     <section className="members-panel" aria-labelledby="project-members-title">
       <header className="section-heading">
         <div>
-          <p className="section-index">Access register</p>
-          <h2 id="project-members-title">Project members</h2>
-          <p>Current project grants from the synchronized account directory.</p>
+          <p className="section-index">{t("project.index")}</p>
+          <h2 id="project-members-title">{t("project.title")}</h2>
+          <p>{t("project.summary")}</p>
         </div>
       </header>
 
       {canManage ? (
-        <form className="member-add-form" onSubmit={(event) => void handleAdd(event)}>
+        <form
+          className="member-add-form"
+          noValidate
+          onSubmit={(event) => void handleAdd(event)}
+        >
           <div className="form-field member-username-field">
-            <label htmlFor="member-username">Synchronized username</label>
+            <label htmlFor="member-username">{t("project.add.username")}</label>
             <input
               id="member-username"
               name="username"
@@ -593,16 +654,16 @@ export function ProjectMembers({
             />
             {addFields.username ? (
               <p className="field-error" id="member-username-error">
-                {addFields.username}
+                {t(addFields.username)}
               </p>
             ) : (
               <p className="field-help" id="member-username-help">
-                Enter the exact username from the synchronized directory.
+                {t("project.add.usernameHelp")}
               </p>
             )}
           </div>
           <div className="form-field">
-            <label htmlFor="new-member-permission">New member permission</label>
+            <label htmlFor="new-member-permission">{t("project.add.permission")}</label>
             <select
               id="new-member-permission"
               name="permission"
@@ -616,12 +677,12 @@ export function ProjectMembers({
                 setNewPermission(event.currentTarget.value as MemberPermission)
               }
             >
-              <option value="viewer">Viewer</option>
-              <option value="editor">Editor</option>
+              <option value="viewer">{permissionLabel("viewer")}</option>
+              <option value="editor">{permissionLabel("editor")}</option>
             </select>
             {addFields.permission ? (
               <p className="field-error" id="new-member-permission-error">
-                {addFields.permission}
+                {t(addFields.permission)}
               </p>
             ) : null}
           </div>
@@ -630,82 +691,89 @@ export function ProjectMembers({
             type="submit"
             disabled={addSubmitting || addAwaitingConfirmation}
           >
-            {addSubmitting ? "Adding member…" : "Add member"}
+            {t(addSubmitting ? "project.add.pending" : "project.add.action")}
           </button>
           <div className="form-message member-form-message" aria-live="polite">
-            {addError ? <p role="alert">{addError}</p> : null}
+            {addError ? <p role="alert">{memberErrorMessage(addError, t)}</p> : null}
           </div>
         </form>
       ) : (
-        <p className="read-only-note">
-          This register is read-only. Project administrators can change access.
-        </p>
+        <p className="read-only-note">{t("project.readOnly")}</p>
       )}
 
       <div
         ref={statusRef}
         className="sr-status"
         role="status"
-        aria-label="Member register status"
+        aria-label={t("project.statusLabel")}
         aria-live="polite"
         tabIndex={-1}
       >
-        {status}
+        {statusMessage}
       </div>
-      {loading ? <p className="loading-line">Loading project members…</p> : null}
+      {loading ? <p className="loading-line">{t("project.loading")}</p> : null}
       {reconciliationError && confirmation === null ? (
         <div role="alert">
-          <p>{reconciliationError}</p>
+          <p>{t(reconciliationError)}</p>
           <button
             className="secondary-button"
             type="button"
             disabled={loading}
             onClick={() => void retryMemberLoad()}
           >
-            {loading ? "Retrying register…" : "Retry register"}
+            {t(loading ? "project.retrying" : "project.retryRegister")}
           </button>
         </div>
       ) : null}
       {loadError ? (
         <div role="alert">
-          <p>{loadError}</p>
+          <p>{t("project.errors.load")}</p>
           <button
             className="secondary-button"
             type="button"
             onClick={() => void retryMemberLoad()}
           >
-            Retry
+            {t("common:actions.retry")}
           </button>
         </div>
       ) : null}
       {!loading && !loadError && members.length === 0 ? (
         <div className="empty-state compact-empty">
-          <h3>No member grants</h3>
+          <h3>{t("project.emptyTitle")}</h3>
           <p>
             {canManage
-              ? "Add a synchronized username to grant project access."
-              : "No synchronized accounts currently have a project grant."}
+              ? t("project.emptyManage")
+              : t("project.emptyReadOnly")}
           </p>
         </div>
       ) : null}
       {!loading && !loadError && members.length > 0 ? (
-        <ul className="member-list" aria-label="Current project grants">
+        <ul className="member-list" aria-label={t("project.currentGrants")}>
           {members.map((member) => {
             const rowOperation = rowOperations[member.username];
             const isSaving = rowOperation?.kind === "saving";
             const rowBusy =
               rowOperation !== undefined ||
               pendingReconciliations[member.username] !== undefined;
+            const rowError = rowErrors[member.username];
             return (
-              <li key={member.user_id} aria-label={`${member.display_name} access`}>
+              <li
+                key={member.user_id}
+                aria-label={t("project.rowLabel", {
+                  name: member.display_name,
+                })}
+              >
                 <div className="member-identity">
                   <strong>{member.display_name}</strong>
                   <span>@{member.username}</span>
                 </div>
                 {canManage ? (
                   <div className="member-controls">
-                    <label className="sr-only" htmlFor={`permission-${member.user_id}`}>
-                      Permission for {member.username}
+                    <label
+                      className="sr-only"
+                      htmlFor={`permission-${member.user_id}`}
+                    >
+                      {t("project.permissionFor", { username: member.username })}
                     </label>
                     <select
                       id={`permission-${member.user_id}`}
@@ -720,8 +788,8 @@ export function ProjectMembers({
                         }));
                       }}
                     >
-                      <option value="viewer">Viewer</option>
-                      <option value="editor">Editor</option>
+                      <option value="viewer">{permissionLabel("viewer")}</option>
+                      <option value="editor">{permissionLabel("editor")}</option>
                     </select>
                     <button
                       className="secondary-button"
@@ -729,28 +797,28 @@ export function ProjectMembers({
                       disabled={rowBusy}
                       onClick={() => void savePermission(member)}
                     >
-                      {isSaving ? "Saving…" : "Save permission"}
+                      {t(isSaving ? "project.saving" : "project.savePermission")}
                     </button>
                     <button
                       className="danger-button"
                       type="button"
                       disabled={rowBusy}
                       onClick={() => {
-                        setRemoveError("");
+                        setRemoveError(null);
                         setConfirmation(member);
                       }}
                     >
-                      Remove access
+                      {t("project.removeAccess")}
                     </button>
-                    {rowErrors[member.username] ? (
+                    {rowError ? (
                       <p className="row-error" role="alert">
-                        {rowErrors[member.username]}
+                        {memberErrorMessage(rowError, t)}
                       </p>
                     ) : null}
                   </div>
                 ) : (
                   <span className="permission-label">
-                    {titleCase(member.permission)}
+                    {permissionLabel(member.permission)}
                   </span>
                 )}
               </li>
@@ -774,7 +842,7 @@ export function ProjectMembers({
           onCancel={() => {
             if (rowOperations[confirmation.username] === undefined) {
               setConfirmation(null);
-              setRemoveError("");
+              setRemoveError(null);
             }
           }}
           onRemove={() => void removeMember()}
@@ -797,16 +865,18 @@ function RemoveMemberDialog({
   retryingReconciliation,
 }: {
   awaitingReconciliation: boolean;
-  error: string;
+  error: MemberError | null;
   member: MemberGrant;
   onCancel(): void;
   onRemove(): void;
   onRetryReconciliation(): void;
-  reconciliationError: string;
+  reconciliationError: MemberError | null;
   removing: boolean;
   retryingReconciliation: boolean;
 }) {
+  const { t } = useTranslation(["members", "common"]);
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const dialogError = error ?? reconciliationError;
 
   return (
     <ModalDialog
@@ -817,15 +887,19 @@ function RemoveMemberDialog({
       closeDisabled={removing}
       onRequestClose={onCancel}
     >
-      <p className="section-index">Access register / Confirmation</p>
-      <h2 id="remove-member-title">Remove {member.display_name} access</h2>
+      <p className="section-index">{t("project.dialog.index")}</p>
+      <h2 id="remove-member-title">
+        {t("project.dialog.title", { name: member.display_name })}
+      </h2>
       <p id="remove-member-description">
-        Remove project access for {member.display_name} (@{member.username})? This
-        takes effect immediately.
+        {t("project.dialog.description", {
+          name: member.display_name,
+          username: member.username,
+        })}
       </p>
-      {error || reconciliationError ? (
+      {dialogError ? (
         <p className="confirmation-error" role="alert">
-          {error || reconciliationError}
+          {memberErrorMessage(dialogError, t)}
         </p>
       ) : null}
       <div className="dialog-actions">
@@ -836,7 +910,7 @@ function RemoveMemberDialog({
           disabled={removing}
           onClick={onCancel}
         >
-          Cancel
+          {t("common:actions.cancel")}
         </button>
         {reconciliationError ? (
           <button
@@ -845,7 +919,11 @@ function RemoveMemberDialog({
             disabled={retryingReconciliation}
             onClick={onRetryReconciliation}
           >
-            {retryingReconciliation ? "Retrying register…" : "Retry register"}
+            {t(
+              retryingReconciliation
+                ? "project.retrying"
+                : "project.retryRegister",
+            )}
           </button>
         ) : null}
         <button
@@ -854,7 +932,7 @@ function RemoveMemberDialog({
           disabled={removing || awaitingReconciliation}
           onClick={onRemove}
         >
-          {removing ? "Removing access…" : "Remove access"}
+          {t(removing ? "project.removing" : "project.removeAccess")}
         </button>
       </div>
     </ModalDialog>
@@ -890,29 +968,52 @@ function memberPath(projectSlug: string, username: string): string {
   return `${memberCollectionPath(projectSlug)}/${encodeURIComponent(username)}`;
 }
 
-function memberMutationError(
+function toMemberMutationErrorState(
   error: unknown,
-  action: "add" | "save" | "remove",
-): string {
-  if (error instanceof APIError) {
-    if (error.status === 404 || error.code === "not_found") {
-      return action === "add"
-        ? "That synchronized user or project could not be found. Check the username and try again."
-        : "The member grant could not be found. Reload the register and try again.";
-    }
-    if (error.status === 409 || error.code === "resource_conflict") {
-      return "The grant changed on the server. Reload the register before trying again.";
-    }
-  }
-  if (action === "remove") {
-    return "Access wasn’t removed. The current grant is unchanged; try again.";
-  }
-  if (action === "save") {
-    return "Permission wasn’t saved. The current grant is unchanged; try again.";
-  }
-  return "Member access couldn’t be added. Keep these values and try again.";
+  action: MutationAction,
+): MemberMutationErrorState {
+  return {
+    kind: "mutation",
+    action,
+    status: error instanceof APIError ? error.status : null,
+    code: error instanceof APIError ? error.code : null,
+  };
 }
 
-function titleCase(permission: MemberPermission): string {
-  return permission === "editor" ? "Editor" : "Viewer";
+function memberMutationError(
+  error: Pick<MemberMutationErrorState, "status" | "code">,
+  action: MutationAction,
+  messages: MemberMutationMessages,
+): string {
+  const actionMessages = messages[action];
+  if (error.status === 404 || error.code === "not_found") {
+    return actionMessages.notFound;
+  }
+  if (error.status === 409 || error.code === "resource_conflict") {
+    return actionMessages.conflict;
+  }
+  return actionMessages.failure;
+}
+
+function memberErrorMessage(error: MemberError, t: TFunction): string {
+  if (typeof error === "string") {
+    return t(error);
+  }
+  return memberMutationError(error, error.action, {
+    add: {
+      notFound: t("project.errors.addNotFound"),
+      conflict: t("project.errors.conflict"),
+      failure: t("project.errors.addFailed"),
+    },
+    save: {
+      notFound: t("project.errors.grantNotFound"),
+      conflict: t("project.errors.conflict"),
+      failure: t("project.errors.saveFailed"),
+    },
+    remove: {
+      notFound: t("project.errors.grantNotFound"),
+      conflict: t("project.errors.conflict"),
+      failure: t("project.errors.removeFailed"),
+    },
+  });
 }

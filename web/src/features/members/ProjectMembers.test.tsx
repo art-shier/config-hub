@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AuthProvider } from "../../auth/AuthProvider";
+import { changeLocale } from "../../i18n";
 import { server } from "../../test/setup";
 import { ProjectMembers } from "./ProjectMembers";
 
@@ -89,6 +90,79 @@ function apiError(
 }
 
 describe("ProjectMembers", () => {
+  it("localizes permissions without changing usernames or payload values", async () => {
+    await changeLocale("zh-CN");
+    mockMembers([
+      {
+        user_id: "user-alex",
+        username: "alex.dev",
+        display_name: "Alex 开发者",
+        permission: "viewer",
+      },
+    ]);
+    renderMembers("admin", true);
+
+    expect(await screen.findByRole("heading", { name: "项目成员" })).toBeVisible();
+    expect(screen.getByText("@alex.dev")).toBeVisible();
+    expect(screen.getByText("Alex 开发者")).toBeVisible();
+    expect(
+      within(screen.getByLabelText("新成员权限")).getByRole("option", {
+        name: "编辑者",
+      }),
+    ).toHaveValue("editor");
+  });
+
+  it("does not render project-member server field messages", async () => {
+    await changeLocale("zh-CN");
+    mockMembers();
+    server.use(
+      http.put("/api/v1/projects/shop/members/:username", () =>
+        apiError(422, "validation_failed", {
+          username: "RAW USERNAME FIELD",
+          permission: "RAW PERMISSION FIELD",
+        }),
+      ),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    await screen.findByText("Alex Smith");
+
+    await user.type(screen.getByLabelText("同步用户名"), "disabled.user");
+    await user.click(screen.getByRole("button", { name: "添加成员" }));
+
+    expect(await screen.findByText("请输入有效的同步用户名。")).toBeVisible();
+    expect(screen.getByText("请选择有效的成员权限。")).toBeVisible();
+    expect(screen.queryByText(/RAW/iu)).not.toBeInTheDocument();
+  });
+
+  it("retranslates an already-visible permission status after locale changes", async () => {
+    let currentMembers: TestMember[] = [alex];
+    server.use(
+      http.get("/api/v1/projects/shop/members", () =>
+        HttpResponse.json({ members: currentMembers }),
+      ),
+      http.put("/api/v1/projects/shop/members/alex.smith", () => {
+        currentMembers = [{ ...alex, permission: "editor" }];
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderMembers("admin", true);
+    const user = userEvent.setup();
+    const row = await screen.findByRole("listitem", { name: "Alex Smith access" });
+
+    await user.selectOptions(
+      within(row).getByLabelText("Permission for alex.smith"),
+      "editor",
+    );
+    await user.click(within(row).getByRole("button", { name: "Save permission" }));
+    expect(await screen.findByText("Permission for Alex Smith updated to Editor.")).toBeVisible();
+
+    await changeLocale("zh-CN");
+
+    expect(await screen.findByText("Alex Smith 的权限已更新为编辑者。")).toBeVisible();
+    expect(screen.queryByText("Permission for Alex Smith updated to Editor.")).not.toBeInTheDocument();
+  });
+
   it("lists current grants without inventing a user directory", async () => {
     mockMembers();
     renderMembers("member", false);
@@ -257,7 +331,10 @@ describe("ProjectMembers", () => {
 
     const username = await screen.findByLabelText("Synchronized username");
     expect(username).toHaveValue("disabled.user");
-    expect(username).toHaveAccessibleDescription("The synchronized user is disabled.");
+    expect(username).toHaveAccessibleDescription(
+      "Enter a valid synchronized username using letters, numbers, dots, underscores, or hyphens.",
+    );
+    expect(screen.queryByText("The synchronized user is disabled.")).not.toBeInTheDocument();
     expect(screen.getByLabelText("New member permission")).toHaveValue("editor");
     expect(screen.getByText("Alex Smith")).toBeInTheDocument();
     expect(screen.queryByText("SECRET")).not.toBeInTheDocument();
