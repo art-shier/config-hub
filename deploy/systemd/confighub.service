@@ -1,0 +1,31 @@
+[Unit]
+Description=ConfigHub configuration server
+Documentation=https://github.com/art-shier/config-hub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=confighub
+Group=confighub
+UMask=0077
+WorkingDirectory=/var/lib/confighub
+ExecStart=/usr/local/bin/confighub-server serve --config /etc/confighub/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/confighub
+ReadWritePaths=/var/lib/confighub /var/backups/confighub
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
