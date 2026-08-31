@@ -55,7 +55,8 @@
 
 - `.github/workflows/ci.yml`: pull request and `main` quality workflow with read-only contents permission.
 - `.github/workflows/release.yml`: tag-only quality, packaging, draft Release upload, asset verification, and publication.
-- `scripts/tests/workflow_contract_test.sh`: tests workflow triggers, permissions, toolchain pins, validation, and expected asset publication contract.
+- `scripts/publish-release.sh`: atomically creates a draft Release, uploads and verifies the five assets, publishes on success, and deletes its own draft on failure.
+- `scripts/tests/publish_release_test.sh`: exercises successful publication, existing-Release refusal, incomplete assets, upload failure cleanup, and remote asset mismatch with a controlled `gh` boundary.
 - `.gitattributes`: keeps Bash and workflow files LF-normalized.
 - `scripts/check.sh`: includes the new Bash test suite before browser/runtime acceptance.
 - `README.md`: documents product split, release flow, independent install/upgrade, operations, and conservative uninstall.
@@ -241,17 +242,7 @@ assert_fails validate_release_tag 1.2.3
 assert_fails validate_release_tag v1.2.3-rc.1
 ```
 
-The same test asserts the unit contains the exact stable directives:
-
-```text
-User=confighub
-Group=confighub
-UMask=0077
-ExecStart=/usr/local/bin/confighub-server serve --config /etc/confighub/config.yaml
-ExecReload=/bin/kill -HUP $MAINPID
-ReadWritePaths=/var/lib/confighub /var/backups/confighub
-ReadOnlyPaths=/etc/confighub
-```
+The test invokes `systemd-analyze verify deploy/systemd/confighub.service` when systemd tooling is available. CI always runs the same command on Ubuntu, so invalid directives, missing sections, bad dependencies, and malformed command lines fail through systemd's real parser rather than source-text assertions.
 
 - [ ] **Step 2: Run the package tests and confirm missing files fail**
 
@@ -536,32 +527,56 @@ git commit -m "feat: deploy Server from GitHub releases"
 
 ---
 
-### Task 5: Add CI and atomic GitHub Release publication
+### Task 5: Add tested atomic publication and GitHub Actions orchestration
 
 **Files:**
 - Create: `.github/workflows/ci.yml`
 - Create: `.github/workflows/release.yml`
-- Create: `scripts/tests/workflow_contract_test.sh`
+- Create: `scripts/publish-release.sh`
+- Create: `scripts/tests/publish_release_test.sh`
 
 **Interfaces:**
 - CI consumes pull requests and `main` pushes, with `contents: read` only.
 - Release consumes strict version-tag pushes and publishes the five locked assets only after quality and package checks.
+- `scripts/publish-release.sh TAG RELEASE_DIRECTORY` owns the stateful `gh release` transaction and is independently behavior-tested.
 
-- [ ] **Step 1: Write failing workflow contract tests**
+- [ ] **Step 1: Write failing Release publication behavior tests**
 
-The Bash test requires both YAML files and asserts:
+Create a fixture Release directory with the exact four archives and `checksums.txt`. Put a stateful executable named `gh` first on `PATH`; it implements the subset of `gh release view/create/upload/edit/delete` used by production and records draft existence, uploaded basenames, publication, and deletion in a temporary state directory.
 
-- CI has `pull_request`, `push` limited to `main`, `permissions: contents: read`, Go `1.25.x`, Node `24.15.0`, Playwright Chromium setup, shellcheck, actionlint, and `./scripts/check.sh`;
-- Release has tag pattern `v*`, no branch trigger, explicit read permission plus job-scoped `contents: write`, checkout `fetch-depth: 0`, strict tag validation, `./scripts/check.sh`, `./scripts/package-release.sh`, exact five-asset verification, draft creation, upload, remote asset verification, and final draft publication;
-- no workflow mentions Docker, a separate Web archive, or an unsupported architecture.
+Invoke the real missing `scripts/publish-release.sh v1.2.3 "$release_dir"` and assert observable state:
 
-- [ ] **Step 2: Run the contract and confirm workflows are missing**
+- all five exact assets are uploaded and the Release becomes non-draft on success;
+- an already existing Release is unchanged and the command fails;
+- a missing, extra, or misnamed local asset fails before `gh release create`;
+- simulated upload failure deletes the draft created by this run and never publishes;
+- a remote asset-name mismatch deletes the draft and never publishes;
+- cleanup never deletes an existing Release that the script did not create.
 
-Run: `bash scripts/tests/workflow_contract_test.sh`
+- [ ] **Step 2: Run the publication tests and confirm the script is missing**
 
-Expected: FAIL because `.github/workflows` does not exist.
+Run: `bash scripts/tests/publish_release_test.sh`
 
-- [ ] **Step 3: Implement `.github/workflows/ci.yml`**
+Expected: FAIL because `scripts/publish-release.sh` does not exist.
+
+- [ ] **Step 3: Implement the transactional publication script**
+
+The script uses `set -euo pipefail`, validates the strict tag and exact local basename set, rejects an existing Release, and creates a draft with `--verify-tag --generate-notes --title "$tag"`. Immediately after successful creation it marks the draft as owned by this process and installs an `EXIT` trap. The trap calls `gh release delete "$tag" --yes` only while the owned draft flag is set.
+
+Upload all five explicit paths without `--clobber`, query `gh release view "$tag" --json assets,isDraft`, and compare hand-derived sorted asset names plus draft state. Publish with `gh release edit "$tag" --draft=false`; only after that succeeds clear the owned draft flag and trap. The script accepts `gh` only through `PATH`, enabling the test double without adding production-only hooks.
+
+- [ ] **Step 4: Run publication tests green**
+
+Run:
+
+```bash
+bash -n scripts/publish-release.sh scripts/tests/publish_release_test.sh
+bash scripts/tests/publish_release_test.sh
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Implement `.github/workflows/ci.yml`**
 
 Use `ubuntu-24.04`, `actions/checkout@v4`, `actions/setup-go@v5` with `go-version: 1.25.x`, and `actions/setup-node@v4` with `node-version: 24.15.0` plus npm cache keyed by `web/package-lock.json`. Run:
 
@@ -572,39 +587,34 @@ sudo apt-get update
 sudo apt-get install --yes shellcheck
 shellcheck scripts/*.sh scripts/tests/*.sh
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+systemd-analyze verify deploy/systemd/confighub.service
 ./scripts/check.sh
 ```
 
 Set a bounded job timeout and concurrency that cancels superseded runs for the same ref.
 
-- [ ] **Step 4: Implement `.github/workflows/release.yml`**
+- [ ] **Step 6: Implement `.github/workflows/release.yml`**
 
 Use the same runner/toolchain/lint/quality setup and `fetch-depth: 0`. Validate `GITHUB_REF_NAME` with Bash's strict regex before packaging. After `scripts/package-release.sh "$GITHUB_REF_NAME"`, compare sorted basenames in `dist/release` to the exact expected list computed from the version.
 
-Publication is one `gh` step with `GH_TOKEN: ${{ github.token }}`:
+Publication is one thin step with `GH_TOKEN: ${{ github.token }}` that runs `./scripts/publish-release.sh "$GITHUB_REF_NAME" dist/release`. Do not duplicate the transaction in YAML.
 
-1. refuse if `gh release view "$tag"` already succeeds;
-2. create a draft Release with `--verify-tag --generate-notes --title "$tag"`;
-3. install an `EXIT` trap that deletes only the draft created by this run if upload/verification fails;
-4. upload the five explicit paths without clobber;
-5. query `gh release view --json assets,isDraft`, compare exact sorted remote asset names, and require draft state;
-6. publish with `gh release edit "$tag" --draft=false`, then disable cleanup.
-
-- [ ] **Step 5: Run workflow contract and syntax validation**
+- [ ] **Step 7: Run behavior and configuration validation**
 
 Run:
 
 ```bash
-bash scripts/tests/workflow_contract_test.sh
+bash scripts/tests/publish_release_test.sh
+systemd-analyze verify deploy/systemd/confighub.service
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 ```
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit automation**
+- [ ] **Step 8: Commit automation**
 
 ```bash
-git add .github/workflows/ci.yml .github/workflows/release.yml scripts/tests/workflow_contract_test.sh
+git add .github/workflows/ci.yml .github/workflows/release.yml scripts/publish-release.sh scripts/tests/publish_release_test.sh
 git commit -m "ci: publish verified GitHub releases"
 ```
 
@@ -631,7 +641,7 @@ Create `scripts/tests/run.sh` with `set -euo pipefail`, resolve its own director
 package_release_test.sh
 install_cli_test.sh
 deploy_server_test.sh
-workflow_contract_test.sh
+publish_release_test.sh
 ```
 
 Run: `bash scripts/tests/run.sh`
