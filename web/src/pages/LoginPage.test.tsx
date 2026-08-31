@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { delay, http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   MemoryRouter,
   Route,
@@ -101,6 +101,33 @@ async function signIn(username = "admin", password = "password") {
   await waitFor(() => expect(submit).toBeEnabled());
   await user.click(submit);
 }
+
+beforeEach(() => {
+  // Break caught: authenticated destination tests emitting unhandled-request diagnostics instead of exercising a complete route fixture.
+  server.use(
+    http.get("/api/v1/projects", () => HttpResponse.json({ projects: [] })),
+    http.get("/api/v1/projects/shop", () =>
+      HttpResponse.json({
+        project: {
+          id: "project-shop",
+          slug: "shop",
+          name: "Shop",
+          description: "Storefront runtime configuration.",
+          created_at: "2026-08-20T08:00:00Z",
+          updated_at: "2026-08-29T08:30:00Z",
+          permission: "admin",
+          environments: [],
+        },
+      }),
+    ),
+    http.get("/api/v1/users", () =>
+      HttpResponse.json({
+        users: [],
+        last_successful_user_sync_at: "2026-08-30T08:00:00Z",
+      }),
+    ),
+  );
+});
 
 describe("authentication routes", () => {
   // Break caught: remounting login while applying a locale, which loses an in-progress username.

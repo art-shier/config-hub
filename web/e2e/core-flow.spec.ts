@@ -23,6 +23,9 @@ const originalDatabaseValue = "postgres://e2e-revision-one";
 const revisionTwoDatabaseValue = "postgres://e2e-revision-two";
 const originalFeatureValue = "e2e-feature-revision-one";
 const sessionSigningKey = "e2e-session-key-012345678901234567890123456789012345";
+const matrixConfigurationValue =
+  "line one / 保持原样\nDATABASE_URL=https://matrix.example.test/路径?mode=exact&flag=✓";
+const matrixChangeMessage = "发布 Locale matrix v1 / 不翻译数据";
 let issuedMachineToken = "";
 const observedBrowserCredentials = new Set<string>();
 
@@ -59,7 +62,7 @@ test.afterAll(async () => {
     } catch {
       stopFailed = true;
     }
-    for (const secret of [adminPassword, developerPassword, sessionSigningKey, originalDatabaseValue, revisionTwoDatabaseValue, originalFeatureValue, issuedMachineToken, ...observedBrowserCredentials]) {
+    for (const secret of [adminPassword, developerPassword, sessionSigningKey, originalDatabaseValue, revisionTwoDatabaseValue, originalFeatureValue, matrixConfigurationValue, issuedMachineToken, ...observedBrowserCredentials]) {
       if (secret === "") continue;
       if (runtimeServer.logs().includes(secret)) {
         throw new Error("runtime logs contained browser credentials or configuration values");
@@ -319,6 +322,276 @@ test("Chinese authenticated narrow workflow preserves route and form value acros
   }
 });
 
+// Break caught: localized async and validation states falling back to stale English or raw API details.
+test("localized project recovery re-renders loading, failure, retry, empty, and validation states without raw server text", async ({ browser }) => {
+  const context = await browser.newContext({
+    locale: "zh-CN",
+    ignoreHTTPSErrors: true,
+    viewport: { width: 1280, height: 900 },
+  });
+  const firstRequestSeen = createDeferred<void>();
+  const releaseFirstRequest = createDeferred<void>();
+  const rawMarker = "RAW_BROWSER_ACCEPTANCE_DETAIL";
+  let projectListRequests = 0;
+  try {
+    const page = await context.newPage();
+    await page.route("**/api/v1/projects", async (route) => {
+      if (route.request().method() === "POST") {
+        await route.fulfill({
+          status: 422,
+          json: {
+            error: {
+              code: "validation_failed",
+              message: rawMarker,
+              request_id: "req-browser-validation",
+              fields: { slug: rawMarker },
+            },
+          },
+        });
+        return;
+      }
+      projectListRequests += 1;
+      if (projectListRequests === 1) {
+        firstRequestSeen.resolve();
+        await releaseFirstRequest.promise;
+        await route.fulfill({
+          status: 503,
+          json: {
+            error: {
+              code: "service_unavailable",
+              message: rawMarker,
+              request_id: "req-browser-load",
+              fields: {},
+            },
+          },
+        });
+        return;
+      }
+      await route.fulfill({ status: 200, json: { projects: [] } });
+    });
+
+    const login = loginInChinese(page);
+    await firstRequestSeen.promise;
+    await login;
+    const headerLanguage = page.locator(".app-header .language-switcher select");
+    await expect(page.getByRole("status")).toHaveText("正在加载项目…");
+
+    await headerLanguage.selectOption("en-US");
+    await expect(page.getByRole("status")).toHaveText("Loading projects…");
+    await headerLanguage.selectOption("zh-CN");
+    await expect(page.getByRole("status")).toHaveText("正在加载项目…");
+    releaseFirstRequest.resolve();
+
+    await expect(page.getByRole("heading", { name: "项目暂不可用" })).toBeVisible();
+    await expect(page.getByText("无法加载项目。请检查服务器后重试。")).toBeVisible();
+    await expect(page.locator("body")).not.toContainText(rawMarker);
+
+    await headerLanguage.selectOption("en-US");
+    await expect(page.getByRole("heading", { name: "Projects unavailable" })).toBeVisible();
+    await expect(page.getByText("Projects couldn’t be loaded. Check the server and try again.")).toBeVisible();
+    await headerLanguage.selectOption("zh-CN");
+    await page.getByRole("button", { name: "重试" }).click();
+    await expect(page.getByRole("heading", { name: "尚无项目" })).toBeVisible();
+
+    await page.getByRole("button", { name: "新建项目" }).click();
+    const chineseDialog = page.getByRole("dialog", { name: "新建项目" });
+    await chineseDialog.getByLabel("项目标识").fill("invalid slug");
+    await chineseDialog.getByLabel("项目名称").fill("Exact validation draft / 验证草稿");
+    await chineseDialog.getByRole("button", { name: "创建项目" }).click();
+    await expect(chineseDialog.getByText("项目标识不符合要求。")).toBeVisible();
+    await expect(chineseDialog.getByRole("alert")).toHaveText("请检查标记的字段后重试。");
+    await expect(chineseDialog.getByLabel("项目标识")).toHaveValue("invalid slug");
+    await expect(page.locator("body")).not.toContainText(rawMarker);
+    await chineseDialog.getByRole("button", { name: "取消" }).click();
+
+    await headerLanguage.selectOption("en-US");
+    await expect(page.getByRole("heading", { name: "No projects yet" })).toBeVisible();
+    await page.getByRole("button", { name: "New project" }).click();
+    const dialog = page.getByRole("dialog", { name: "New project" });
+    await dialog.getByLabel("Project slug").fill("invalid slug");
+    await dialog.getByLabel("Project name").fill("Exact validation draft / 验证草稿");
+    await dialog.getByRole("button", { name: "Create project" }).click();
+    await expect(dialog.getByText("Project slug is invalid.")).toBeVisible();
+    await expect(dialog.getByRole("alert")).toHaveText("Check the marked fields and try again.");
+    await expect(dialog.getByLabel("Project slug")).toHaveValue("invalid slug");
+    await expect(page.locator("body")).not.toContainText(rawMarker);
+  } finally {
+    releaseFirstRequest.resolve();
+    await context.close();
+  }
+});
+
+// Break caught: 200% desktop reflow or locale replacement dropping an exact configuration draft or clipping an admin surface.
+test("200 percent reflow keeps every localized admin surface usable and preserves an exact configuration draft", async ({ browser }) => {
+  const context = await browser.newContext({
+    locale: "zh-CN",
+    ignoreHTTPSErrors: true,
+    reducedMotion: "reduce",
+    viewport: { width: 1440, height: 1000 },
+  });
+  try {
+    const page = await context.newPage();
+    await loginInChinese(page);
+    const headerLanguage = page.locator(".app-header .language-switcher select");
+
+    await page.getByRole("button", { name: "新建项目" }).click();
+    const projectDialog = page.getByRole("dialog", { name: "新建项目" });
+    await projectDialog.getByLabel("项目标识").fill("locale-matrix");
+    await projectDialog.getByLabel("项目名称").fill("Locale Matrix 业务项目");
+    await projectDialog.getByLabel("说明").fill("Long exact business description / 业务说明 / " + "X".repeat(160));
+    await projectDialog.getByRole("button", { name: "创建项目" }).click();
+    await page.getByRole("link", { name: "Locale Matrix 业务项目" }).click();
+    await expect(page.getByRole("heading", { name: "Locale Matrix 业务项目", level: 1 })).toBeVisible();
+
+    await page.getByRole("button", { name: "新建环境" }).click();
+    const environmentDialog = page.getByRole("dialog", { name: "新建环境" });
+    await environmentDialog.getByLabel("环境标识").fill("production");
+    await environmentDialog.getByLabel("环境名称").fill("Production 生产环境");
+    await environmentDialog.getByRole("button", { name: "创建环境" }).click();
+    await expect(page.getByRole("option", { name: "Production 生产环境" })).toBeAttached();
+
+    await expect(page.getByRole("heading", { name: "配置", level: 2 })).toBeVisible();
+    await page.getByRole("button", { name: "编辑配置" }).click();
+    await page.getByRole("button", { name: "添加条目" }).click();
+    const draftList = page.locator(".configuration-draft-list");
+    await expect(draftList).toHaveAccessibleName("配置条目");
+    const draftRow = draftList.locator("fieldset").last();
+    const draftInputs = draftRow.locator("input");
+    const draftKey = draftInputs.nth(0);
+    const draftValue = draftRow.locator("textarea");
+    const draftService = draftInputs.nth(1);
+    const changeMessage = page.locator("#configuration-message");
+    await expect(changeMessage).toHaveAccessibleName("变更说明");
+    await draftKey.fill("MATRIX_EXACT_VALUE");
+    await draftValue.fill(matrixConfigurationValue);
+    await draftService.fill("api-服务");
+    await changeMessage.fill(matrixChangeMessage);
+    const configurationURL = page.url();
+
+    await headerLanguage.focus();
+    await headerLanguage.press("ArrowUp");
+    await expect(headerLanguage).toHaveValue("en-US");
+    await expect(headerLanguage).toBeFocused();
+    await expect(page).toHaveURL(configurationURL);
+    await expect(page.getByRole("heading", { name: "Edit configuration", level: 2 })).toBeVisible();
+    await expect(draftList).toHaveAccessibleName("Configuration entries");
+    await expect(draftKey).toHaveValue("MATRIX_EXACT_VALUE");
+    await expect(draftValue).toHaveValue(matrixConfigurationValue.replaceAll("\r\n", "\n").replaceAll("\r", "\n"));
+    await expect(draftService).toHaveValue("api-服务");
+    await expect(changeMessage).toHaveValue(matrixChangeMessage);
+    await expect(changeMessage).toHaveAccessibleName("Change message");
+    await expect(draftValue).toHaveAccessibleName("Value for MATRIX_EXACT_VALUE");
+
+    await headerLanguage.press("ArrowDown");
+    await expect(headerLanguage).toHaveValue("zh-CN");
+    await expect(headerLanguage).toBeFocused();
+    await expect(page).toHaveURL(configurationURL);
+    await expect(page.getByRole("heading", { name: "编辑配置", level: 2 })).toBeVisible();
+    await expect(draftList).toHaveAccessibleName("配置条目");
+    await expect(draftValue).toHaveAccessibleName("MATRIX_EXACT_VALUE 的值");
+    await expect(draftValue).toHaveValue(matrixConfigurationValue.replaceAll("\r\n", "\n").replaceAll("\r", "\n"));
+    await expect(changeMessage).toHaveValue(matrixChangeMessage);
+    await expect(changeMessage).toHaveAccessibleName("变更说明");
+
+    await page.getByRole("button", { name: "保存更改" }).click();
+    await expect(page.getByText("版本 1 已保存。")).toBeVisible();
+    await expect(page.getByTestId("configuration-value-MATRIX_EXACT_VALUE")).toHaveText(matrixConfigurationValue);
+    const search = page.locator("#configuration-search");
+    await expect(search).toHaveAccessibleName("搜索配置");
+    await search.fill("NO_MATCH_MATRIX_QUERY");
+    await expect(page.getByText("没有与此搜索匹配的键或服务。")).toBeVisible();
+    await headerLanguage.selectOption("en-US");
+    await expect(search).toHaveValue("NO_MATCH_MATRIX_QUERY");
+    await expect(search).toHaveAccessibleName("Search configuration");
+    await expect(page.getByText("No keys or services match this search.")).toBeVisible();
+
+    await page.getByRole("tab", { name: "Versions" }).click();
+    await expect(page.getByRole("heading", { name: "Versions", level: 2 })).toBeVisible();
+    await expect(page.getByText(matrixChangeMessage, { exact: true })).toBeVisible();
+    await headerLanguage.selectOption("zh-CN");
+    await expect(page.getByRole("heading", { name: "版本", level: 2 })).toBeVisible();
+    await expect(page.getByText(matrixChangeMessage, { exact: true })).toBeVisible();
+
+    await page.getByRole("tab", { name: "成员" }).click();
+    await expect(page.getByRole("heading", { name: "项目成员", level: 2 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "没有成员授权", level: 3 })).toBeVisible();
+    await page.getByLabel("同步用户名").fill("developer-a");
+    await page.getByRole("button", { name: "添加成员" }).click();
+    await expect(page.getByText("@developer-a", { exact: true })).toBeVisible();
+    await expect(page.getByText("E2E Developer", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "移除访问权限" }).click();
+    await expect(page.getByRole("dialog", { name: "移除 E2E Developer 的访问权限" })).toBeVisible();
+    await page.getByRole("dialog").getByRole("button", { name: "取消" }).click();
+
+    await headerLanguage.selectOption("en-US");
+    await expect(page.getByRole("heading", { name: "Project members", level: 2 })).toBeVisible();
+    await expect(page.getByText("@developer-a", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Remove access" }).click();
+    await expect(page.getByRole("dialog", { name: "Remove E2E Developer access" })).toBeVisible();
+    await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
+
+    await page.locator("#primary-navigation").getByRole("link", { name: "Members" }).click();
+    await expect(page.getByRole("heading", { name: "Members", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Synchronized accounts", level: 2 })).toBeVisible();
+    await expect(page.getByText("developer-a", { exact: true })).toBeVisible();
+    await headerLanguage.selectOption("zh-CN");
+    await expect(page.getByRole("heading", { name: "成员", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "同步账户", level: 2 })).toBeVisible();
+    await expect(page.getByText("developer-a", { exact: true })).toBeVisible();
+
+    await page.locator("#primary-navigation").getByRole("link", { name: "机器访问" }).click();
+    await expect(page.getByRole("heading", { name: "机器访问", level: 1 })).toBeVisible();
+    await headerLanguage.selectOption("en-US");
+    await expect(page.getByRole("heading", { name: "Machine Access", level: 1 })).toBeVisible();
+
+    await page.locator("#primary-navigation").getByRole("link", { name: "System" }).click();
+    await expect(page.getByRole("heading", { name: "System", level: 1 })).toBeVisible();
+    await headerLanguage.selectOption("zh-CN");
+    await expect(page.getByRole("heading", { name: "系统", level: 1 })).toBeVisible();
+
+    await page.locator("#primary-navigation").getByRole("link", { name: "项目" }).click();
+    await expect(page.getByRole("heading", { name: "项目", level: 1 })).toBeVisible();
+    await headerLanguage.selectOption("en-US");
+    await expect(page.getByRole("heading", { name: "Projects", level: 1 })).toBeVisible();
+
+    await emulateTwoHundredPercentDesktopReflow(page);
+    await expectNonOverlapping([
+      { name: "200% language selector", locator: headerLanguage },
+      { name: "200% navigation button", locator: page.getByRole("button", { name: "Open navigation" }) },
+      { name: "200% sign-out button", locator: page.getByRole("button", { name: "Sign out" }) },
+    ], 720);
+    await expectNoRootHorizontalOverflow(page);
+
+    await page.getByRole("link", { name: "Locale Matrix 业务项目" }).click();
+    await expect(page.getByRole("heading", { name: "Locale Matrix 业务项目", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Configuration", level: 2 })).toBeVisible();
+    await expectNonOverlapping([
+      { name: "configuration tab", locator: page.getByRole("tab", { name: "Configuration" }) },
+      { name: "versions tab", locator: page.getByRole("tab", { name: "Versions" }) },
+      { name: "members tab", locator: page.getByRole("tab", { name: "Members" }) },
+    ], 720);
+    await expectNoRootHorizontalOverflow(page);
+    await page.getByRole("tab", { name: "Versions" }).click();
+    await expect(page.getByRole("heading", { name: "Versions", level: 2 })).toBeVisible();
+    await expectNoRootHorizontalOverflow(page);
+    await page.getByRole("tab", { name: "Members" }).click();
+    await expect(page.getByRole("heading", { name: "Project members", level: 2 })).toBeVisible();
+    await expectNoRootHorizontalOverflow(page);
+
+    await navigateCollapsed(page, "Machine Access");
+    await expect(page.getByRole("heading", { name: "Machine Access", level: 1 })).toBeVisible();
+    await expectNoRootHorizontalOverflow(page);
+    await navigateCollapsed(page, "Members");
+    await expect(page.getByRole("heading", { name: "Members", level: 1 })).toBeVisible();
+    await expectNoRootHorizontalOverflow(page);
+    await navigateCollapsed(page, "System");
+    await expect(page.getByRole("heading", { name: "System", level: 1 })).toBeVisible();
+    await expectNoRootHorizontalOverflow(page);
+  } finally {
+    await context.close();
+  }
+});
+
 async function login(page: Page): Promise<void> {
   await page.goto(`${runtimeServer.origin}/login`);
   await page.getByLabel("Username").fill("admin");
@@ -381,6 +654,50 @@ async function expectNonOverlapping(
       expect(overlaps, `${left.name} overlaps ${right.name}`).toBe(false);
     }
   }
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+async function emulateTwoHundredPercentDesktopReflow(page: Page): Promise<void> {
+  const session = await page.context().newCDPSession(page);
+  await session.send("Emulation.setDeviceMetricsOverride", {
+    width: 720,
+    height: 500,
+    deviceScaleFactor: 1,
+    mobile: false,
+    screenWidth: 1440,
+    screenHeight: 1000,
+  });
+  await expect
+    .poll(() => page.evaluate(() => ({
+      cssViewportWidth: window.innerWidth,
+      desktopScreenWidth: window.screen.width,
+    })))
+    .toEqual({ cssViewportWidth: 720, desktopScreenWidth: 1440 });
+}
+
+async function expectNoRootHorizontalOverflow(page: Page): Promise<void> {
+  await expect
+    .poll(() => page.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    ))
+    .toBeLessThanOrEqual(1);
+}
+
+async function navigateCollapsed(page: Page, linkName: string): Promise<void> {
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  const link = page.locator("#primary-navigation").getByRole("link", {
+    name: linkName,
+    exact: true,
+  });
+  await expect(link).toBeVisible();
+  await link.click();
 }
 
 async function createProject(page: Page): Promise<void> {
