@@ -22,6 +22,7 @@ interface RevisionResponse {
 }
 
 type LoadState = "idle" | "loading" | "ready" | "error";
+type RollbackError = "validation" | "failure" | null;
 
 export function VersionList({
   canWrite,
@@ -48,7 +49,7 @@ export function VersionList({
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
   const [rollbackTarget, setRollbackTarget] = useState<RevisionSummary | null>(null);
   const [rollbackMessage, setRollbackMessage] = useState("");
-  const [rollbackError, setRollbackError] = useState("");
+  const [rollbackError, setRollbackError] = useState<RollbackError>(null);
   const [rollingBack, setRollingBack] = useState(false);
   const listGenerationRef = useRef(0);
   const detailGenerationRef = useRef(0);
@@ -86,7 +87,7 @@ export function VersionList({
     setSelectedVersion(null);
     setRollbackTarget(null);
     setRollbackMessage("");
-    setRollbackError("");
+    setRollbackError(null);
     void loadRevisions();
     return () => {
       listGenerationRef.current += 1;
@@ -122,13 +123,13 @@ export function VersionList({
   function openRollback(revision: RevisionSummary) {
     setRollbackTarget(revision);
     setRollbackMessage("");
-    setRollbackError("");
+    setRollbackError(null);
   }
 
   function closeRollback() {
     if (!rollingBackRef.current) {
       setRollbackTarget(null);
-      setRollbackError("");
+      setRollbackError(null);
     }
   }
 
@@ -141,7 +142,7 @@ export function VersionList({
     const generation = ++rollbackGenerationRef.current;
     const targetVersion = rollbackTarget.version;
     setRollingBack(true);
-    setRollbackError("");
+    setRollbackError(null);
     try {
       const response = await client.post<RevisionResponse>(
         `${revisionsPath(projectSlug, environmentSlug)}/${targetVersion}/rollback`,
@@ -158,9 +159,9 @@ export function VersionList({
         return;
       }
       if (error instanceof APIError && error.status === 422 && Object.hasOwn(error.fields, "message")) {
-        setRollbackError(t("rollback.validation.message"));
+        setRollbackError("validation");
       } else {
-        setRollbackError(t("rollback.failure"));
+        setRollbackError("failure");
       }
     } finally {
       if (rollbackGenerationRef.current === generation) {
@@ -274,14 +275,20 @@ export function VersionList({
                 id="rollback-message"
                 value={rollbackMessage}
                 disabled={rollingBack}
-                aria-invalid={rollbackError ? "true" : undefined}
-                aria-describedby={rollbackError ? "rollback-message-error" : undefined}
+                aria-invalid={rollbackError !== null ? "true" : undefined}
+                aria-describedby={rollbackError !== null ? "rollback-message-error" : undefined}
                 onChange={(event) => {
                   setRollbackMessage(event.currentTarget.value);
-                  setRollbackError("");
+                  setRollbackError(null);
                 }}
               />
-              {rollbackError ? <p className="field-error" id="rollback-message-error" role="alert">{rollbackError}</p> : null}
+              {rollbackError !== null ? (
+                <p className="field-error" id="rollback-message-error" role="alert">
+                  {rollbackError === "validation"
+                    ? t("rollback.validation.message")
+                    : t("rollback.failure")}
+                </p>
+              ) : null}
             </div>
             <button className="primary-button" type="submit" disabled={rollingBack}>
               {rollingBack ? t("rollback.pending") : t("rollback.action")}
