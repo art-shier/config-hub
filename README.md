@@ -272,7 +272,58 @@ curl -fsS http://127.0.0.1:8080/api/v1/health/ready
 
 ## CLI
 
-CLI 只读取机器身份当前被授权的配置。Token 明文仅在 Web 签发时展示一次。优先由 CI 的 secret 设施注入连接信息：
+CLI 只读取机器身份当前被授权的配置。Token 明文仅在 Web 签发时展示一次。连接信息可以保存在全局配置和当前项目目录配置中；配置文件只接受 `server`、`token` 两个字段，项目、环境和服务仍在每次命令中显式传入。
+
+全局配置路径遵循操作系统用户配置目录：
+
+| 平台 | 全局配置路径 |
+| --- | --- |
+| Linux | `$XDG_CONFIG_HOME/confighub/config.yaml`，未设置时为 `$HOME/.config/confighub/config.yaml` |
+| macOS | `$HOME/Library/Application Support/confighub/config.yaml` |
+| Windows | `%AppData%\confighub\config.yaml` |
+
+例如，多个项目共用同一个 Server 时，全局文件可以只保存：
+
+```yaml
+server: https://config.example.com
+```
+
+每个项目在自己的工作目录创建 `.confighub.yaml`，只保存该项目的机器 Token：
+
+```yaml
+token: ch_一次性签发的机器Token
+```
+
+CLI 只检查执行命令时的精确工作目录，不向父目录搜索。它先读取全局配置，再以字段为单位应用当前目录配置，因此项目目录中的 Token 可以与全局 Server 合并。存在但格式错误或不安全的配置会直接使命令失败，不会被静默跳过。
+
+Unix 上含 Token 的配置必须禁止 group 和 other 访问，并应加入所在项目的 `.gitignore`：
+
+```bash
+chmod 600 .confighub.yaml
+printf '%s\n' '.confighub.yaml' >> .gitignore
+```
+
+Windows 配置必须位于本地磁盘且不能是目录或 reparse point。配置文件直接包含 Token；不要提交、复制到共享目录或写入构建日志。
+
+最终优先级为：
+
+```text
+Server: --server > CONFIGHUB_URL > 当前目录配置 > 全局配置
+Token:  --token-file > CONFIGHUB_TOKEN > 当前目录配置 > 全局配置
+```
+
+可以查看候选路径、生效值和每个字段的来源：
+
+```bash
+confighub config path
+confighub config show
+confighub config get server
+confighub config get token
+```
+
+`config show` 会脱敏 Token；`config get token` 是显式取密命令，会把完整 Token 写到标准输出，调用方必须避免终端录制、日志采集和不安全的管道。
+
+CI 中仍应优先使用 secret 设施注入连接信息，无需创建配置文件：
 
 ```bash
 export CONFIGHUB_URL=https://config.example.com
@@ -297,6 +348,8 @@ CONFIGHUB_URL=https://config.example.com \
   ./dist/confighub --token-file /run/confighub-shop.token \
   export --project shop --env production --format json
 ```
+
+CLI 接受合法的 HTTP 和 HTTPS Server URL，包括带端口或路径前缀的地址。HTTP 不提供传输加密，Bearer Token 和响应内容会以明文经过网络，只应在操作者明确接受该风险的开发环境或受信网络中使用。生产 Server 的 `public_url`、外部反向代理和部署流程仍要求 HTTPS。
 
 ## 备份与恢复
 

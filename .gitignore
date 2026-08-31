@@ -7,6 +7,7 @@
 .confighub-backup-*.tmp*
 
 # Runtime configuration and SQLite state
+/.confighub.yaml
 /config/config.yaml
 /config/users.yaml
 /config/session.key
