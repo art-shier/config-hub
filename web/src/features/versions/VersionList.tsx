@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { APIError } from "../../api/client";
 import type {
   APIClientContract,
@@ -9,6 +10,8 @@ import type {
 } from "../../api/types";
 import { ExactValue } from "../../components/ExactValue";
 import { ModalDialog } from "../../components/ModalDialog";
+import { formatDateTime } from "../../i18n/format";
+import type { SupportedLocale } from "../../i18n/locales";
 
 interface RevisionListResponse {
   revisions: RevisionSummary[];
@@ -35,6 +38,8 @@ export function VersionList({
   refreshEpoch: number;
   onRevisionChanged(revision: Revision): void;
 }) {
+  const { i18n, t } = useTranslation(["versions", "common"]);
+  const locale: SupportedLocale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en-US";
   const [revisions, setRevisions] = useState<RevisionSummary[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [selected, setSelected] = useState<Revision | null>(null);
@@ -152,10 +157,10 @@ export function VersionList({
       if (rollbackGenerationRef.current !== generation) {
         return;
       }
-      if (error instanceof APIError && error.status === 422 && error.fields.message) {
-        setRollbackError(error.fields.message);
+      if (error instanceof APIError && error.status === 422 && Object.hasOwn(error.fields, "message")) {
+        setRollbackError(t("rollback.validation.message"));
       } else {
-        setRollbackError("The system couldn’t create the rollback version. Keep this message and try again.");
+        setRollbackError(t("rollback.failure"));
       }
     } finally {
       if (rollbackGenerationRef.current === generation) {
@@ -168,22 +173,22 @@ export function VersionList({
   if (!environmentSlug) {
     return (
       <div className="empty-state compact-empty">
-        <h2>Choose an environment</h2>
-        <p>Select an environment above to review its version history.</p>
+          <h2>{t("states.chooseEnvironment")}</h2>
+          <p>{t("states.chooseEnvironmentDescription")}</p>
       </div>
     );
   }
 
   if (loadState === "idle" || loadState === "loading") {
-    return <p className="loading-line" role="status">Loading version history…</p>;
+    return <p className="loading-line" role="status">{t("states.loading")}</p>;
   }
 
   if (loadState === "error") {
     return (
       <div className="inline-error-state">
-        <h2>Version history unavailable</h2>
-        <p>The version register couldn’t be loaded. Try again.</p>
-        <button className="secondary-button" type="button" onClick={() => void loadRevisions()}>Retry</button>
+        <h2>{t("states.unavailable")}</h2>
+        <p>{t("states.unavailableDescription")}</p>
+        <button className="secondary-button" type="button" onClick={() => void loadRevisions()}>{t("common:actions.retry")}</button>
       </div>
     );
   }
@@ -192,42 +197,42 @@ export function VersionList({
     <section className="version-workspace" aria-labelledby="versions-title">
       <header className="section-heading">
         <div>
-          <p className="section-index">Revision register</p>
-          <h2 id="versions-title">Versions</h2>
-          <p>Open a version to compare its exact values with the current configuration.</p>
+          <p className="section-index">{t("register.index")}</p>
+          <h2 id="versions-title">{t("register.title")}</h2>
+          <p>{t("register.summary")}</p>
         </div>
       </header>
 
       {revisions.length === 0 ? (
         <div className="empty-state compact-empty">
-          <h3>No versions yet</h3>
-          <p>Save configuration changes to create the first version.</p>
+          <h3>{t("register.emptyTitle")}</h3>
+          <p>{t("register.emptyDescription")}</p>
         </div>
       ) : (
         <div className="version-layout">
-          <div className="version-register" aria-label="Version history">
+          <div className="version-register" aria-label={t("register.accessibleName")}>
             {revisions.map((revision) => (
               <article
                 key={revision.id}
                 className={selectedVersion === revision.version ? "version-row selected-version" : "version-row"}
-                aria-label={`Version ${revision.version}`}
+                aria-label={t("register.rowAccessibleName", { version: revision.version })}
               >
                 <div className="version-row-main">
-                  <p className="section-index">Version</p>
+                  <p className="section-index">{t("register.version")}</p>
                   <h3 id={`version-${revision.version}-title`}>{revision.version}</h3>
-                  <p>{revision.message || "No change message"}</p>
+                  <p>{revision.message || t("register.noMessage")}</p>
                 </div>
                 <dl className="version-meta">
-                  <div><dt>Created by</dt><dd>{revision.created_by}</dd></div>
-                  <div><dt>Created</dt><dd>{formatDateTime(revision.created_at)}</dd></div>
+                  <div><dt>{t("register.createdBy")}</dt><dd>{revision.created_by}</dd></div>
+                  <div><dt>{t("register.created")}</dt><dd>{formatDateTime(revision.created_at, locale, t("states.timeUnavailable"))}</dd></div>
                 </dl>
                 <div className="version-actions">
                   <button className="text-button" type="button" onClick={() => void loadDetail(revision.version)}>
-                    View version {revision.version}
+                    {t("register.view", { version: revision.version })}
                   </button>
                   {canWrite ? (
                     <button className="text-button" type="button" onClick={() => openRollback(revision)}>
-                      Rollback to version {revision.version}
+                      {t("register.rollback", { version: revision.version })}
                     </button>
                   ) : null}
                 </div>
@@ -238,6 +243,7 @@ export function VersionList({
             state={detailState}
             selected={selected}
             diff={diff}
+            locale={locale}
             selectedVersion={selectedVersion}
             onRetry={(version) => void loadDetail(version)}
           />
@@ -253,17 +259,17 @@ export function VersionList({
         >
           <header className="dialog-heading">
             <div>
-              <p className="section-index">Revision register / Rollback</p>
-              <h2 id="rollback-title">Rollback to version {rollbackTarget.version}?</h2>
+              <p className="section-index">{t("rollback.index")}</p>
+              <h2 id="rollback-title">{t("rollback.title", { version: rollbackTarget.version })}</h2>
             </div>
-            <button className="text-button" type="button" disabled={rollingBack} onClick={closeRollback}>Cancel</button>
+            <button className="text-button" type="button" disabled={rollingBack} onClick={closeRollback}>{t("common:actions.cancel")}</button>
           </header>
           <p id="rollback-description">
-            A rollback creates a new current version from version {rollbackTarget.version}; it does not remove later history.
+            {t("rollback.description", { version: rollbackTarget.version })}
           </p>
-          <form className="resource-form" onSubmit={(event) => void submitRollback(event)}>
+          <form className="resource-form" noValidate onSubmit={(event) => void submitRollback(event)}>
             <div className="form-field">
-              <label htmlFor="rollback-message">Rollback message</label>
+              <label htmlFor="rollback-message">{t("rollback.message")}</label>
               <input
                 id="rollback-message"
                 value={rollbackMessage}
@@ -278,7 +284,7 @@ export function VersionList({
               {rollbackError ? <p className="field-error" id="rollback-message-error" role="alert">{rollbackError}</p> : null}
             </div>
             <button className="primary-button" type="submit" disabled={rollingBack}>
-              {rollingBack ? "Creating rollback…" : "Create rollback version"}
+              {rollingBack ? t("rollback.pending") : t("rollback.action")}
             </button>
           </form>
         </ModalDialog>
@@ -289,43 +295,46 @@ export function VersionList({
 
 function VersionDetail({
   diff,
+  locale,
   onRetry,
   selected,
   selectedVersion,
   state,
 }: {
   diff: DiffResult | null;
+  locale: SupportedLocale;
   onRetry(version: number): void;
   selected: Revision | null;
   selectedVersion: number | null;
   state: LoadState;
 }) {
+  const { t } = useTranslation(["versions", "common"]);
   if (selectedVersion === null) {
     return (
       <aside className="version-detail empty-version-detail">
-        <h3>Select a version</h3>
-        <p>Choose a register row to inspect its details and current difference.</p>
+        <h3>{t("detail.selectTitle")}</h3>
+        <p>{t("detail.selectDescription")}</p>
       </aside>
     );
   }
   if (state === "loading") {
-    return <p className="loading-line version-detail" role="status">Loading version {selectedVersion}…</p>;
+    return <p className="loading-line version-detail" role="status">{t("detail.loading", { version: selectedVersion })}</p>;
   }
   if (state === "error" || selected === null || diff === null) {
     return (
       <aside className="version-detail inline-error-state">
-        <h3>Version details unavailable</h3>
-        <p>The selected version couldn’t be compared. Try again.</p>
-        <button className="secondary-button" type="button" onClick={() => onRetry(selectedVersion)}>Retry version details</button>
+        <h3>{t("detail.unavailable")}</h3>
+        <p>{t("detail.unavailableDescription")}</p>
+        <button className="secondary-button" type="button" onClick={() => onRetry(selectedVersion)}>{t("detail.retry")}</button>
       </aside>
     );
   }
   return (
     <aside className="version-detail" aria-labelledby="version-diff-title">
-      <p className="section-index">Selected revision / {formatDateTime(selected.created_at)}</p>
-      <h3 id="version-diff-title">Version {diff.before_revision} to current version {diff.after_revision}</h3>
-      <p className="selected-revision-message">{selected.message || "No change message"}</p>
-      {diff.changes.length === 0 ? <p>No configuration differences.</p> : (
+      <p className="section-index">{t("detail.index", { createdAt: formatDateTime(selected.created_at, locale, t("states.timeUnavailable")) })}</p>
+      <h3 id="version-diff-title">{t("detail.title", { before: diff.before_revision, after: diff.after_revision })}</h3>
+      <p className="selected-revision-message">{selected.message || t("register.noMessage")}</p>
+      {diff.changes.length === 0 ? <p>{t("detail.noDifferences")}</p> : (
         <div className="difference-list history-difference-list">
           {diff.changes.map((change) => <HistoryChange key={change.key} change={change} />)}
         </div>
@@ -335,16 +344,17 @@ function VersionDetail({
 }
 
 function HistoryChange({ change }: { change: RevisionChange }) {
+  const { t } = useTranslation("versions");
   const beforePresent = change.kind !== "added";
   const afterPresent = change.kind !== "deleted";
   return (
     <article className="difference-row history-difference-row">
       <header>
-        <span className={`change-kind change-${change.kind}`}>{change.kind}</span>
+        <span className={`change-kind change-${change.kind}`}>{t(`diff.${change.kind}`)}</span>
         <h4 className="code-label">{change.key}</h4>
       </header>
-      <HistorySide side="before" label="Selected version" present={beforePresent} value={change.before} service={change.before_service} entryKey={change.key} />
-      <HistorySide side="after" label="Current version" present={afterPresent} value={change.after} service={change.after_service} entryKey={change.key} />
+      <HistorySide side="before" label={t("diff.selected")} valueLabel={t("diff.selectedValue", { key: change.key })} present={beforePresent} value={change.before} service={change.before_service} entryKey={change.key} />
+      <HistorySide side="after" label={t("diff.current")} valueLabel={t("diff.currentValue", { key: change.key })} present={afterPresent} value={change.after} service={change.after_service} entryKey={change.key} />
     </article>
   );
 }
@@ -352,6 +362,7 @@ function HistoryChange({ change }: { change: RevisionChange }) {
 function HistorySide({
   entryKey,
   label,
+  valueLabel,
   present,
   service,
   side,
@@ -359,25 +370,27 @@ function HistorySide({
 }: {
   entryKey: string;
   label: string;
+  valueLabel: string;
   present: boolean;
   service: string;
   side: "before" | "after";
   value: string;
 }) {
+  const { t } = useTranslation("versions");
   return (
     <div className="difference-side">
       <p>{label}</p>
       {present ? (
         <ExactValue
-          label={`${label} value for ${entryKey}`}
+          label={valueLabel}
           testId={`diff-${side}-${entryKey}`}
           value={value}
         />
       ) : (
-        <span className="absent-value" data-testid={`diff-${side}-${entryKey}`}>Absent</span>
+        <span className="absent-value" data-testid={`diff-${side}-${entryKey}`}>{t("diff.absent")}</span>
       )}
       <span className="difference-service" data-testid={`diff-${side}-service-${entryKey}`}>
-        Service: {present ? (service || <span className="empty-value">Empty string</span>) : <span className="absent-value">Absent</span>}
+        {t("diff.service")} {present ? (service || <span className="empty-value">{t("common:exactValue.emptyString")}</span>) : <span className="absent-value">{t("diff.absent")}</span>}
       </span>
     </div>
   );
@@ -385,14 +398,4 @@ function HistorySide({
 
 function revisionsPath(projectSlug: string, environmentSlug: string): string {
   return `/projects/${encodeURIComponent(projectSlug)}/environments/${encodeURIComponent(environmentSlug)}/revisions`;
-}
-
-function formatDateTime(value: string): string {
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return "Time unavailable";
-  try {
-    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
-  } catch {
-    return date.toISOString();
-  }
 }

@@ -1,10 +1,11 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { APIError } from "../../api/client";
 import type { APIClientContract } from "../../api/types";
+import { changeLocale } from "../../i18n";
 import { VersionList } from "./VersionList";
 
 function client(): APIClientContract {
@@ -71,6 +72,80 @@ describe("VersionList", () => {
     await waitFor(() => expect(api.get).toHaveBeenCalledWith(
       "/projects/shop%2Fintl/environments/prod%20west/revisions",
     ));
+  });
+
+  it("shows Chinese version actions while preserving revision messages and uses the active date locale", async () => {
+    const api = client();
+    vi.mocked(api.get).mockResolvedValue({
+      revisions: [{
+        id: "revision-1",
+        environment_id: "env-prod",
+        version: 1,
+        message: "发布 中文 🍾",
+        created_by: "ada",
+        created_at: "2026-08-29T08:00:00Z",
+      }],
+    });
+    const dateTimeFormat = vi.spyOn(Intl, "DateTimeFormat");
+    await act(async () => {
+      await changeLocale("zh-CN");
+    });
+
+    render(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: "版本" })).toBeVisible();
+    expect(screen.getByText("发布 中文 🍾")).toBeVisible();
+    expect(screen.getByRole("button", { name: "查看版本 1" })).toBeVisible();
+    expect(dateTimeFormat).toHaveBeenCalledWith(
+      "zh-CN",
+      expect.objectContaining({ dateStyle: "medium", timeStyle: "short" }),
+    );
+  });
+
+  it("uses a local rollback validation message without disclosing server fields", async () => {
+    const api = client();
+    vi.mocked(api.get).mockResolvedValue({
+      revisions: [{
+        id: "revision-1",
+        environment_id: "env-prod",
+        version: 1,
+        message: "发布 中文 🍾",
+        created_by: "ada",
+        created_at: "2026-08-29T08:00:00Z",
+      }],
+    });
+    vi.mocked(api.post).mockRejectedValue(
+      new APIError(422, "validation_failed", "RAW SECRET", "req", { message: "RAW FIELD" }),
+    );
+    await act(async () => {
+      await changeLocale("zh-CN");
+    });
+    render(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "回滚到版本 1" }));
+    await user.click(screen.getByRole("button", { name: "创建回滚版本" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("请输入有效的回滚说明。");
+    expect(screen.queryByText(/RAW/u)).not.toBeInTheDocument();
   });
 
   it("shows empty history after a focusable retry", async () => {
