@@ -121,6 +121,39 @@ function Get-PathEntryCount {
     return $count
 }
 
+function New-CliFixtureExecutable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $compilerPath = $null
+    foreach ($frameworkDirectory in @('Framework64', 'Framework')) {
+        $candidate = Join-Path $env:WINDIR "Microsoft.NET\$frameworkDirectory\v4.0.30319\csc.exe"
+        if ([IO.File]::Exists($candidate)) {
+            $compilerPath = $candidate
+            break
+        }
+    }
+    if ([string]::IsNullOrEmpty($compilerPath)) {
+        throw 'Could not find the .NET Framework C# compiler.'
+    }
+
+    $sourcePath = [IO.Path]::ChangeExtension($Path, '.cs')
+    [IO.File]::WriteAllText($sourcePath, $Source, (New-Object Text.UTF8Encoding($false)))
+    try {
+        $compilerOutput = @(& $compilerPath /nologo /target:exe "/out:$Path" $sourcePath 2>&1)
+        if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists($Path)) {
+            throw "Could not compile the CLI fixture: $($compilerOutput -join ' ')"
+        }
+    }
+    finally {
+        if ([IO.File]::Exists($sourcePath)) {
+            [IO.File]::Delete($sourcePath)
+        }
+    }
+}
+
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $installerPath = Join-Path $repoRoot 'scripts\install-cli.ps1'
 
@@ -253,8 +286,7 @@ public static class Program {
     }
 }
 '@
-    Add-Type -TypeDefinition $fixtureSource -Language CSharp `
-        -OutputAssembly $fixtureExe -OutputType ConsoleApplication
+    New-CliFixtureExecutable -Source $fixtureSource -Path $fixtureExe
 
     $wrongFixtureExe = Join-Path $fixtureRoot 'fixture-confighub-wrong.exe'
     $wrongFixtureSource = @'
@@ -276,8 +308,7 @@ namespace WrongFixture {
     }
 }
 '@
-    Add-Type -TypeDefinition $wrongFixtureSource -Language CSharp `
-        -OutputAssembly $wrongFixtureExe -OutputType ConsoleApplication
+    New-CliFixtureExecutable -Source $wrongFixtureSource -Path $wrongFixtureExe
 
     function Set-DownloadArchive {
         param([Parameter(Mandatory = $true)][string]$ExecutablePath)
