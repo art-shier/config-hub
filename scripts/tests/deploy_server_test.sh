@@ -4,6 +4,7 @@ set -euo pipefail
 test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$test_dir/../.." && pwd)"
 
+# shellcheck source=scripts/tests/testlib.sh
 source "$test_dir/testlib.sh"
 source "$repo_root/scripts/deploy-server.sh"
 
@@ -117,6 +118,7 @@ key_before="$(sha256sum "$deployment_root/etc/confighub/session.key")"
 assert_fails install_first_server "$v2_fixture" v1.2.4 https://other.example.com other changed
 assert_eq "$config_before" "$(sha256sum "$deployment_root/etc/confighub/config.yaml")"
 
+# shellcheck disable=SC2317
 run_online_backup() { return 1; }
 assert_fails upgrade_server "$v2_fixture" v1.2.4
 assert_eq v1.2.3 "$("$deployment_root/usr/local/bin/confighub-server" version)"

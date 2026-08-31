@@ -287,8 +287,8 @@ run_online_backup() {
 }
 
 wait_for_readiness() {
-  local attempt
-  for attempt in {1..30}; do
+  local _
+  for _ in {1..30}; do
     if curl --fail --silent --show-error http://127.0.0.1:8080/api/v1/health/ready >/dev/null; then
       return 0
     fi

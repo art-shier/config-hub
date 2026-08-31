@@ -4,6 +4,7 @@ set -euo pipefail
 test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$test_dir/../.." && pwd)"
 
+# shellcheck source=scripts/tests/testlib.sh
 source "$test_dir/testlib.sh"
 source "$repo_root/scripts/package-release.sh"
 
