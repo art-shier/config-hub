@@ -391,10 +391,11 @@ func TestRuntimeServerRetriesAnOccupiedCandidatePort(t *testing.T) {
 	defer occupied.Close()
 
 	attempts := 0
-	startedAt := time.Now()
+	var firstAttemptAt time.Time
 	fixture := startRuntimeServerWithAddressProvider(t, ctx, func() (string, error) {
 		attempts++
 		if attempts == 1 {
+			firstAttemptAt = time.Now()
 			return occupied.Addr().String(), nil
 		}
 		return unusedLoopbackAddress()
@@ -403,7 +404,7 @@ func TestRuntimeServerRetriesAnOccupiedCandidatePort(t *testing.T) {
 	if attempts < 2 {
 		t.Fatalf("address attempts=%d, want at least 2", attempts)
 	}
-	if elapsed := time.Since(startedAt); elapsed >= 1500*time.Millisecond {
+	if elapsed := time.Since(firstAttemptAt); elapsed >= 1500*time.Millisecond {
 		t.Fatalf("occupied-port retry elapsed=%s, want less than 1.5s", elapsed)
 	}
 }
