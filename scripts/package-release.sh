@@ -24,22 +24,56 @@ release_version() {
   printf '%s\n' "${tag#v}"
 }
 
+validate_release_target() {
+  local product="${1:-}"
+  local operating_system="${2:-}"
+  local architecture="${3:-}"
+
+  case "$product/$operating_system/$architecture" in
+  server/linux/amd64 | server/linux/arm64 | \
+    cli/linux/amd64 | cli/linux/arm64 | \
+    cli/darwin/arm64 | cli/windows/amd64) ;;
+  *) die "unsupported release target: $product/$operating_system/$architecture" ;;
+  esac
+}
+
+release_binary_name() {
+  local product="${1:-}"
+  local operating_system="${2:-}"
+
+  case "$product/$operating_system" in
+  server/linux) printf '%s\n' 'confighub-server' ;;
+  cli/linux | cli/darwin) printf '%s\n' 'confighub' ;;
+  cli/windows) printf '%s\n' 'confighub.exe' ;;
+  *) die "unsupported release binary: $product/$operating_system" ;;
+  esac
+}
+
 release_archive_base() {
   local product="${1:-}"
   local tag="${2:-}"
-  local arch="${3:-}"
+  local operating_system="${3:-}"
+  local architecture="${4:-}"
   local version
 
-  case "$product" in
-  server | cli) ;;
-  *) die 'product must be server or cli' || return ;;
-  esac
-  case "$arch" in
-  amd64 | arm64) ;;
-  *) die 'architecture must be amd64 or arm64' || return ;;
-  esac
+  validate_release_target "$product" "$operating_system" "$architecture" || return
   version="$(release_version "$tag")" || return
-  printf 'config-hub-%s_%s_linux_%s\n' "$product" "$version" "$arch"
+  printf 'config-hub-%s_%s_%s_%s\n' \
+    "$product" "$version" "$operating_system" "$architecture"
+}
+
+release_archive_name() {
+  local product="${1:-}"
+  local tag="${2:-}"
+  local operating_system="${3:-}"
+  local architecture="${4:-}"
+  local archive_base
+
+  archive_base="$(release_archive_base "$product" "$tag" "$operating_system" "$architecture")" || return
+  case "$product/$operating_system/$architecture" in
+  cli/windows/amd64) printf '%s.zip\n' "$archive_base" ;;
+  *) printf '%s.tar.gz\n' "$archive_base" ;;
+  esac
 }
 
 require_command() {
@@ -57,7 +91,7 @@ verify_release_source() {
   status="$(git -C "$repo_root" status --porcelain)"
   [[ -z "$status" ]] || die 'release packaging requires a clean worktree'
 
-  for command_name in git npm go tar gzip sha256sum install mktemp; do
+  for command_name in git npm go tar gzip zip sha256sum install mktemp; do
     require_command "$command_name" || return
   done
   tar --version | grep -F 'GNU tar' >/dev/null || die 'release packaging requires GNU tar'
@@ -76,6 +110,19 @@ create_archive() {
   )
 }
 
+create_zip_archive() {
+  local package_root="$1"
+  local archive_base="$2"
+  local output_path="$3"
+  local source_epoch="$4"
+
+  (
+    cd "$package_root"
+    TZ=UTC touch -d "@$source_epoch" -- "$archive_base" "$archive_base/confighub.exe"
+    TZ=UTC LC_ALL=C zip -X -q "$output_path" "$archive_base/" "$archive_base/confighub.exe"
+  )
+}
+
 cleanup_release_temp() {
   if [[ -n "${release_temp_root:-}" && -d "$release_temp_root" ]]; then
     rm -rf -- "$release_temp_root"
@@ -88,6 +135,7 @@ build_release() {
   local temp_root
   local package_root
   local asset_root
+  local archive_count
   local release_dir="$repo_root/dist/release"
 
   verify_release_source "$tag" || return
@@ -110,23 +158,21 @@ build_release() {
   asset_root="$temp_root/assets"
   mkdir -p -- "$package_root" "$asset_root"
 
-  local arch
-  for arch in amd64 arm64; do
+  local architecture
+  for architecture in amd64 arm64; do
     local server_base
-    local cli_base
-    server_base="$(release_archive_base server "$tag" "$arch")"
-    cli_base="$(release_archive_base cli "$tag" "$arch")"
+    local server_archive_name
+    local server_binary
+    server_base="$(release_archive_base server "$tag" linux "$architecture")"
+    server_archive_name="$(release_archive_name server "$tag" linux "$architecture")"
+    server_binary="$(release_binary_name server linux)"
 
-    mkdir -p -- "$package_root/$server_base/config" "$package_root/$server_base/deploy" \
-      "$package_root/$cli_base"
-    CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false \
+    mkdir -p -- "$package_root/$server_base/config" "$package_root/$server_base/deploy"
+    CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" go build -trimpath -buildvcs=false \
       -ldflags "-X confighub.local/internal/buildinfo.Version=$tag" \
-      -o "$package_root/$server_base/confighub-server" ./cmd/server
-    CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false \
-      -ldflags "-X confighub.local/internal/buildinfo.Version=$tag" \
-      -o "$package_root/$cli_base/confighub" ./cmd/cli
+      -o "$package_root/$server_base/$server_binary" ./cmd/server
 
-    chmod 0755 -- "$package_root/$server_base/confighub-server" "$package_root/$cli_base/confighub"
+    chmod 0755 -- "$package_root/$server_base/$server_binary"
     install -m 0644 -- "$repo_root/config/config.example.yaml" \
       "$package_root/$server_base/config/config.example.yaml"
     install -m 0644 -- "$repo_root/config/users.example.yaml" \
@@ -134,16 +180,44 @@ build_release() {
     install -m 0644 -- "$repo_root/deploy/systemd/confighub.service" \
       "$package_root/$server_base/deploy/confighub.service"
 
-    create_archive "$package_root" "$server_base" "$asset_root/$server_base.tar.gz" "$source_epoch"
-    create_archive "$package_root" "$cli_base" "$asset_root/$cli_base.tar.gz" "$source_epoch"
+    create_archive "$package_root" "$server_base" \
+      "$asset_root/$server_archive_name" "$source_epoch"
+  done
+
+  local target
+  local operating_system
+  for target in linux/amd64 linux/arm64 darwin/arm64 windows/amd64; do
+    local cli_base
+    local cli_archive_name
+    local cli_binary
+    IFS=/ read -r operating_system architecture <<<"$target"
+    cli_base="$(release_archive_base cli "$tag" "$operating_system" "$architecture")"
+    cli_archive_name="$(release_archive_name cli "$tag" "$operating_system" "$architecture")"
+    cli_binary="$(release_binary_name cli "$operating_system")"
+
+    mkdir -p -- "$package_root/$cli_base"
+    CGO_ENABLED=0 GOOS="$operating_system" GOARCH="$architecture" \
+      go build -trimpath -buildvcs=false \
+      -ldflags "-X confighub.local/internal/buildinfo.Version=$tag" \
+      -o "$package_root/$cli_base/$cli_binary" ./cmd/cli
+    chmod 0755 -- "$package_root/$cli_base/$cli_binary"
+
+    if [[ "$operating_system" == 'windows' ]]; then
+      create_zip_archive "$package_root" "$cli_base" \
+        "$asset_root/$cli_archive_name" "$source_epoch"
+    else
+      create_archive "$package_root" "$cli_base" \
+        "$asset_root/$cli_archive_name" "$source_epoch"
+    fi
   done
 
   (
     cd "$asset_root"
-    LC_ALL=C sha256sum config-hub-*.tar.gz | LC_ALL=C sort -k2 >checksums.txt
+    LC_ALL=C sha256sum config-hub-*.tar.gz config-hub-*.zip | LC_ALL=C sort -k2 >checksums.txt
   )
-  [[ "$(find "$asset_root" -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 4 ]] ||
-    die 'release packaging did not create four archives'
+  archive_count="$(find "$asset_root" -maxdepth 1 -type f \
+    \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)"
+  [[ "$archive_count" -eq 6 ]] || die 'release packaging did not create six archives'
 
   if [[ -z "$repo_root" || "$repo_root" == '/' || "$release_dir" != "$repo_root/dist/release" ]]; then
     die 'invalid release output path'
