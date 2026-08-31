@@ -11,14 +11,14 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func openTokenFile(path string) (*os.File, error) {
+func openRestrictedFile(path string) (*os.File, error) {
 	absolutePath, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
 	volume := filepath.VolumeName(absolutePath)
 	if len(volume) != 2 || volume[1] != ':' || strings.Contains(absolutePath[len(volume):], ":") {
-		return nil, errors.New("token file must be on a local Windows volume")
+		return nil, errors.New("file must be on a local Windows volume")
 	}
 	pathPointer, err := windows.UTF16PtrFromString(absolutePath)
 	if err != nil {
@@ -43,7 +43,7 @@ func openTokenFile(path string) (*os.File, error) {
 	}
 	if information.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 {
 		_ = windows.CloseHandle(handle)
-		return nil, errors.New("token file must be a regular non-reparse file")
+		return nil, errors.New("file must be a regular non-reparse file")
 	}
 	file := os.NewFile(uintptr(handle), absolutePath)
 	if file == nil {
@@ -52,6 +52,8 @@ func openTokenFile(path string) (*os.File, error) {
 	}
 	return file, nil
 }
+
+func openTokenFile(path string) (*os.File, error) { return openRestrictedFile(path) }
 
 func tokenFilePermissionsValid(os.FileMode) bool {
 	return true
