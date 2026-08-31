@@ -27,6 +27,11 @@ func TestDecodeCLIConfigAcceptsOnlyOptionalServerAndToken(t *testing.T) {
 			contents:   "server: https://config.example.com\n",
 			wantServer: stringPointer("https://config.example.com"),
 		},
+		{
+			name:       "remote HTTP server",
+			contents:   "server: http://config.example.com:8080\n",
+			wantServer: stringPointer("http://config.example.com:8080"),
+		},
 		{name: "token only", contents: "token: ch_project_a\n", wantToken: stringPointer("ch_project_a")},
 		{name: "unknown", contents: "profile: project-a\n", wantErr: true},
 		{

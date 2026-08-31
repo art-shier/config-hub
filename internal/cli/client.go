@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -316,12 +315,8 @@ func validateBaseURL(raw string) (*url.URL, error) {
 		}
 	}
 	switch parsed.Scheme {
-	case "https":
+	case "http", "https":
 		return parsed, nil
-	case "http":
-		if isLoopbackHost(parsed.Hostname()) {
-			return parsed, nil
-		}
 	}
 	return nil, errors.New("invalid URL")
 }
@@ -342,14 +337,6 @@ func validURLPort(parsed *url.URL) bool {
 	}
 	number, err := strconv.ParseUint(port, 10, 16)
 	return err == nil && number != 0
-}
-
-func isLoopbackHost(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 func validToken(token string) bool {

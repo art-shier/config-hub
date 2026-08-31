@@ -212,7 +212,7 @@ func TestClientValidatesServiceBeforeRequest(t *testing.T) {
 	}
 }
 
-func TestNewClientEnforcesHTTPSWithLoopbackHTTPException(t *testing.T) {
+func TestNewClientAcceptsHTTPAndHTTPSForValidHosts(t *testing.T) {
 	tests := []struct {
 		name    string
 		baseURL string
@@ -230,6 +230,11 @@ func TestNewClientEnforcesHTTPSWithLoopbackHTTPException(t *testing.T) {
 		{name: "localhost", baseURL: "http://localhost:8080"},
 		{name: "ipv4 loopback range", baseURL: "http://127.42.1.9:8080"},
 		{name: "ipv6 loopback", baseURL: "http://[::1]:8080"},
+		{name: "remote http", baseURL: "http://config.example.com"},
+		{name: "remote http port", baseURL: "http://192.0.2.10:8080"},
+		{name: "remote http ipv6", baseURL: "http://[2001:db8::1]:8080"},
+		{name: "remote http prefix", baseURL: "http://gateway.example/config-hub"},
+		{name: "http hostname resembling localhost", baseURL: "http://localhost.evil:8080"},
 		{name: "empty port", baseURL: "https://localhost:", wantErr: true},
 		{name: "zero port", baseURL: "https://localhost:0", wantErr: true},
 		{name: "port above maximum", baseURL: "https://localhost:65536", wantErr: true},
@@ -240,14 +245,13 @@ func TestNewClientEnforcesHTTPSWithLoopbackHTTPException(t *testing.T) {
 		{name: "malformed bracketed ipv6", baseURL: "https://[::gg]", wantErr: true},
 		{name: "bracketed ipv4", baseURL: "https://[192.0.2.1]", wantErr: true},
 		{name: "unbracketed ipv6", baseURL: "https://2001:db8::1", wantErr: true},
-		{name: "remote http", baseURL: "http://config.example.com", wantErr: true},
-		{name: "localhost suffix", baseURL: "http://localhost.evil:8080", wantErr: true},
-		{name: "loopback prefix hostname", baseURL: "http://127.0.0.1.example:8080", wantErr: true},
 		{name: "relative", baseURL: "/config", wantErr: true},
 		{name: "userinfo", baseURL: "https://user:pass@config.example.com", wantErr: true},
 		{name: "query", baseURL: "https://config.example.com?target=other", wantErr: true},
 		{name: "fragment", baseURL: "https://config.example.com/#other", wantErr: true},
 		{name: "empty fragment", baseURL: "https://config.example.com#", wantErr: true},
+		{name: "dot path segment", baseURL: "http://config.example.com/./private", wantErr: true},
+		{name: "parent path segment", baseURL: "http://config.example.com/../private", wantErr: true},
 		{name: "unsupported scheme", baseURL: "ftp://config.example.com", wantErr: true},
 	}
 	for _, test := range tests {
