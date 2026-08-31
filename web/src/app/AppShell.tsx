@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { useAuth } from "../auth/AuthProvider";
+import { LanguageSwitcher } from "../components/LanguageSwitcher";
 
-const memberNavigation = [{ to: "/projects", label: "Projects" }];
+const memberNavigation = [{ to: "/projects", key: "projects" }];
 const adminNavigation = [
-  { to: "/machine-access", label: "Machine Access" },
-  { to: "/members", label: "Members" },
-  { to: "/system", label: "System" },
+  { to: "/machine-access", key: "machineAccess" },
+  { to: "/members", key: "members" },
+  { to: "/system", key: "system" },
 ];
-const LOGOUT_ERROR_MESSAGE =
-  "ConfigHub couldn’t confirm sign-out. You’re still signed in. Check the server and try again.";
 
 export function AppShell() {
+  const { t } = useTranslation(["common", "auth"]);
   const { logout, user } = useAuth();
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState("");
@@ -70,7 +71,7 @@ export function AppShell() {
     try {
       await logout();
     } catch {
-      setLogoutError(LOGOUT_ERROR_MESSAGE);
+      setLogoutError(t("auth:signOut.failure"));
     } finally {
       setLoggingOut(false);
     }
@@ -79,14 +80,14 @@ export function AppShell() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">
-        Skip to content
+        {t("skipLink")}
       </a>
       <header className="app-header">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true" />
           <div>
             <span className="brand-name">ConfigHub</span>
-            <span className="brand-context">Control ledger</span>
+            <span className="brand-context">{t("brandContext")}</span>
           </div>
         </div>
         <button
@@ -95,21 +96,26 @@ export function AppShell() {
           type="button"
           aria-controls="primary-navigation"
           aria-expanded={navigationOpen}
-          aria-label={navigationOpen ? "Close navigation" : "Open navigation"}
+          aria-label={t(
+            navigationOpen ? "navigation.close" : "navigation.open",
+          )}
           onClick={() => setNavigationOpen((current) => !current)}
         >
           <span aria-hidden="true">Menu</span>
         </button>
         <div className="session-summary">
           <span className="session-user">{user.display_name}</span>
-          <span className="session-role">{user.role}</span>
+          <span className="session-role">{t(`roles.${user.role}`)}</span>
+          <LanguageSwitcher />
           <button
             className="quiet-button"
             type="button"
             disabled={loggingOut}
             onClick={() => void handleLogout()}
           >
-            {loggingOut ? "Signing out…" : "Sign out"}
+            {loggingOut
+              ? t("auth:signOut.pending")
+              : t("auth:signOut.action")}
           </button>
           {logoutError ? (
             <p
@@ -128,9 +134,9 @@ export function AppShell() {
           ref={navigationRef}
           id="primary-navigation"
           className={navigationOpen ? "primary-nav primary-nav-open" : "primary-nav"}
-          aria-label="Primary"
+          aria-label={t("navigation.primary")}
         >
-          <p className="nav-label">Workspace</p>
+          <p className="nav-label">{t("navigation.workspace")}</p>
           <ul>
             {navigation.map((item) => (
               <li key={item.to}>
@@ -141,7 +147,7 @@ export function AppShell() {
                     isActive ? "nav-link nav-link-active" : "nav-link"
                   }
                 >
-                  {item.label}
+                  {t(`navigation.${item.key}`)}
                 </NavLink>
               </li>
             ))}

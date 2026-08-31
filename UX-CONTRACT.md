@@ -81,7 +81,7 @@
 
 ## Navigation and responsive behavior
 
-- Route document title policy: No route-title policy is implemented in the current code; later localization work must not invent one without an approved task.
+- Route document title policy: One shared application-root owner sets `document.title` as `ConfigHub — {localized route title}` for login, projects, machine access, members, system, and the app-owned not-found route. `ConfigHub` remains verbatim; updates follow route changes and active UI locale changes without rebuilding route state.
 - Route error / 403 page behavior: Current app-owned not-found page remains under the authenticated shell. Non-admin access redirects to `/projects` via `RequireAdmin`; this redirect is canonical for the current routes and is not changed by localization.
 - Breadcrumb/tab/route-state policy: Project environment and tab state remain in search parameters; no breadcrumb primitive exists.
 - Sidebar/drawer/bottom-sheet transformation: Header navigation toggles the existing primary navigation region; no sidebar/drawer/bottom-sheet contract exists.

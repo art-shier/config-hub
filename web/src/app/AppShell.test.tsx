@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 import { App } from "./App";
 import { server } from "../test/setup";
+import { changeLocale } from "../i18n";
 
 function mockAdminShell() {
   server.use(
@@ -20,6 +21,16 @@ function mockAdminShell() {
 }
 
 describe("AppShell responsive navigation", () => {
+  // Break caught: leaving authenticated navigation labels and the route title in the previous locale.
+  it("localizes shared navigation and the current route title", async () => {
+    mockAdminShell();
+    window.history.pushState({}, "", "/projects");
+    await changeLocale("zh-CN");
+    render(<App />);
+
+    expect(await screen.findByRole("link", { name: "\u9879\u76ee" })).toBeInTheDocument();
+    expect(document.title).toBe("ConfigHub \u2014 \u9879\u76ee");
+  });
   it("opens an accessible menu and restores the control on Escape", async () => {
     mockAdminShell();
     window.history.pushState({}, "", "/projects");

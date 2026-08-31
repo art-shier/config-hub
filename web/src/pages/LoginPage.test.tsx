@@ -11,6 +11,7 @@ import {
 } from "react-router-dom";
 import { App } from "../app/App";
 import { AuthProvider } from "../auth/AuthProvider";
+import { changeLocale } from "../i18n";
 import { server } from "../test/setup";
 import { LoginPage } from "./LoginPage";
 
@@ -102,6 +103,70 @@ async function signIn(username = "admin", password = "password") {
 }
 
 describe("authentication routes", () => {
+  // Break caught: remounting login while applying a locale, which loses an in-progress username.
+  it("keeps login field values while switching language", async () => {
+    useSignedOutSession();
+    const user = userEvent.setup();
+    renderAppAt("/login");
+
+    await user.type(await screen.findByLabelText("Username"), "admin");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Language" }), "zh-CN");
+
+    expect(screen.getByLabelText("\u7528\u6237\u540d")).toHaveValue("admin");
+    expect(screen.getByRole("button", { name: "\u767b\u5f55" })).toBeVisible();
+  });
+
+  // Break caught: rendering an API-provided login error message instead of its stable status/code mapping.
+  it("does not disclose a raw API login message in Chinese", async () => {
+    useSignedOutSession();
+    server.use(
+      http.post("/api/v1/auth/login", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "invalid_credentials",
+              message: "RAW SECRET",
+              request_id: "req",
+              fields: {},
+            },
+          },
+          { status: 401 },
+        ),
+      ),
+    );
+    await changeLocale("zh-CN");
+    renderAppAt("/login");
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("\u7528\u6237\u540d"), "admin");
+    await user.type(screen.getByLabelText("\u5bc6\u7801"), "wrong");
+    await user.click(screen.getByRole("button", { name: "\u767b\u5f55" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("\u7528\u6237\u540d\u6216\u5bc6\u7801\u4e0d\u6b63\u786e\u3002");
+    expect(screen.queryByText("RAW SECRET")).not.toBeInTheDocument();
+  });
+
+  // Break caught: changing password visibility without an accessible stateful control, or exposing it by default.
+  it("keeps the password masked until the accessible visibility control is activated", async () => {
+    useSignedOutSession();
+    const user = userEvent.setup();
+    renderAppAt("/login");
+    const password = await screen.findByLabelText("Username").then(() => screen.getByLabelText("Password"));
+    await user.type(password, "secret");
+
+    expect(password).toHaveAttribute("type", "password");
+    await user.click(screen.getByRole("button", { name: "Show password" }));
+    expect(password).toHaveAttribute("type", "text");
+    expect(password).toHaveValue("secret");
+    expect(screen.getByRole("button", { name: "Hide password" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  // Break caught: allowing browser-native validation UI to replace localized login recovery.
+  it("owns login validation with noValidate", async () => {
+    useSignedOutSession();
+    renderAppAt("/login");
+
+    expect((await screen.findByLabelText("Username")).closest("form")).toHaveAttribute("novalidate");
+  });
   it("logs in and redirects to projects", async () => {
     useSignedOutSession();
     server.use(

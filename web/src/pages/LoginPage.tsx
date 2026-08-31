@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { APIError } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
+import { LanguageSwitcher } from "../components/LanguageSwitcher";
+import { useTranslation } from "react-i18next";
 
 const knownDestinations = new Set([
   "/projects",
@@ -19,12 +21,14 @@ interface LoginLocationState {
 }
 
 export function LoginPage() {
+  const { t } = useTranslation("auth");
   const { loading, login, user } = useAuth();
   const location = useLocation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const mountedRef = useRef(false);
   const destination = safeDestination(location.state);
 
@@ -51,7 +55,7 @@ export function LoginPage() {
       await login(username, password);
     } catch (caught) {
       if (mountedRef.current) {
-        setError(loginErrorMessage(caught));
+        setError(t(loginErrorKey(caught)));
       }
     } finally {
       if (mountedRef.current) {
@@ -68,32 +72,36 @@ export function LoginPage() {
           <span className="brand-mark" aria-hidden="true" />
           <span className="brand-name">ConfigHub</span>
         </div>
-        <p className="eyebrow">Internal configuration control</p>
-        <h1 id="login-title">Sign in to the team ledger.</h1>
+        <p className="eyebrow">{t("login.eyebrow")}</p>
+        <h1 id="login-title">{t("login.title")}</h1>
         <p className="login-summary">
-          Review current values, trace revisions, and keep machine access
-          scoped to the work that needs it.
+          {t("login.summary")}
         </p>
         <dl className="login-facts">
           <div>
-            <dt>Access</dt>
-            <dd>Team accounts only</dd>
+            <dt>{t("login.facts.access")}</dt>
+            <dd>{t("login.facts.accessValue")}</dd>
           </div>
           <div>
-            <dt>Session</dt>
-            <dd>Managed by ConfigHub</dd>
+            <dt>{t("login.facts.session")}</dt>
+            <dd>{t("login.facts.sessionValue")}</dd>
           </div>
         </dl>
       </section>
 
-      <section className="login-form-region" aria-label="Account sign in">
+      <section className="login-form-region" aria-label={t("login.region")}>
         <div className="login-form-heading">
-          <p className="section-index">Session / 01</p>
-          <h2>Account credentials</h2>
-          <p>Use the username and password issued by your administrator.</p>
+          <p className="section-index">{t("login.sectionIndex")}</p>
+          <h2>{t("login.credentialsTitle")}</h2>
+          <p>{t("login.credentialsDescription")}</p>
         </div>
-        <form className="login-form" onSubmit={(event) => void handleSubmit(event)}>
-          <label htmlFor="username">Username</label>
+        <form
+          className="login-form"
+          noValidate
+          onSubmit={(event) => void handleSubmit(event)}
+        >
+          <LanguageSwitcher className="login-language-switcher" />
+          <label htmlFor="username">{t("login.fields.username")}</label>
           <input
             id="username"
             name="username"
@@ -107,17 +115,32 @@ export function LoginPage() {
             onChange={(event) => setUsername(event.currentTarget.value)}
           />
 
-          <label htmlFor="password">Password</label>
-          <input
-            id="password"
-            name="password"
-            type="password"
-            autoComplete="current-password"
-            required
-            value={password}
-            disabled={submitting}
-            onChange={(event) => setPassword(event.currentTarget.value)}
-          />
+          <label htmlFor="password">{t("login.fields.password")}</label>
+          <div className="password-field">
+            <input
+              id="password"
+              name="password"
+              type={passwordVisible ? "text" : "password"}
+              autoComplete="current-password"
+              required
+              value={password}
+              disabled={submitting}
+              onChange={(event) => setPassword(event.currentTarget.value)}
+            />
+            <button
+              className="text-button password-visibility-button"
+              type="button"
+              aria-pressed={passwordVisible}
+              disabled={submitting}
+              onClick={() => setPasswordVisible((visible) => !visible)}
+            >
+              {t(
+                passwordVisible
+                  ? "login.passwordVisibility.hide"
+                  : "login.passwordVisibility.show",
+              )}
+            </button>
+          </div>
 
           <div className="form-message" aria-live="polite" aria-atomic="true">
             {error ? <p role="alert">{error}</p> : null}
@@ -128,11 +151,11 @@ export function LoginPage() {
             type="submit"
             disabled={loading || submitting}
           >
-            {submitting ? "Signing in…" : "Sign in"}
+            {submitting ? t("login.pending") : t("login.action")}
           </button>
           {loading ? (
             <p className="session-check" role="status">
-              Checking existing session…
+              {t("login.sessionCheck")}
             </p>
           ) : null}
         </form>
@@ -160,14 +183,17 @@ function safeDestination(state: unknown): string {
   return `${from.pathname}${search}`;
 }
 
-function loginErrorMessage(error: unknown): string {
+function loginErrorKey(error: unknown):
+  | "login.errors.invalidCredentials"
+  | "login.errors.rateLimited"
+  | "login.errors.network" {
   if (error instanceof APIError) {
     if (error.status === 401 || error.code === "invalid_credentials") {
-      return "Username or password wasn’t recognized.";
+      return "login.errors.invalidCredentials";
     }
     if (error.status === 429 || error.code === "rate_limited") {
-      return "Too many sign-in attempts. Wait a moment and try again.";
+      return "login.errors.rateLimited";
     }
   }
-  return "ConfigHub couldn’t be reached. Check the server and try again.";
+  return "login.errors.network";
 }

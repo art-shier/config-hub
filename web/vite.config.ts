@@ -12,6 +12,16 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: "../internal/webui/dist",
       emptyOutDir: true,
+      rolldownOptions: {
+        output: {
+          manualChunks(id) {
+            return id.includes("node_modules/i18next/") ||
+              id.includes("node_modules/react-i18next/")
+              ? "i18n"
+              : undefined;
+          },
+        },
+      },
     },
     test: {
       include: ["src/**/*.{test,spec}.{ts,tsx}"],

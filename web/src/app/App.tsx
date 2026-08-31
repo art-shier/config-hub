@@ -8,6 +8,7 @@ import {
   useLocation,
 } from "react-router-dom";
 import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { AuthProvider, useAuth } from "../auth/AuthProvider";
 import { LoginPage } from "../pages/LoginPage";
 import { MachineAccessPage } from "../pages/MachineAccessPage";
@@ -45,6 +46,7 @@ export function App() {
 function AppRoutes() {
   return (
     <AuthProvider>
+      <RouteDocumentTitle />
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route element={<RequireSession />}>
@@ -68,13 +70,7 @@ function AppRoutes() {
             </Route>
             <Route
               path="*"
-              element={
-                <PlaceholderPage
-                  eyebrow="Navigation"
-                  title="Page not found"
-                  description="This address does not match a ConfigHub page."
-                />
-              }
+              element={<NotFoundPage />}
             />
           </Route>
         </Route>
@@ -110,29 +106,43 @@ function RequireAdmin() {
 }
 
 function SessionLoading() {
+  const { t } = useTranslation("common");
   return (
     <main className="session-loading" aria-labelledby="session-loading-title">
       <span className="brand-mark" aria-hidden="true" />
-      <p className="eyebrow">ConfigHub session</p>
-      <h1 id="session-loading-title">Checking access…</h1>
+      <p className="eyebrow">{t("session.eyebrow")}</p>
+      <h1 id="session-loading-title">{t("session.loading")}</h1>
     </main>
   );
 }
 
-function PlaceholderPage({
-  description,
-  eyebrow,
-  title,
-}: {
-  description: string;
-  eyebrow: string;
-  title: string;
-}) {
+function NotFoundPage() {
+  const { t } = useTranslation("common");
   return (
     <section className="page-heading">
-      <p className="eyebrow">{eyebrow}</p>
-      <h1>{title}</h1>
-      <p>{description}</p>
+      <p className="eyebrow">{t("notFound.eyebrow")}</p>
+      <h1>{t("notFound.title")}</h1>
+      <p>{t("notFound.description")}</p>
     </section>
   );
+}
+
+function RouteDocumentTitle() {
+  const location = useLocation();
+  const { t } = useTranslation("common");
+
+  useEffect(() => {
+    document.title = `ConfigHub — ${t(routeTitleKey(location.pathname))}`;
+  }, [location.pathname, t]);
+
+  return null;
+}
+
+function routeTitleKey(pathname: string) {
+  if (pathname === "/login") return "routeTitles.login";
+  if (pathname.startsWith("/projects")) return "routeTitles.projects";
+  if (pathname === "/machine-access") return "routeTitles.machineAccess";
+  if (pathname === "/members") return "routeTitles.members";
+  if (pathname === "/system") return "routeTitles.system";
+  return "routeTitles.notFound";
 }
