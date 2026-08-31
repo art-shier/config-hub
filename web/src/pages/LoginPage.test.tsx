@@ -184,6 +184,7 @@ describe("authentication routes", () => {
     ).toHaveAttribute("href", "#main-content");
   });
 
+  // Break caught: storing rendered login recovery copy that does not update with the active locale.
   it("shows a credential-safe error after a rejected login", async () => {
     useSignedOutSession();
     server.use(
@@ -210,6 +211,15 @@ describe("authentication routes", () => {
     expect(error).not.toHaveTextContent("account-specific");
     expect(error).not.toHaveTextContent("does not exist");
     expect(screen.getByLabelText("Password")).toHaveValue("");
+
+    const user = userEvent.setup();
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Language" }),
+      "zh-CN",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "用户名或密码不正确。",
+    );
   });
 
   it("prevents duplicate sign-in submissions while loading", async () => {

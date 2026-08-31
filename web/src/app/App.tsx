@@ -140,7 +140,9 @@ function RouteDocumentTitle() {
 
 function routeTitleKey(pathname: string) {
   if (pathname === "/login") return "routeTitles.login";
-  if (pathname.startsWith("/projects")) return "routeTitles.projects";
+  if (pathname === "/projects" || pathname.startsWith("/projects/")) {
+    return "routeTitles.projects";
+  }
   if (pathname === "/machine-access") return "routeTitles.machineAccess";
   if (pathname === "/members") return "routeTitles.members";
   if (pathname === "/system") return "routeTitles.system";

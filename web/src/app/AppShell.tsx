@@ -10,12 +10,15 @@ const adminNavigation = [
   { to: "/members", key: "members" },
   { to: "/system", key: "system" },
 ];
+type LogoutErrorKey = "auth:signOut.failure";
 
 export function AppShell() {
   const { t } = useTranslation(["common", "auth"]);
   const { logout, user } = useAuth();
   const [loggingOut, setLoggingOut] = useState(false);
-  const [logoutError, setLogoutError] = useState("");
+  const [logoutErrorKey, setLogoutErrorKey] = useState<LogoutErrorKey | null>(
+    null,
+  );
   const [navigationOpen, setNavigationOpen] = useState(false);
   const navigationButtonRef = useRef<HTMLButtonElement>(null);
   const navigationRef = useRef<HTMLElement>(null);
@@ -66,12 +69,12 @@ export function AppShell() {
     if (loggingOut) {
       return;
     }
-    setLogoutError("");
+    setLogoutErrorKey(null);
     setLoggingOut(true);
     try {
       await logout();
     } catch {
-      setLogoutError(t("auth:signOut.failure"));
+      setLogoutErrorKey("auth:signOut.failure");
     } finally {
       setLoggingOut(false);
     }
@@ -101,7 +104,7 @@ export function AppShell() {
           )}
           onClick={() => setNavigationOpen((current) => !current)}
         >
-          <span aria-hidden="true">Menu</span>
+          <span aria-hidden="true">{t("navigation.menu")}</span>
         </button>
         <div className="session-summary">
           <span className="session-user">{user.display_name}</span>
@@ -117,14 +120,14 @@ export function AppShell() {
               ? t("auth:signOut.pending")
               : t("auth:signOut.action")}
           </button>
-          {logoutError ? (
+          {logoutErrorKey ? (
             <p
               className="logout-error"
               role="status"
               aria-live="polite"
               aria-atomic="true"
             >
-              {logoutError}
+              {t(logoutErrorKey)}
             </p>
           ) : null}
         </div>

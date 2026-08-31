@@ -29,7 +29,57 @@ describe("AppShell responsive navigation", () => {
     render(<App />);
 
     expect(await screen.findByRole("link", { name: "\u9879\u76ee" })).toBeInTheDocument();
+    expect(screen.getByText("\u83dc\u5355")).toBeVisible();
     expect(document.title).toBe("ConfigHub \u2014 \u9879\u76ee");
+  });
+
+  // Break caught: treating an unrelated route with a shared prefix as a project route.
+  it("uses the not-found title outside the projects path boundary", async () => {
+    mockAdminShell();
+    window.history.pushState({}, "", "/projectswildcard");
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Page not found" }),
+    ).toBeInTheDocument();
+    expect(document.title).toBe("ConfigHub \u2014 Page not found");
+  });
+
+  // Break caught: storing a rendered sign-out failure string that becomes stale after a locale switch.
+  it("retranslates an unconfirmed sign-out recovery message after switching locale", async () => {
+    mockAdminShell();
+    server.use(
+      http.post("/api/v1/auth/logout", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "service_unavailable",
+              message: "RAW SECRET",
+              request_id: "req",
+              fields: {},
+            },
+          },
+          { status: 503 },
+        ),
+      ),
+    );
+    window.history.pushState({}, "", "/projects");
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Projects" });
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "ConfigHub couldn’t confirm sign-out. You’re still signed in. Check the server and try again.",
+    );
+
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Language" }),
+      "zh-CN",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "ConfigHub 无法确认退出登录。您仍处于登录状态。请检查服务器后重试。",
+    );
   });
   it("opens an accessible menu and restores the control on Escape", async () => {
     mockAdminShell();

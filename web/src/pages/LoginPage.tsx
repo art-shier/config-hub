@@ -20,13 +20,18 @@ interface LoginLocationState {
   };
 }
 
+type LoginErrorKey =
+  | "login.errors.invalidCredentials"
+  | "login.errors.rateLimited"
+  | "login.errors.network";
+
 export function LoginPage() {
   const { t } = useTranslation("auth");
   const { loading, login, user } = useAuth();
   const location = useLocation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
+  const [errorKey, setErrorKey] = useState<LoginErrorKey | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [passwordVisible, setPasswordVisible] = useState(false);
   const mountedRef = useRef(false);
@@ -49,13 +54,13 @@ export function LoginPage() {
       return;
     }
 
-    setError("");
+    setErrorKey(null);
     setSubmitting(true);
     try {
       await login(username, password);
     } catch (caught) {
       if (mountedRef.current) {
-        setError(t(loginErrorKey(caught)));
+        setErrorKey(loginErrorKey(caught));
       }
     } finally {
       if (mountedRef.current) {
@@ -143,7 +148,7 @@ export function LoginPage() {
           </div>
 
           <div className="form-message" aria-live="polite" aria-atomic="true">
-            {error ? <p role="alert">{error}</p> : null}
+            {errorKey ? <p role="alert">{t(errorKey)}</p> : null}
           </div>
 
           <button
@@ -183,10 +188,7 @@ function safeDestination(state: unknown): string {
   return `${from.pathname}${search}`;
 }
 
-function loginErrorKey(error: unknown):
-  | "login.errors.invalidCredentials"
-  | "login.errors.rateLimited"
-  | "login.errors.network" {
+function loginErrorKey(error: unknown): LoginErrorKey {
   if (error instanceof APIError) {
     if (error.status === 401 || error.code === "invalid_credentials") {
       return "login.errors.invalidCredentials";
