@@ -14,12 +14,16 @@ function sortedLeafKeys(value: object, prefix = ""): string[] {
 
 describe("translation resources", () => {
   it("keeps every namespace and nested key in parity", () => {
-    for (const namespace of Object.keys(resources["en-US"]) as Array<
+    const namespaces = Object.keys(resources["en-US"]) as Array<
       keyof (typeof resources)["en-US"]
-    >) {
-      expect(sortedLeafKeys(resources["zh-CN"][namespace])).toEqual(
-        sortedLeafKeys(resources["en-US"][namespace]),
-      );
+    >;
+
+    for (const namespace of namespaces) {
+      const english = sortedLeafKeys(resources["en-US"][namespace]);
+      const chinese = sortedLeafKeys(resources["zh-CN"][namespace]);
+      expect(english.length, `${namespace} must not be empty`).toBeGreaterThan(0);
+      expect(chinese.length, `${namespace} must not be empty`).toBeGreaterThan(0);
+      expect(chinese).toEqual(english);
     }
   });
 });

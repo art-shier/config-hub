@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 import { App } from "../app/App";
+import { changeLocale } from "../i18n";
 import { server } from "../test/setup";
 
 function mockSession(role: "admin" | "member") {
@@ -23,6 +24,29 @@ function renderAt(path = "/system") {
 }
 
 describe("SystemPage", () => {
+  it("localizes operational labels without changing the build version", async () => {
+    await changeLocale("zh-CN");
+    mockSession("admin");
+    server.use(
+      http.get("/api/v1/system", () =>
+        HttpResponse.json({
+          build_version: "v2026.08.31+sha.abc123",
+          live: true,
+          ready: true,
+          sqlite_ready: true,
+          last_successful_user_sync_at: "2026-08-29T09:00:00Z",
+        }),
+      ),
+    );
+
+    renderAt();
+
+    expect(await screen.findByRole("heading", { name: "系统" })).toBeVisible();
+    expect(await screen.findByText("构建版本")).toBeVisible();
+    expect(screen.getByText("v2026.08.31+sha.abc123")).toBeVisible();
+    expect(screen.getAllByText("可用").length).toBeGreaterThan(0);
+  });
+
   it("redirects a non-admin without requesting system state", async () => {
     mockSession("member");
     let requests = 0;

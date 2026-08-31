@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { SystemStatus } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
+import { formatDateTime } from "../i18n/format";
+import type { SupportedLocale } from "../i18n/locales";
 
 type LoadState = "loading" | "ready" | "error";
 
 export function SystemPage() {
   const { client } = useAuth();
+  const { t } = useTranslation("system");
   const [state, setState] = useState<LoadState>("loading");
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const generationRef = useRef(0);
@@ -41,20 +45,20 @@ export function SystemPage() {
     <section className="resource-page administration-page" aria-labelledby="system-title">
       <header className="resource-heading">
         <div>
-          <p className="eyebrow">Service state register</p>
-          <h1 id="system-title">System</h1>
-          <p>A deliberately narrow view of process, storage, and account synchronization readiness.</p>
+          <p className="eyebrow">{t("page.eyebrow")}</p>
+          <h1 id="system-title">{t("page.title")}</h1>
+          <p>{t("page.summary")}</p>
         </div>
       </header>
 
-      {state === "loading" ? <p className="loading-line" role="status">Loading system state…</p> : null}
+      {state === "loading" ? <p className="loading-line" role="status">{t("page.loading")}</p> : null}
       {state === "error" ? (
         <div className="inline-error-state administration-error" role="alert">
-          <p className="section-index">Operational register / Unavailable</p>
-          <h2>System state unavailable</h2>
-          <p>The safe service summary couldn’t be loaded. Check the service and try again.</p>
+          <p className="section-index">{t("error.index")}</p>
+          <h2>{t("error.title")}</h2>
+          <p>{t("error.description")}</p>
           <button className="secondary-button" type="button" onClick={() => void load()}>
-            Retry system state
+            {t("error.retry")}
           </button>
         </div>
       ) : null}
@@ -64,20 +68,22 @@ export function SystemPage() {
 }
 
 function SystemRegister({ status }: { status: SystemStatus }) {
+  const { i18n, t } = useTranslation("system");
+  const locale: SupportedLocale = i18n.resolvedLanguage === "zh-CN" ? "zh-CN" : "en-US";
   const rows = [
-    ["Build version", status.build_version || "Unavailable", null],
-    ["Live", status.live ? "Available" : "Unavailable", status.live],
-    ["Ready", status.ready ? "Available" : "Unavailable", status.ready],
-    ["SQLite readiness", status.sqlite_ready ? "Available" : "Unavailable", status.sqlite_ready],
-    ["Last successful user sync", formatDateTime(status.last_successful_user_sync_at), null],
+    [t("register.buildVersion"), status.build_version || t("status.unavailable"), null],
+    [t("register.live"), status.live ? t("status.available") : t("status.unavailable"), status.live],
+    [t("register.ready"), status.ready ? t("status.available") : t("status.unavailable"), status.ready],
+    [t("register.sqliteReadiness"), status.sqlite_ready ? t("status.available") : t("status.unavailable"), status.sqlite_ready],
+    [t("register.lastSuccessfulUserSync"), formatDateTime(status.last_successful_user_sync_at, locale, t("status.unavailable")), null],
   ] as const;
   return (
     <section className="system-register" aria-labelledby="system-register-title">
       <header className="section-heading administration-section-heading">
         <div>
-          <p className="section-index">Current process / Safe fields</p>
-          <h2 id="system-register-title">Operational state</h2>
-          <p>Paths, configuration values, database details, and user-file contents are never shown.</p>
+          <p className="section-index">{t("register.index")}</p>
+          <h2 id="system-register-title">{t("register.title")}</h2>
+          <p>{t("register.safety")}</p>
         </div>
       </header>
       <dl className="status-ledger">
@@ -103,11 +109,4 @@ function isSystemStatus(value: unknown): value is SystemStatus {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function formatDateTime(value: string): string {
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.valueOf())
-    ? "Unavailable"
-    : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(parsed);
 }
