@@ -139,7 +139,7 @@ validate_cli_archive() {
   tar -xzf "$archive" -C "$extract_root" "$archive_base/confighub"
   [[ -f "$extract_root/$archive_base/confighub" && ! -L "$extract_root/$archive_base/confighub" ]] ||
     die 'extracted CLI is not a regular file' || return
-  chmod 0755 -- "$extract_root/$archive_base/confighub"
+  chmod 0755 "$extract_root/$archive_base/confighub"
 }
 
 remove_download_origin_mark() {

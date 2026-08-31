@@ -47,12 +47,12 @@ function Assert-AbsoluteInstallDirectory {
 
 function Resolve-WindowsCliTarget {
     param(
-        [Parameter(Mandatory = $true)][bool]$IsWindows,
+        [Parameter(Mandatory = $true)][bool]$IsWindowsPlatform,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Architecture,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Wow64Architecture
     )
 
-    if (-not $IsWindows) {
+    if (-not $IsWindowsPlatform) {
         throw 'The ConfigHub Windows installer only supports Windows.'
     }
 
@@ -385,7 +385,7 @@ function Install-CliRelease {
     $architecture = [string][Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE')
     $wow64Architecture = [string][Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITEW6432')
     Resolve-WindowsCliTarget `
-        -IsWindows ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) `
+        -IsWindowsPlatform ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) `
         -Architecture $architecture -Wow64Architecture $wow64Architecture | Out-Null
 
     $installFullPath = [IO.Path]::GetFullPath($InstallDirectory)
@@ -443,7 +443,7 @@ function Invoke-InstallCliMain {
     Assert-AbsoluteInstallDirectory $RequestedInstallDir
     $architecture = [string][Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE')
     $wow64Architecture = [string][Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITEW6432')
-    Resolve-WindowsCliTarget -IsWindows ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) `
+    Resolve-WindowsCliTarget -IsWindowsPlatform ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) `
         -Architecture $architecture -Wow64Architecture $wow64Architecture | Out-Null
 
     if ([string]::IsNullOrEmpty($RequestedVersion)) {

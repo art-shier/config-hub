@@ -40,7 +40,7 @@ cat >"$fallback_bin/shasum" <<EOF
 #!/bin/bash
 printf '%s  %s\n' '1805CC9EA64598BB6C71C9A14232B932D9369DA74D2E3943342CF2D2A05FC609' "\${4:-}"
 EOF
-chmod 0755 -- "$fallback_bin/awk" "$fallback_bin/shasum"
+chmod 0755 "$fallback_bin/awk" "$fallback_bin/shasum"
 assert_eq "$checksum_expected" "$(PATH="$fallback_bin" sha256_file "$checksum_fixture")"
 
 fixture_target="$(detect_cli_target "$(uname -s)" "$(uname -m)")"
@@ -62,7 +62,7 @@ if [[ "${1:-}" == version && "$#" -eq 1 ]]; then
 fi
 exit 2
 EOF
-chmod 0755 -- "$fixture_root/package/$fixture_base/confighub"
+chmod 0755 "$fixture_root/package/$fixture_base/confighub"
 tar -czf "$fixture_root/release/$fixture_base.tar.gz" -C "$fixture_root/package" "$fixture_base"
 (
   cd "$fixture_root/release"

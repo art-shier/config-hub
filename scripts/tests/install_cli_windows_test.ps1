@@ -128,10 +128,10 @@ $installerPath = Join-Path $repoRoot 'scripts\install-cli.ps1'
 # while correct dot-sourcing only defines the installer functions.
 . $installerPath -Version 'dot-source-must-not-install' -InstallDir $PSScriptRoot
 
-Assert-Equal 'windows amd64' (Resolve-WindowsCliTarget -IsWindows $true -Architecture 'AMD64' -Wow64Architecture '')
-Assert-Equal 'windows amd64' (Resolve-WindowsCliTarget -IsWindows $true -Architecture 'x86' -Wow64Architecture 'AMD64')
-Assert-Throws { Resolve-WindowsCliTarget -IsWindows $false -Architecture 'AMD64' -Wow64Architecture '' }
-Assert-Throws { Resolve-WindowsCliTarget -IsWindows $true -Architecture 'ARM64' -Wow64Architecture '' }
+Assert-Equal 'windows amd64' (Resolve-WindowsCliTarget -IsWindowsPlatform $true -Architecture 'AMD64' -Wow64Architecture '')
+Assert-Equal 'windows amd64' (Resolve-WindowsCliTarget -IsWindowsPlatform $true -Architecture 'x86' -Wow64Architecture 'AMD64')
+Assert-Throws { Resolve-WindowsCliTarget -IsWindowsPlatform $false -Architecture 'AMD64' -Wow64Architecture '' }
+Assert-Throws { Resolve-WindowsCliTarget -IsWindowsPlatform $true -Architecture 'ARM64' -Wow64Architecture '' }
 Assert-ReleaseTag 'v1.2.3'
 Assert-Throws { Assert-ReleaseTag 'v1.2.3-rc1' }
 Assert-Throws { Assert-AbsoluteInstallDirectory 'relative\bin' }
