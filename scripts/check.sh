@@ -20,6 +20,7 @@ if [[ -n "$unformatted" ]]; then
 fi
 go vet ./...
 go test -race -count=1 ./...
+"$script_dir/tests/run.sh"
 
 npm ci --include=dev --prefix "$repo_root/web"
 npm run typecheck --prefix "$repo_root/web"

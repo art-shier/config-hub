@@ -7,7 +7,7 @@ ConfigHub 是面向单个内部研发团队的轻量配置中心。管理员和�
 - `dist/confighub-server`：Web、HTTP API、账号同步、SQLite 与在线备份；
 - `dist/confighub`：只读 CLI，不直接访问 SQLite。
 
-仓库不提供 Docker、Caddy、外部数据库或 systemd 配置。
+仓库提供 Linux GitHub Release、独立安装/部署脚本和 systemd unit；不提供 Docker、Caddy 或外部数据库。
 
 ## 前置条件
 
@@ -18,7 +18,100 @@ ConfigHub 是面向单个内部研发团队的轻量配置中心。管理员和�
 
 Node.js 23、25 以及低于上述 patch 下限的版本不受支持，构建脚本会在安装依赖前拒绝它们。
 
-## 首次配置
+## Release 产物与安装
+
+推送严格格式的 `vMAJOR.MINOR.PATCH` 标签后，GitHub Release 会发布两个彼此独立的产品，支持 Linux `amd64` 和 `arm64`：
+
+- `config-hub-server_VERSION_linux_ARCH.tar.gz`：`confighub-server`、内嵌 Web、配置示例和 systemd unit；
+- `config-hub-cli_VERSION_linux_ARCH.tar.gz`：独立的 `confighub` CLI；
+- `checksums.txt`：四个归档的 SHA-256 校验值。
+
+Server 安装不会附带 CLI；需要在哪台机器使用 CLI，就在那台机器单独安装。两个脚本只从 `art-shier/config-hub` 的 GitHub Release 下载匹配当前 Linux 架构的归档，并在安装前验证校验值、归档结构和二进制版本。
+
+### 安装 CLI
+
+先下载并审阅安装脚本：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/art-shier/config-hub/main/scripts/install-cli.sh
+less install-cli.sh
+```
+
+安装最新版本到默认的 `/usr/local/bin`：
+
+```bash
+sudo bash install-cli.sh
+```
+
+安装固定版本，或安装到当前用户的自定义绝对目录：
+
+```bash
+sudo bash install-cli.sh --version v1.2.3
+mkdir -p "$HOME/.local/bin"
+bash install-cli.sh --version v1.2.3 --install-dir "$HOME/.local/bin"
+```
+
+安装后可用 `confighub version` 核对版本。自定义目录需要加入 `PATH`。
+
+### 首次部署 Server + Web
+
+Server 部署脚本要求 root、systemd、Linux `amd64` 或 `arm64`。它创建专用的 `confighub` 系统账号，将服务限制在 `127.0.0.1:8080`，并生成受限配置、管理员账号、Session 密钥和 SQLite/备份目录：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/art-shier/config-hub/main/scripts/deploy-server.sh
+less deploy-server.sh
+sudo bash deploy-server.sh --public-url https://config.example.com
+```
+
+默认会通过 `/dev/tty` 交互读取两次初始管理员密码。非交互部署必须改用普通文件，且文件必须是非符号链接、只包含一行非空密码、权限严格为 `0600`：
+
+```bash
+sudo install -m 600 /dev/null /root/confighub-admin-password
+sudoedit /root/confighub-admin-password
+sudo bash deploy-server.sh \
+  --public-url https://config.example.com \
+  --admin-username admin \
+  --admin-password-file /root/confighub-admin-password
+sudo rm -f /root/confighub-admin-password
+```
+
+脚本安装的运行文件位于 `/etc/confighub`，SQLite 位于 `/var/lib/confighub`，在线备份位于 `/var/backups/confighub`。生产访问必须由外部 HTTPS 反向代理转发到回环地址；不要把服务监听地址直接暴露到公网。若代理不在本机，先在 `/etc/confighub/config.yaml` 的 `trusted_proxy_cidrs` 中加入精确的可信代理网段，再重启服务。
+
+### 升级 Server + Web
+
+再次下载并审阅当前部署脚本，然后直接执行即可升级到最新版本；也可用 `--version v1.2.3` 固定版本：
+
+```bash
+sudo bash deploy-server.sh
+sudo bash deploy-server.sh --version v1.2.3
+```
+
+已安装相同版本且 readiness 正常时，脚本不做变更。升级到新版本前，脚本必须先用当前二进制完成 SQLite 在线备份；备份失败时不会替换二进制或 unit。升级后的服务若未就绪，脚本会保留新二进制、`/usr/local/lib/confighub/confighub-server.previous` 和升级前备份供人工恢复，但不会自动回滚 SQLite。
+
+### systemd 运维与卸载
+
+```bash
+sudo systemctl status confighub.service
+sudo systemctl restart confighub.service
+sudo systemctl reload confighub.service
+sudo journalctl -u confighub.service
+curl -fsS http://127.0.0.1:8080/api/v1/health/live
+curl -fsS http://127.0.0.1:8080/api/v1/health/ready
+```
+
+`reload` 发送 `SIGHUP`，用于重新载入 `/etc/confighub/users.yaml`。若要卸载 CLI，只需删除实际安装目录中的 `confighub`。保守卸载 Server 时先停止并禁用服务，再移除 unit 和已安装二进制；默认保留配置、数据库和备份：
+
+```bash
+sudo systemctl disable --now confighub.service
+sudo rm -f /etc/systemd/system/confighub.service \
+  /usr/local/bin/confighub-server \
+  /usr/local/lib/confighub/confighub-server.previous
+sudo systemctl daemon-reload
+```
+
+不要把 `/etc/confighub`、`/var/lib/confighub` 或 `/var/backups/confighub` 作为常规卸载的一部分删除。确认数据保留与备份策略后，再单独决定是否移除 `confighub` 系统账号和这些目录。
+
+## 源码运行：首次配置
 
 从示例创建运行文件，并在写入任何密码或密钥前收紧权限：
 
@@ -45,7 +138,7 @@ chmod 700 data backups
 
 `config.yaml`、`users.yaml`、`session.key`、SQLite 文件和备份文件权限必须不宽于 `0600`，数据与备份目录必须不宽于 `0700`。运行账号应是这些文件的唯一所有者和日常读写者。
 
-## 构建与启动
+## 源码运行：构建与启动
 
 完整构建：
 
@@ -211,7 +304,17 @@ SQLite 数据库和所有备份都以明文保存业务配置。任何能够读�
 ./scripts/check.sh
 ```
 
-它执行 Go 格式检查、vet、race 测试、前端类型检查/单元测试/构建、两个二进制构建、真实 Chromium E2E 和真实运行时/在线备份验收。浏览器失败时的截图和 trace 只写入 `output/playwright/`；成功后不保留业务运行数据。
+它执行 Go 格式检查、vet、race 测试、发布/安装/部署 Bash 行为测试、前端类型检查/单元测试/构建、两个二进制构建、真实 Chromium E2E 和真实运行时/在线备份验收。浏览器失败时的截图和 trace 只写入 `output/playwright/`；成功后不保留业务运行数据。
+
+维护者发布新版本前，先确保 `main` 的完整质量门禁通过，再创建并推送标签：
+
+```bash
+./scripts/check.sh
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+标签推送会触发发布流水线：重新执行质量门禁，构建四个归档，核对资产与校验清单，在验证全部上传资产后才公开 GitHub Release。标签必须严格匹配 `vMAJOR.MINOR.PATCH`。
 
 ## MVP 明确不包含
 
@@ -225,7 +328,7 @@ SQLite 数据库和所有备份都以明文保存业务配置。任何能够读�
 - 运行时 Sidecar、配置推送、热刷新或动态凭据；
 - 多实例部署、水平扩容和分布式锁；
 - 网页修改账号或密码；
-- 完整配置文件、证书和二进制文件管理；
+- 通过 Web 管理完整配置文件或证书，以及多主机部署编排；
 - 移动端复杂编辑体验。
 
 完整产品与安全取舍见 `docs/superpowers/specs/2026-08-28-confighub-design.md`。
