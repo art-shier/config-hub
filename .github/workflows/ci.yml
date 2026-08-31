@@ -40,7 +40,7 @@ jobs:
           cd web
           npx playwright install --with-deps chromium
           sudo apt-get update
-          sudo apt-get install --yes shellcheck
+          sudo apt-get install --yes shellcheck zip unzip
 
       - name: Lint shell and workflows
         run: |
@@ -50,3 +50,76 @@ jobs:
 
       - name: Run complete quality gate
         run: ./scripts/check.sh
+
+  cli-macos:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.x
+          cache: true
+
+      - name: Verify Apple Silicon runner
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+
+      - name: Test macOS CLI installer
+        run: /bin/bash scripts/tests/install_cli_test.sh
+
+      - name: Test and run native CLI
+        run: |
+          go test ./internal/cli -count=1
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+            -ldflags "-X confighub.local/internal/buildinfo.Version=ci" \
+            -o dist/confighub ./cmd/cli
+          test "$(./dist/confighub version)" = ci
+
+  cli-windows:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.x
+          cache: true
+
+      - name: Verify x64 runner
+        shell: powershell
+        run: |
+          if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne `
+              [Runtime.InteropServices.Architecture]::X64) {
+              throw 'Windows CLI checks require an x64 runner.'
+          }
+
+      - name: Test installer with Windows PowerShell 5.1
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\tests\install_cli_windows_test.ps1
+
+      - name: Test installer with PowerShell 7
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/tests/install_cli_windows_test.ps1
+
+      - name: Test and run native CLI
+        shell: powershell
+        run: |
+          go test ./internal/cli -count=1
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $env:CGO_ENABLED = '0'
+          go build -trimpath -buildvcs=false `
+            -ldflags "-X confighub.local/internal/buildinfo.Version=ci" `
+            -o dist\confighub.exe ./cmd/cli
+          $actualVersion = & .\dist\confighub.exe version
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -cne 'ci') {
+              throw "Unexpected native CLI version: $actualVersion"
+          }

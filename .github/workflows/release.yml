@@ -13,16 +13,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  quality:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: write
+    timeout-minutes: 45
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -50,7 +46,7 @@ jobs:
           cd web
           npx playwright install --with-deps chromium
           sudo apt-get update
-          sudo apt-get install --yes shellcheck
+          sudo apt-get install --yes shellcheck zip unzip
 
       - name: Lint shell and workflows
         run: |
@@ -61,8 +57,210 @@ jobs:
       - name: Run complete quality gate
         run: ./scripts/check.sh
 
+  package:
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.x
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install ZIP packager
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zip
+
       - name: Build Server and CLI release assets
         run: ./scripts/package-release.sh "$GITHUB_REF_NAME"
+
+      - name: Verify exact Release assets
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          actual_assets="$(find dist/release -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          expected_assets="$(printf '%s\n' \
+            checksums.txt \
+            "config-hub-cli_${version}_darwin_arm64.tar.gz" \
+            "config-hub-cli_${version}_linux_amd64.tar.gz" \
+            "config-hub-cli_${version}_linux_arm64.tar.gz" \
+            "config-hub-cli_${version}_windows_amd64.zip" \
+            "config-hub-server_${version}_linux_amd64.tar.gz" \
+            "config-hub-server_${version}_linux_arm64.tar.gz")"
+          if [[ "$actual_assets" != "$expected_assets" ]]; then
+            printf 'unexpected Release assets:\n%s\n' "$actual_assets" >&2
+            exit 1
+          fi
+
+      - name: Upload immutable Release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-hub-release-assets
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke-cli-macos:
+    needs: package
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Download Release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: config-hub-release-assets
+          path: dist/release
+
+      - name: Verify Apple Silicon runner
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+
+      - name: Test macOS CLI installer
+        run: /bin/bash scripts/tests/install_cli_test.sh
+
+      - name: Verify and run packaged macOS CLI
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive_base="config-hub-cli_${version}_darwin_arm64"
+          archive_name="${archive_base}.tar.gz"
+          archive_path="dist/release/${archive_name}"
+          manifest_record="$(awk -v filename="$archive_name" \
+            'NF == 2 && $2 == filename { digest=$1; count++ } \
+             END { printf "%d %s\n", count + 0, digest }' \
+            dist/release/checksums.txt)"
+          read -r match_count expected_digest <<<"$manifest_record"
+          [[ "$match_count" -eq 1 && "$expected_digest" =~ ^[0-9A-Fa-f]{64}$ ]]
+          actual_digest="$(shasum -a 256 "$archive_path" | awk '{ print $1 }')"
+          [[ "${actual_digest}" == "${expected_digest}" ]]
+
+          expected_members="$(printf '%s\n%s' "${archive_base}/" "${archive_base}/confighub")"
+          actual_members="$(tar -tzf "$archive_path")"
+          [[ "$actual_members" == "$expected_members" ]]
+
+          smoke_root="$RUNNER_TEMP/confighub-smoke"
+          mkdir -p "$smoke_root"
+          tar -xzf "$archive_path" -C "$smoke_root"
+          [[ "$("$smoke_root/$archive_base/confighub" version)" == "$GITHUB_REF_NAME" ]]
+
+  smoke-cli-windows:
+    needs: package
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Download Release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: config-hub-release-assets
+          path: dist/release
+
+      - name: Verify x64 runner
+        shell: powershell
+        run: |
+          if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne `
+              [Runtime.InteropServices.Architecture]::X64) {
+              throw 'Windows CLI smoke requires an x64 runner.'
+          }
+
+      - name: Test installer with Windows PowerShell 5.1
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\tests\install_cli_windows_test.ps1
+
+      - name: Test installer with PowerShell 7
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/tests/install_cli_windows_test.ps1
+
+      - name: Verify and run packaged Windows CLI
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $archiveBase = "config-hub-cli_${version}_windows_amd64"
+          $archiveName = "$archiveBase.zip"
+          $archivePath = Join-Path 'dist\release' $archiveName
+          $pattern = '^([0-9A-Fa-f]{64})  ' + [Regex]::Escape($archiveName) + '$'
+          $matchingDigests = @()
+          foreach ($line in Get-Content -LiteralPath 'dist\release\checksums.txt') {
+              if ($line -cmatch $pattern) {
+                  $matchingDigests += $Matches[1]
+              }
+          }
+          if ($matchingDigests.Count -ne 1) {
+              throw 'Checksum manifest must contain one exact Windows archive entry.'
+          }
+          $actualDigest = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+          if (-not [string]::Equals(
+              $matchingDigests[0],
+              $actualDigest,
+              [StringComparison]::OrdinalIgnoreCase
+          )) {
+              throw 'Windows archive checksum verification failed.'
+          }
+
+          $zip = [IO.Compression.ZipFile]::OpenRead($archivePath)
+          try {
+              $entries = @($zip.Entries)
+              if ($entries.Count -ne 2 -or
+                  $entries[0].FullName -cne "$archiveBase/" -or
+                  $entries[1].FullName -cne "$archiveBase/confighub.exe") {
+                  throw 'Windows archive members do not match the Release contract.'
+              }
+          }
+          finally {
+              $zip.Dispose()
+          }
+
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'confighub-smoke'
+          if ([IO.Directory]::Exists($smokeRoot)) {
+              throw "Unexpected existing smoke directory: $smokeRoot"
+          }
+          [IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $smokeRoot)
+          $cliPath = Join-Path $smokeRoot "$archiveBase\confighub.exe"
+          $actualVersion = @(& $cliPath version)
+          if ($LASTEXITCODE -ne 0 -or $actualVersion.Count -ne 1 -or
+              $actualVersion[0] -cne $env:GITHUB_REF_NAME) {
+              throw "Unexpected packaged Windows CLI version: $actualVersion"
+          }
+
+  publish:
+    needs:
+      - package
+      - smoke-cli-macos
+      - smoke-cli-windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Download verified Release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: config-hub-release-assets
+          path: dist/release
 
       - name: Publish verified GitHub Release
         env:
