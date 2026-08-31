@@ -74,6 +74,8 @@ config-hub-cli_1.2.3_windows_amd64/
 install-cli.sh [--version vMAJOR.MINOR.PATCH] [--install-dir ABSOLUTE_DIRECTORY]
 ```
 
+脚本必须兼容 macOS 系统自带的 `/bin/bash` 3.2，不要求 Homebrew Bash。生产脚本和共享 Bash 测试不得使用 `mapfile`、关联数组、`${name,,}` 或其他 Bash 4+ 语法。
+
 平台映射为：
 
 - `Linux x86_64|amd64` → `linux_amd64`；
@@ -158,7 +160,7 @@ Ubuntu `package` 作业只在 quality 成功后运行，检出完整标签历史
 
 两个并行原生作业下载相同内部 artifact：
 
-- `macos-14`：GitHub 标准 Apple Silicon M1/arm64 runner。使用系统 SHA-256 工具验证 manifest，检查 tar 成员，运行 `confighub version`，并运行 Bash 安装器行为测试；
+- `macos-14`：GitHub 标准 Apple Silicon M1/arm64 runner。使用系统 `/bin/bash` 3.2 和 SHA-256 工具验证 manifest，检查 tar 成员，运行 `confighub version`，并运行 Bash 安装器行为测试；
 - `windows-2025`：GitHub 标准 x64 runner。使用 PowerShell 验证 checksum 和 ZIP 成员，运行 `confighub.exe version`，分别用 Windows PowerShell 5.1 与 PowerShell 7+ 执行安装器行为测试。
 
 原生作业必须验证 runner 架构与预期一致，不能在错误架构上跳过执行。它们不创建或修改 GitHub Release。
