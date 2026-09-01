@@ -42,6 +42,12 @@ type rollbackRevisionRequest struct {
 	Message string `json:"message"`
 }
 
+type machineMutationRequest struct {
+	BaseRevision int64                        `json:"base_revision"`
+	Message      string                       `json:"message"`
+	Operation    *revisions.MutationOperation `json:"operation"`
+}
+
 func (h *revisionHandlers) current(w http.ResponseWriter, r *http.Request) {
 	if len(r.Header.Values("Authorization")) > 0 {
 		token, ok := strictBearerToken(r)
@@ -108,9 +114,18 @@ func (h *revisionHandlers) mutate(w http.ResponseWriter, r *http.Request) {
 	if !revisionQueryAbsent(w, r) {
 		return
 	}
-	var input revisions.MachineMutationInput
-	if !decodeRevisionJSON(w, r, &input) {
+	var request *machineMutationRequest
+	if !decodeRevisionJSON(w, r, &request) {
 		return
+	}
+	if request == nil || request.Operation == nil {
+		writeError(w, r, http.StatusBadRequest, "malformed_request", "Malformed JSON request")
+		return
+	}
+	input := revisions.MachineMutationInput{
+		BaseRevision: request.BaseRevision,
+		Message:      request.Message,
+		Operation:    *request.Operation,
 	}
 	result, err := h.service.MutateForMachine(r.Context(), token, r.PathValue("project"), r.PathValue("environment"), input)
 	if err != nil {

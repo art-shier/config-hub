@@ -370,7 +370,10 @@ func TestMachineMutationLifecycleAndMinimalResponse(t *testing.T) {
 func TestMachineMutationRejectsMalformedBodiesQueriesAndInvalidOperations(t *testing.T) {
 	tests := []struct {
 		name, path, body, code string
+		grantEnvironment       string
 	}{
+		{name: "null request", path: "/api/v1/projects/shop/environments/staging/config", body: `null`, code: "malformed_request", grantEnvironment: "shop-staging"},
+		{name: "null operation", path: machineConfigPath, body: `{"base_revision":1,"operation":null}`, code: "malformed_request"},
 		{name: "query", path: machineConfigPath + "?service=api", body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT"}}`, code: "malformed_query"},
 		{name: "unknown top-level field", path: machineConfigPath, body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT"},"submitted":"machine-http-sentinel"}`, code: "malformed_request"},
 		{name: "unknown operation field", path: machineConfigPath, body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT","submitted":"machine-http-sentinel"}}`, code: "malformed_request"},
@@ -380,7 +383,11 @@ func TestMachineMutationRejectsMalformedBodiesQueriesAndInvalidOperations(t *tes
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newMachineHTTPFixture(t)
-			fixture.replaceGrantPermission(t, machineaccess.GrantWrite)
+			if test.grantEnvironment == "" {
+				fixture.replaceGrantPermission(t, machineaccess.GrantWrite)
+			} else {
+				fixture.replaceGrantPermissionForEnvironment(t, machineaccess.GrantWrite, test.grantEnvironment)
+			}
 			response := fixture.bearerMutation(t, fixture.token.Plaintext, test.path, test.body)
 			assertMachineMutationError(t, response, http.StatusBadRequest, test.code)
 			if fixture.revisionCount(t) != 1 {
@@ -833,8 +840,13 @@ func (f *machineHTTPFixture) bearerMutation(t *testing.T, token, path, body stri
 
 func (f *machineHTTPFixture) replaceGrantPermission(t *testing.T, permission string) {
 	t.Helper()
+	f.replaceGrantPermissionForEnvironment(t, permission, "shop-production")
+}
+
+func (f *machineHTTPFixture) replaceGrantPermissionForEnvironment(t *testing.T, permission, environmentID string) {
+	t.Helper()
 	err := f.service.ReplaceGrants(context.Background(), f.users["admin"], f.identity.ID, []machineaccess.EnvironmentGrant{{
-		ProjectID: "shop-project", EnvironmentID: "shop-production", Permission: permission,
+		ProjectID: "shop-project", EnvironmentID: environmentID, Permission: permission,
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -844,7 +856,7 @@ func (f *machineHTTPFixture) replaceGrantPermission(t *testing.T, permission str
 func (f *machineHTTPFixture) revisionCount(t *testing.T) int {
 	t.Helper()
 	var count int
-	if err := f.store.DB().QueryRow(`SELECT COUNT(*) FROM revisions WHERE environment_id = 'shop-production'`).Scan(&count); err != nil {
+	if err := f.store.DB().QueryRow(`SELECT COUNT(*) FROM revisions`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count
