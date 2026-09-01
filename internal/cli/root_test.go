@@ -38,6 +38,13 @@ func TestExecuteVersionReportsStdoutWriteFailure(t *testing.T) {
 	}
 }
 
+func TestRootDescribesReadAndWriteConfiguration(t *testing.T) {
+	root := newRootCommand(context.Background(), mapEnvironment(nil), io.Discard, io.Discard)
+	if root.Short != "Read and write configuration with ConfigHub" {
+		t.Fatalf("short_ok=%v", root.Short == "Read and write configuration with ConfigHub")
+	}
+}
+
 type versionFailingWriter struct{}
 
 func (versionFailingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }

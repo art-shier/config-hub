@@ -85,7 +85,7 @@ func newRootCommandWithLoader(
 	var serverURL, tokenFile string
 	root := &cobra.Command{
 		Use:           "confighub",
-		Short:         "Read configuration from ConfigHub",
+		Short:         "Read and write configuration with ConfigHub",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -193,6 +193,7 @@ func newRootCommandWithLoader(
 	_ = run.MarkFlagRequired("project")
 	_ = run.MarkFlagRequired("env")
 	root.AddCommand(run)
+	root.AddCommand(newMutationCommands(resolveConfig, stdout)...)
 	root.AddCommand(newConfigCommand(loadConfig, resolveConfig, stdout))
 
 	version := &cobra.Command{
@@ -240,6 +241,10 @@ func markRunRuntime(cause error) error {
 	return &runtimeFailure{operation: "run", cause: cause}
 }
 
+func markMutationRuntime(operation string, cause error) error {
+	return &runtimeFailure{operation: operation, cause: cause}
+}
+
 func runtimeDiagnostic(err error) string {
 	var runFailure *runExecutionFailure
 	if errors.As(err, &runFailure) {
@@ -281,8 +286,13 @@ func runtimeDiagnostic(err error) string {
 		return "confighub: stdout write failed"
 	default:
 		var failure *runtimeFailure
-		if errors.As(err, &failure) && failure.operation == "run" {
-			return "confighub: run failed"
+		if errors.As(err, &failure) {
+			switch failure.operation {
+			case "run":
+				return "confighub: run failed"
+			case "set", "unset":
+				return "confighub: " + failure.operation + " failed"
+			}
 		}
 		return "confighub: export failed"
 	}
