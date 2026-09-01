@@ -21,7 +21,7 @@ func newMutationCommands(resolveConfig func() (configSnapshot, error), stdoutWri
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, argv []string) error {
 			key, value, err := parseSetArgument(argv[0])
-			if err != nil || !slugPattern.MatchString(setProject) || !slugPattern.MatchString(setEnvironment) || !validMutationService(setService) || !validMutationMessage(setMessage) {
+			if err != nil || len(key) > mutationClientMaxKeyBytes || !slugPattern.MatchString(setProject) || !slugPattern.MatchString(setEnvironment) || !validMutationService(setService) || !validMutationMessage(setMessage) {
 				return errLocalInput
 			}
 			if !command.Flags().Changed("message") {
@@ -77,7 +77,7 @@ func newMutationCommands(resolveConfig func() (configSnapshot, error), stdoutWri
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, argv []string) error {
 			key := argv[0]
-			if !environmentKeyPattern.MatchString(key) || !slugPattern.MatchString(unsetProject) || !slugPattern.MatchString(unsetEnvironment) || !validMutationMessage(unsetMessage) {
+			if !environmentKeyPattern.MatchString(key) || len(key) > mutationClientMaxKeyBytes || !slugPattern.MatchString(unsetProject) || !slugPattern.MatchString(unsetEnvironment) || !validMutationMessage(unsetMessage) {
 				return errLocalInput
 			}
 			if !command.Flags().Changed("message") {
