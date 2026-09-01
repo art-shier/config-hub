@@ -4,6 +4,7 @@ import { delay, http, HttpResponse } from "msw";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../app/App";
 import { APIClient, APIError } from "../api/client";
+import type { MachineEnvironmentGrant } from "../api/types";
 import { changeLocale } from "../i18n";
 import { server } from "../test/setup";
 import { IssueTokenDialog } from "./MachineAccessPage";
@@ -43,13 +44,19 @@ function mockSession(role: "admin" | "member") {
   );
 }
 
-function mockMachinePage({ tokens = [primaryToken] } = {}) {
+function mockMachinePage({
+  grants = [],
+  tokens = [primaryToken],
+}: {
+  grants?: MachineEnvironmentGrant[];
+  tokens?: typeof primaryToken[];
+} = {}) {
   server.use(
     http.get("/api/v1/machine-identities", () =>
       HttpResponse.json({ identities: [identity] }),
     ),
     http.get("/api/v1/machine-identities/machine-ci", () =>
-      HttpResponse.json({ identity: { ...identity, grants: [], tokens } }),
+      HttpResponse.json({ identity: { ...identity, grants, tokens } }),
     ),
     http.get("/api/v1/projects", () =>
       HttpResponse.json({
@@ -230,18 +237,67 @@ describe("MachineAccessPage", () => {
     expect(await screen.findByRole("heading", { name: "shop-ci" })).toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText("Project"), "project-shop");
     await user.selectOptions(screen.getByLabelText("Environment"), "environment-prod");
+    await user.selectOptions(screen.getByLabelText("Permission"), "write");
     await user.click(screen.getByRole("button", { name: "Add grant" }));
-    expect(screen.getByText("Shop 商店 / Production 🚀")).toBeInTheDocument();
+    expect(screen.getByText("Shop 商店 / Production 🚀 · Read and write")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Save grants" }));
 
     await waitFor(() =>
       expect(requestBody).toEqual({
         grants: [
-          { project_id: "project-shop", environment_id: "environment-prod" },
+          {
+            project_id: "project-shop",
+            environment_id: "environment-prod",
+            permission: "write",
+          },
         ],
       }),
     );
     expect(screen.getByRole("status")).toHaveTextContent("Grants saved");
+  });
+
+  it("defaults new environment grants to Read", async () => {
+    mockMachinePage({ tokens: [] });
+    renderAdminAt();
+
+    expect(await screen.findByLabelText("Permission")).toHaveValue("read");
+    expect(screen.getByRole("option", { name: "Read" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Read and write" })).toBeInTheDocument();
+  });
+
+  it("renders saved permission labels and replaces the permission for the same grant key", async () => {
+    mockMachinePage({
+      grants: [{
+        project_id: "project-shop",
+        environment_id: "environment-prod",
+        permission: "read",
+      }],
+      tokens: [],
+    });
+    renderAdminAt();
+    const user = userEvent.setup();
+
+    expect(await screen.findByText("Shop 商店 / Production 🚀 · Read")).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("Permission"), "write");
+    await user.click(screen.getByRole("button", { name: "Add grant" }));
+
+    expect(screen.queryByText("Shop 商店 / Production 🚀 · Read")).not.toBeInTheDocument();
+    expect(screen.getByText("Shop 商店 / Production 🚀 · Read and write")).toBeInTheDocument();
+  });
+
+  it("retranslates a writable grant draft without losing its selected permission", async () => {
+    mockMachinePage({ tokens: [] });
+    renderAdminAt();
+    const user = userEvent.setup();
+
+    await user.selectOptions(await screen.findByLabelText("Permission"), "write");
+    await user.click(screen.getByRole("button", { name: "Add grant" }));
+    expect(screen.getByText("Shop 商店 / Production 🚀 · Read and write")).toBeInTheDocument();
+
+    await changeLocale("zh-CN");
+
+    expect(screen.getByLabelText("权限")).toHaveValue("write");
+    expect(screen.getByText("Shop 商店 / Production 🚀 · 读写")).toBeInTheDocument();
   });
 
   it("creates a named identity and opens its durable register entry", async () => {
@@ -410,7 +466,7 @@ describe("MachineAccessPage", () => {
     await user.click(screen.getByRole("button", { name: "Save grants" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/couldn’t be saved/iu);
-    expect(screen.getByText("Shop 商店 / Production 🚀")).toBeInTheDocument();
+    expect(screen.getByText("Shop 商店 / Production 🚀 · Read")).toBeInTheDocument();
     expect(screen.queryByText("remote SECRET detail")).not.toBeInTheDocument();
   });
 

@@ -72,6 +72,7 @@ function mockProjectPage(
             environment_id: `env-${String(params.environment)}`,
             message: params.environment === "prod" ? "current values" : "",
             created_by: "user-admin",
+            created_by_type: "user",
             version: params.environment === "prod" ? 7 : 0,
             created_at: "2026-08-29T08:00:00Z",
             entries:
@@ -372,6 +373,7 @@ describe("ProjectPage", () => {
                 environment_id: "env-prod",
                 message: "update URL",
                 created_by: "user-admin",
+                created_by_type: "user",
                 version: 8,
                 created_at: "2026-08-29T09:00:00Z",
                 entries: [
@@ -396,6 +398,7 @@ describe("ProjectPage", () => {
               environment_id: "env-prod",
               message: "update URL",
               created_by: "user-admin",
+              created_by_type: "user",
               version: 8,
               created_at: "2026-08-29T09:00:00Z",
             },

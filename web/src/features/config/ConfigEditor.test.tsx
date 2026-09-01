@@ -12,6 +12,7 @@ const revision: Revision = {
   environment_id: "env-prod",
   message: "current",
   created_by: "user-admin",
+  created_by_type: "user",
   version: 7,
   created_at: "2026-08-29T08:00:00Z",
   entries: [{ key: "EMPTY", value: "", service: "api" }],

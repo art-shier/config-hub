@@ -39,9 +39,12 @@ export interface Environment {
   updated_at: string;
 }
 
+export type MachineGrantPermission = "read" | "write";
+
 export interface MachineEnvironmentGrant {
   project_id: string;
   environment_id: string;
+  permission: MachineGrantPermission;
 }
 
 export interface MachineTokenMetadata {
@@ -109,11 +112,14 @@ export interface ConfigEntry {
   service: string;
 }
 
+export type RevisionActorType = "user" | "machine";
+
 export interface RevisionSummary {
   id: string;
   environment_id: string;
   message: string;
   created_by: string;
+  created_by_type: RevisionActorType;
   version: number;
   created_at: string;
 }

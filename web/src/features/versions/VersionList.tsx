@@ -224,7 +224,12 @@ export function VersionList({
                   <p>{revision.message || t("register.noMessage")}</p>
                 </div>
                 <dl className="version-meta">
-                  <div><dt>{t("register.createdBy")}</dt><dd>{revision.created_by}</dd></div>
+                  <div>
+                    <dt>{t("register.createdBy")}</dt>
+                    <dd>{revision.created_by_type === "machine"
+                      ? t("register.machineCreatedBy", { id: revision.created_by })
+                      : revision.created_by}</dd>
+                  </div>
                   <div><dt>{t("register.created")}</dt><dd>{formatDateTime(revision.created_at, locale, t("states.timeUnavailable"))}</dd></div>
                 </dl>
                 <div className="version-actions">

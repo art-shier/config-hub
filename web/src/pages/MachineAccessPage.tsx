@@ -12,6 +12,7 @@ import type {
   Environment,
   IssuedMachineToken,
   MachineEnvironmentGrant,
+  MachineGrantPermission,
   MachineIdentity,
   MachineIdentityDetail,
   MachineTokenMetadata,
@@ -235,6 +236,7 @@ function IdentityPanel({
   const [grants, setGrants] = useState<MachineEnvironmentGrant[]>([]);
   const [projectID, setProjectID] = useState("");
   const [environmentID, setEnvironmentID] = useState("");
+  const [grantPermission, setGrantPermission] = useState<MachineGrantPermission>("read");
   const [identityMessage, setIdentityMessage] = useState<"saved" | null>(null);
   const [identityError, setIdentityError] = useState<IdentityErrorKey | null>(null);
   const [identityFieldErrors, setIdentityFieldErrors] = useState<FieldErrors>({});
@@ -375,12 +377,25 @@ function IdentityPanel({
   }
 
   function addGrant() {
-    if (!projectID || !environmentID || grants.some((grant) => grant.project_id === projectID && grant.environment_id === environmentID)) {
+    if (!projectID || !environmentID) {
       return;
     }
     setGrantError(null);
     setGrantMessage(null);
-    setGrants((current) => [...current, { project_id: projectID, environment_id: environmentID }]);
+    setGrants((current) => {
+      const nextGrant = {
+        project_id: projectID,
+        environment_id: environmentID,
+        permission: grantPermission,
+      };
+      const existingIndex = current.findIndex(
+        (grant) => grant.project_id === projectID && grant.environment_id === environmentID,
+      );
+      if (existingIndex === -1) {
+        return [...current, nextGrant];
+      }
+      return current.map((grant, index) => index === existingIndex ? nextGrant : grant);
+    });
   }
 
   if (state === "loading") {
@@ -500,6 +515,17 @@ function IdentityPanel({
               <label htmlFor={`grant-environment-${identityID}`}>{t("grants.environment")}</label>
               <select id={`grant-environment-${identityID}`} value={environmentID} disabled={(selectedProject?.environments.length ?? 0) === 0} onChange={(event) => setEnvironmentID(event.currentTarget.value)}>
                 {(selectedProject?.environments ?? []).map((environment) => <option key={environment.id} value={environment.id}>{environment.name}</option>)}
+              </select>
+            </div>
+            <div className="form-field">
+              <label htmlFor={`grant-permission-${identityID}`}>{t("grants.permission")}</label>
+              <select
+                id={`grant-permission-${identityID}`}
+                value={grantPermission}
+                onChange={(event) => setGrantPermission(event.currentTarget.value as MachineGrantPermission)}
+              >
+                <option value="read">{t("grants.permissions.read")}</option>
+                <option value="write">{t("grants.permissions.write")}</option>
               </select>
             </div>
             <button className="secondary-button" type="button" disabled={!environmentID} onClick={addGrant}>{t("grants.add")}</button>
@@ -974,6 +1000,7 @@ function grantLabel(t: TFunction, projects: ProjectOption[], grant: MachineEnvir
   return t("grants.label", {
     project: project?.name ?? grant.project_id,
     environment: environment?.name ?? grant.environment_id,
+    permission: t(`grants.permissions.${grant.permission}`),
   });
 }
 
@@ -1009,7 +1036,10 @@ function isIdentityResponse(value: unknown): value is { identity: MachineIdentit
 }
 
 function isGrant(value: unknown): value is MachineEnvironmentGrant {
-  return isRecord(value) && typeof value.project_id === "string" && typeof value.environment_id === "string";
+  return isRecord(value)
+    && typeof value.project_id === "string"
+    && typeof value.environment_id === "string"
+    && (value.permission === "read" || value.permission === "write");
 }
 
 function isToken(value: unknown): value is MachineTokenMetadata {

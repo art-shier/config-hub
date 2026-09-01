@@ -47,6 +47,7 @@ describe("VersionList", () => {
           version: 2,
           message: "发布 中文 😀",
           created_by: "ada",
+          created_by_type: "user",
           created_at: "2026-08-29T08:00:00Z",
         },
       ],
@@ -74,6 +75,39 @@ describe("VersionList", () => {
     ));
   });
 
+  it("labels machine revision actors in both supported locales", async () => {
+    const api = client();
+    vi.mocked(api.get).mockResolvedValue({
+      revisions: [{
+        id: "revision-machine",
+        environment_id: "env-prod",
+        version: 3,
+        message: "Automated delivery",
+        created_by: "machine-ci",
+        created_by_type: "machine",
+        created_at: "2026-08-29T08:00:00Z",
+      }],
+    });
+    render(
+      <VersionList
+        client={api}
+        projectSlug="shop"
+        environmentSlug="prod"
+        canWrite
+        refreshEpoch={0}
+        onRevisionChanged={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("Machine machine-ci")).toBeInTheDocument();
+
+    await act(async () => {
+      await changeLocale("zh-CN");
+    });
+
+    expect(screen.getByText("机器 machine-ci")).toBeInTheDocument();
+  });
+
   it("shows Chinese version actions while preserving revision messages and uses the active date locale", async () => {
     const api = client();
     vi.mocked(api.get).mockResolvedValue({
@@ -83,6 +117,7 @@ describe("VersionList", () => {
         version: 1,
         message: "发布 中文 🍾",
         created_by: "ada",
+        created_by_type: "user",
         created_at: "2026-08-29T08:00:00Z",
       }],
     });
@@ -120,6 +155,7 @@ describe("VersionList", () => {
         version: 1,
         message: "发布 中文 🍾",
         created_by: "ada",
+        created_by_type: "user",
         created_at: "2026-08-29T08:00:00Z",
       }],
     });
@@ -157,6 +193,7 @@ describe("VersionList", () => {
         version: 1,
         message: "发布 中文 🍾",
         created_by: "ada",
+        created_by_type: "user",
         created_at: "2026-08-29T08:00:00Z",
       }],
     });
@@ -220,8 +257,8 @@ describe("VersionList", () => {
       if (path.endsWith("/revisions")) {
         return Promise.resolve({
           revisions: [
-            { id: "r2", environment_id: "env", version: 2, message: "current", created_by: "ada", created_at: "2026-08-29T08:00:00Z" },
-            { id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" },
+            { id: "r2", environment_id: "env", version: 2, message: "current", created_by: "ada", created_by_type: "user", created_at: "2026-08-29T08:00:00Z" },
+            { id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_by_type: "user", created_at: "2026-08-28T08:00:00Z" },
           ],
         });
       }
@@ -243,6 +280,7 @@ describe("VersionList", () => {
           version: 1,
           message: "first",
           created_by: "lee",
+          created_by_type: "user",
           created_at: "2026-08-28T08:00:00Z",
           entries: [{ key: "CHANGED", value: "before  ", service: "api" }],
         },
@@ -280,7 +318,7 @@ describe("VersionList", () => {
     const api = client();
     const onRevisionChanged = vi.fn();
     vi.mocked(api.get).mockResolvedValue({
-      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" }],
+      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_by_type: "user", created_at: "2026-08-28T08:00:00Z" }],
     });
     vi.mocked(api.post).mockReturnValue(new Promise<never>((resolve) => {
       resolveRollback = resolve as (value: unknown) => void;
@@ -313,7 +351,7 @@ describe("VersionList", () => {
     expect(screen.getByRole("dialog", { name: "Rollback to version 1?" })).toBeInTheDocument();
     resolveRollback({
       revision: {
-        id: "r3", environment_id: "env", version: 3, message: "restore known values", created_by: "ada", created_at: "2026-08-29T09:00:00Z", entries: [],
+        id: "r3", environment_id: "env", version: 3, message: "restore known values", created_by: "ada", created_by_type: "user", created_at: "2026-08-29T09:00:00Z", entries: [],
       },
     });
     await waitFor(() => expect(onRevisionChanged).toHaveBeenCalledTimes(1));
@@ -326,7 +364,7 @@ describe("VersionList", () => {
     let historyRequests = 0;
     const api = client();
     const history = {
-      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" }],
+      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_by_type: "user", created_at: "2026-08-28T08:00:00Z" }],
     };
     vi.mocked(api.get).mockImplementation(() => {
       historyRequests += 1;
@@ -336,7 +374,7 @@ describe("VersionList", () => {
       });
     });
     vi.mocked(api.post).mockResolvedValue({
-      revision: { id: "r2", environment_id: "env", version: 2, message: "restore", created_by: "ada", created_at: "2026-08-29T09:00:00Z", entries: [] },
+      revision: { id: "r2", environment_id: "env", version: 2, message: "restore", created_by: "ada", created_by_type: "user", created_at: "2026-08-29T09:00:00Z", entries: [] },
     });
     function Harness() {
       const [epoch, setEpoch] = useState(0);
@@ -368,11 +406,11 @@ describe("VersionList", () => {
     vi.mocked(api.get).mockImplementation(() => {
       historyRequests += 1;
       return Promise.resolve({
-        revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" }],
+        revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_by_type: "user", created_at: "2026-08-28T08:00:00Z" }],
       });
     });
     vi.mocked(api.post).mockResolvedValue({
-      revision: { id: "r2", environment_id: "env", version: 2, message: "restore", created_by: "ada", created_at: "2026-08-29T09:00:00Z", entries: [] },
+      revision: { id: "r2", environment_id: "env", version: 2, message: "restore", created_by: "ada", created_by_type: "user", created_at: "2026-08-29T09:00:00Z", entries: [] },
     });
     function Harness() {
       const [epoch, setEpoch] = useState(0);
@@ -426,8 +464,8 @@ describe("VersionList", () => {
     const newRollbackPath = `${nextListPath}/2/rollback`;
     vi.mocked(api.get).mockImplementation((path) => Promise.resolve({
       revisions: path === nextListPath
-        ? [{ id: "next-r2", environment_id: "next-env", version: 2, message: "NEXT SCOPE", created_by: "lee", created_at: "2026-08-29T09:00:00Z" }]
-        : [{ id: "old-r1", environment_id: "old-env", version: 1, message: "OLD SCOPE", created_by: "ada", created_at: "2026-08-29T08:00:00Z" }],
+        ? [{ id: "next-r2", environment_id: "next-env", version: 2, message: "NEXT SCOPE", created_by: "lee", created_by_type: "user", created_at: "2026-08-29T09:00:00Z" }]
+        : [{ id: "old-r1", environment_id: "old-env", version: 1, message: "OLD SCOPE", created_by: "ada", created_by_type: "user", created_at: "2026-08-29T08:00:00Z" }],
     }));
     vi.mocked(api.post).mockImplementation((path) =>
       path === oldRollbackPath ? oldRollback : newRollback,
@@ -465,7 +503,7 @@ describe("VersionList", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 
     resolveNewRollback({
-      revision: { id: "next-r3", environment_id: "next-env", version: 3, message: "restore next", created_by: "ada", created_at: "2026-08-29T10:00:00Z", entries: [] },
+      revision: { id: "next-r3", environment_id: "next-env", version: 3, message: "restore next", created_by: "ada", created_by_type: "user", created_at: "2026-08-29T10:00:00Z", entries: [] },
     });
     await waitFor(() => expect(onRevisionChanged).toHaveBeenCalledTimes(1));
     expect(onRevisionChanged).toHaveBeenCalledWith(expect.objectContaining({ id: "next-r3" }));
@@ -477,7 +515,7 @@ describe("VersionList", () => {
   it("retains rollback message after a safe typed failure and hides write entry points from viewers", async () => {
     const api = client();
     vi.mocked(api.get).mockResolvedValue({
-      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_at: "2026-08-28T08:00:00Z" }],
+      revisions: [{ id: "r1", environment_id: "env", version: 1, message: "first", created_by: "lee", created_by_type: "user", created_at: "2026-08-28T08:00:00Z" }],
     });
     vi.mocked(api.post).mockRejectedValue(new APIError(503, "service_unavailable", "SECRET", "req", {}));
     const view = render(
@@ -520,13 +558,13 @@ describe("VersionList", () => {
       if (path.includes("/prod/")) return new Promise<never>((resolve) => {
         resolveProd = resolve as (value: unknown) => void;
       });
-      return Promise.resolve({ revisions: [{ id: "stage", environment_id: "stage", version: 4, message: "STAGE HISTORY", created_by: "lee", created_at: "2026-08-29T08:00:00Z" }] });
+      return Promise.resolve({ revisions: [{ id: "stage", environment_id: "stage", version: 4, message: "STAGE HISTORY", created_by: "lee", created_by_type: "user", created_at: "2026-08-29T08:00:00Z" }] });
     });
     const props = { client: api, projectSlug: "shop", canWrite: true, refreshEpoch: 0, onRevisionChanged: vi.fn() };
     const view = render(<VersionList {...props} environmentSlug="prod" />);
     view.rerender(<VersionList {...props} environmentSlug="stage" />);
     expect(await screen.findByText("STAGE HISTORY")).toBeInTheDocument();
-    resolveProd({ revisions: [{ id: "prod", environment_id: "prod", version: 9, message: "STALE PROD", created_by: "ada", created_at: "2026-08-29T08:00:00Z" }] });
+    resolveProd({ revisions: [{ id: "prod", environment_id: "prod", version: 9, message: "STALE PROD", created_by: "ada", created_by_type: "user", created_at: "2026-08-29T08:00:00Z" }] });
     await waitFor(() => expect(screen.queryByText("STALE PROD")).not.toBeInTheDocument());
   });
 });

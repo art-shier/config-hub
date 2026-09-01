@@ -172,6 +172,12 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
   await page.getByLabel("Description", { exact: true }).fill("browser Token flow");
   await page.getByRole("button", { name: "Create identity" }).click();
   await expect(page.getByRole("heading", { name: "shop-browser-ci" })).toBeVisible();
+  await page.getByLabel("Project").selectOption({ label: "Shop browser flow" });
+  await page.getByLabel("Environment", { exact: true }).selectOption({ label: "Production" });
+  await page.getByLabel("Permission").selectOption("write");
+  await page.getByRole("button", { name: "Add grant" }).click();
+  await page.getByRole("button", { name: "Save grants" }).click();
+  await expect(page.getByText("Shop browser flow / Production · Read and write", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Issue Token" }).click();
   await page.getByLabel("Token name").fill("browser-token");
   await page.getByRole("dialog").getByRole("button", { name: "Issue Token", exact: true }).click();
