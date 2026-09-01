@@ -176,8 +176,13 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
   await page.getByLabel("Environment", { exact: true }).selectOption({ label: "Production" });
   await page.getByLabel("Permission").selectOption("write");
   await page.getByRole("button", { name: "Add grant" }).click();
-  await page.getByRole("button", { name: "Save grants" }).click();
-  await expect(page.getByText("Shop browser flow / Production · Read and write", { exact: true })).toBeVisible();
+  const grantsRegion = page.getByRole("region", { name: "Environment grants" });
+  await grantsRegion.getByRole("button", { name: "Save grants" }).click();
+  await expect(grantsRegion.getByRole("status")).toHaveText("Grants saved.");
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "shop-browser-ci" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Environment grants" })
+    .getByText("Shop browser flow / Production · Read and write", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Issue Token" }).click();
   await page.getByLabel("Token name").fill("browser-token");
   await page.getByRole("dialog").getByRole("button", { name: "Issue Token", exact: true }).click();
