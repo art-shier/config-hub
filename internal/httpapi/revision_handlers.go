@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"confighub.local/internal/auth"
+	"confighub.local/internal/machineaccess"
 	"confighub.local/internal/revisions"
 )
 
@@ -17,6 +18,7 @@ var revisionVersionPattern = regexp.MustCompile(`^[1-9][0-9]*$`)
 
 type RevisionService interface {
 	CurrentForProject(context.Context, auth.User, string, string, string) (revisions.Revision, error)
+	MutateForMachine(context.Context, string, string, string, revisions.MachineMutationInput) (revisions.MutationResult, error)
 	ReplaceForProject(context.Context, auth.User, string, string, revisions.ReplaceInput) (revisions.Revision, error)
 	ListForProject(context.Context, auth.User, string, string) ([]revisions.RevisionSummary, error)
 	GetForProject(context.Context, auth.User, string, string, int64) (revisions.Revision, error)
@@ -95,6 +97,31 @@ func (h *revisionHandlers) replace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"revision": revision})
+}
+
+func (h *revisionHandlers) mutate(w http.ResponseWriter, r *http.Request) {
+	token, ok := strictBearerToken(r)
+	if !ok {
+		writeError(w, r, http.StatusUnauthorized, "invalid_token", "Invalid or expired machine token")
+		return
+	}
+	if !revisionQueryAbsent(w, r) {
+		return
+	}
+	var input revisions.MachineMutationInput
+	if !decodeRevisionJSON(w, r, &input) {
+		return
+	}
+	result, err := h.service.MutateForMachine(r.Context(), token, r.PathValue("project"), r.PathValue("environment"), input)
+	if err != nil {
+		writeMachineMutationServiceError(w, r, err)
+		return
+	}
+	status := http.StatusOK
+	if result.Created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, result)
 }
 
 func (h *revisionHandlers) list(w http.ResponseWriter, r *http.Request) {
@@ -290,6 +317,19 @@ func writeRevisionServiceError(w http.ResponseWriter, r *http.Request, err error
 	}
 }
 
+func writeMachineMutationServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, machineaccess.ErrInvalidToken):
+		writeError(w, r, http.StatusUnauthorized, "invalid_token", "Invalid or expired machine token")
+	case errors.Is(err, machineaccess.ErrScopeDenied):
+		writeError(w, r, http.StatusForbidden, "scope_denied", "Machine token is not authorized for this environment")
+	case errors.Is(err, revisions.ErrRevisionConflict):
+		writeError(w, r, http.StatusConflict, "revision_conflict", "Configuration changed since it was loaded")
+	default:
+		writeRevisionServiceError(w, r, err)
+	}
+}
+
 func revisionRouteMethods(path string) (string, bool) {
 	parts := strings.Split(strings.TrimPrefix(path, "/api/v1/projects/"), "/")
 	if len(parts) < 4 || parts[0] == "" || parts[1] != "environments" || parts[2] == "" {
@@ -297,7 +337,7 @@ func revisionRouteMethods(path string) (string, bool) {
 	}
 	switch {
 	case len(parts) == 4 && parts[3] == "config":
-		return "GET, PUT", true
+		return "GET, PATCH, PUT", true
 	case len(parts) == 4 && parts[3] == "revisions":
 		return http.MethodGet, true
 	case len(parts) == 5 && parts[3] == "revisions" && parts[4] != "":

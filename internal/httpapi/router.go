@@ -85,7 +85,8 @@ func NewRouter(deps Dependencies, options Options) (http.Handler, error) {
 	}
 	if revisionsEnabled {
 		revisionAPI := &revisionHandlers{service: deps.Revisions, machines: deps.Machines, auth: handlers}
-		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/config", revisionAPI.current)
+		mux.HandleFunc(currentConfigGetRoutePattern, revisionAPI.current)
+		mux.HandleFunc(currentConfigPatchRoutePattern, revisionAPI.mutate)
 		mux.HandleFunc("PUT /api/v1/projects/{project}/environments/{environment}/config", revisionAPI.replace)
 		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/revisions", revisionAPI.list)
 		mux.HandleFunc("GET /api/v1/projects/{project}/environments/{environment}/revisions/{version}", revisionAPI.detail)

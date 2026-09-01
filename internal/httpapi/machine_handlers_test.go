@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -305,6 +306,151 @@ func TestCurrentConfigSupportsCookieOrStrictBearerWithoutFallback(t *testing.T) 
 	assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
 }
 
+func TestMachineMutationLifecycleAndMinimalResponse(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		key         string
+		wantValue   string
+		wantService string
+		wantPresent bool
+	}{
+		{name: "set new key", body: `{"base_revision":1,"message":"machine update","operation":{"type":"set","key":"FEATURE_FLAG","value":"enabled","service":"worker"}}`, key: "FEATURE_FLAG", wantValue: "enabled", wantService: "worker", wantPresent: true},
+		{name: "preserve existing service", body: `{"base_revision":1,"operation":{"type":"set","key":"DATABASE_URL","value":"postgres://rotated"}}`, key: "DATABASE_URL", wantValue: "postgres://rotated", wantService: "api", wantPresent: true},
+		{name: "change existing service", body: `{"base_revision":1,"operation":{"type":"set","key":"DATABASE_URL","value":"postgres://config-secret","service":"worker"}}`, key: "DATABASE_URL", wantValue: "postgres://config-secret", wantService: "worker", wantPresent: true},
+		{name: "unset existing key", body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT"}}`, key: "PORT", wantPresent: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMachineHTTPFixture(t)
+			fixture.replaceGrantPermission(t, machineaccess.GrantWrite)
+
+			response := fixture.bearerMutation(t, fixture.token.Plaintext, machineConfigPath, test.body)
+			wantBody := "{\"project\":\"shop\",\"environment\":\"production\",\"revision\":2,\"created\":true}\n"
+			if response.Code != http.StatusCreated || response.Body.String() != wantBody {
+				t.Fatalf("mutation status=%d response_bytes=%d exact_response=%t", response.Code, response.Body.Len(), response.Body.String() == wantBody)
+			}
+			if count := fixture.revisionCount(t); count != 2 {
+				t.Fatalf("mutation revision_count=%d want=2", count)
+			}
+			revision, err := revisions.NewService(fixture.store).CurrentForProject(context.Background(), fixture.users["admin"], "shop", "production", "")
+			if err != nil {
+				t.Fatalf("read mutated revision: %v", err)
+			}
+			var found bool
+			var valueMatches, serviceMatches bool
+			for _, entry := range revision.Entries {
+				if entry.Key == test.key {
+					found = true
+					valueMatches = entry.Value == test.wantValue
+					serviceMatches = entry.Service == test.wantService
+				}
+			}
+			if revision.Version != 2 || found != test.wantPresent || (found && (!valueMatches || !serviceMatches)) {
+				t.Fatalf("mutation revision=%d entry_count=%d present=%t value_matches=%t service_matches=%t", revision.Version, len(revision.Entries), found, valueMatches, serviceMatches)
+			}
+		})
+	}
+
+	t.Run("no-op", func(t *testing.T) {
+		fixture := newMachineHTTPFixture(t)
+		fixture.replaceGrantPermission(t, machineaccess.GrantWrite)
+		response := fixture.bearerMutation(t, fixture.token.Plaintext, machineConfigPath,
+			`{"base_revision":1,"operation":{"type":"set","key":"DATABASE_URL","value":"postgres://config-secret"}}`)
+		wantBody := "{\"project\":\"shop\",\"environment\":\"production\",\"revision\":1,\"created\":false}\n"
+		if response.Code != http.StatusOK || response.Body.String() != wantBody {
+			t.Fatalf("no-op status=%d response_bytes=%d exact_response=%t", response.Code, response.Body.Len(), response.Body.String() == wantBody)
+		}
+		if count := fixture.revisionCount(t); count != 1 {
+			t.Fatalf("no-op revision_count=%d want=1", count)
+		}
+	})
+}
+
+func TestMachineMutationRejectsMalformedBodiesQueriesAndInvalidOperations(t *testing.T) {
+	tests := []struct {
+		name, path, body, code string
+	}{
+		{name: "query", path: machineConfigPath + "?service=api", body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT"}}`, code: "malformed_query"},
+		{name: "unknown top-level field", path: machineConfigPath, body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT"},"submitted":"machine-http-sentinel"}`, code: "malformed_request"},
+		{name: "unknown operation field", path: machineConfigPath, body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT","submitted":"machine-http-sentinel"}}`, code: "malformed_request"},
+		{name: "duplicate top-level field", path: machineConfigPath, body: `{"base_revision":1,"base_revision":0,"operation":{"type":"unset","key":"PORT"}}`, code: "malformed_request"},
+		{name: "duplicate operation field", path: machineConfigPath, body: `{"base_revision":1,"operation":{"type":"set","key":"PORT","value":"first","value":"machine-http-sentinel"}}`, code: "malformed_request"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMachineHTTPFixture(t)
+			fixture.replaceGrantPermission(t, machineaccess.GrantWrite)
+			response := fixture.bearerMutation(t, fixture.token.Plaintext, test.path, test.body)
+			assertMachineMutationError(t, response, http.StatusBadRequest, test.code)
+			if fixture.revisionCount(t) != 1 {
+				t.Fatal("rejected request changed revision count")
+			}
+			if strings.Contains(response.Body.String(), "machine-http-sentinel") || strings.Contains(fixture.logs.String(), "machine-http-sentinel") || strings.Contains(fixture.logs.String(), fixture.token.Plaintext) {
+				t.Fatal("rejected request exposed submitted data or credentials")
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name, body string
+	}{
+		{name: "set without value", body: `{"base_revision":1,"operation":{"type":"set","key":"PORT"}}`},
+		{name: "unset with value", body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT","value":"machine-http-sentinel"}}`},
+		{name: "unset with service", body: `{"base_revision":1,"operation":{"type":"unset","key":"PORT","service":"api"}}`},
+		{name: "unknown operation", body: `{"base_revision":1,"operation":{"type":"replace","key":"PORT","value":"machine-http-sentinel"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMachineHTTPFixture(t)
+			fixture.replaceGrantPermission(t, machineaccess.GrantWrite)
+			response := fixture.bearerMutation(t, fixture.token.Plaintext, machineConfigPath, test.body)
+			assertMachineMutationError(t, response, http.StatusUnprocessableEntity, "validation_failed")
+			if fixture.revisionCount(t) != 1 {
+				t.Fatal("invalid operation changed revision count")
+			}
+			if strings.Contains(response.Body.String(), "machine-http-sentinel") || strings.Contains(fixture.logs.String(), "machine-http-sentinel") || strings.Contains(fixture.logs.String(), fixture.token.Plaintext) {
+				t.Fatal("validation failure exposed submitted data or credentials")
+			}
+		})
+	}
+}
+
+func TestMachineMutationErrorPrecedenceAndBearerOnlyAuthentication(t *testing.T) {
+	tests := []struct {
+		name       string
+		permission string
+		token      func(*machineHTTPFixture) string
+		base       int
+		status     int
+		code       string
+	}{
+		{name: "invalid token before scope conflict and validation", permission: machineaccess.GrantRead, token: func(f *machineHTTPFixture) string { return f.token.Plaintext + "invalid" }, base: 0, status: http.StatusUnauthorized, code: "invalid_token"},
+		{name: "scope before conflict and validation", permission: machineaccess.GrantRead, token: func(f *machineHTTPFixture) string { return f.token.Plaintext }, base: 0, status: http.StatusForbidden, code: "scope_denied"},
+		{name: "conflict before validation", permission: machineaccess.GrantWrite, token: func(f *machineHTTPFixture) string { return f.token.Plaintext }, base: 0, status: http.StatusConflict, code: "revision_conflict"},
+		{name: "validation after authorization and conflict", permission: machineaccess.GrantWrite, token: func(f *machineHTTPFixture) string { return f.token.Plaintext }, base: 1, status: http.StatusUnprocessableEntity, code: "validation_failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMachineHTTPFixture(t)
+			fixture.replaceGrantPermission(t, test.permission)
+			body := fmt.Sprintf(`{"base_revision":%d,"operation":{"type":"unset","key":"PORT","value":"machine-http-sentinel"}}`, test.base)
+			response := fixture.bearerMutation(t, test.token(fixture), machineConfigPath, body)
+			assertMachineMutationError(t, response, test.status, test.code)
+			if fixture.revisionCount(t) != 1 {
+				t.Fatal("failed mutation changed revision count")
+			}
+			if strings.Contains(response.Body.String(), "machine-http-sentinel") || strings.Contains(fixture.logs.String(), "machine-http-sentinel") || strings.Contains(fixture.logs.String(), fixture.token.Plaintext) {
+				t.Fatal("mutation failure exposed submitted data or credentials")
+			}
+		})
+	}
+
+	fixture := newMachineHTTPFixture(t)
+	request := fixture.request(t, "admin", http.MethodPatch, machineConfigPath, `{"base_revision":1,"operation":{"type":"unset","key":"PORT"}}`)
+	response := fixture.serve(t, request)
+	assertMachineMutationError(t, response, http.StatusUnauthorized, "invalid_token")
+}
+
 func TestAuthorizationGuardUsesActualServeMuxPattern(t *testing.T) {
 	fixture := newMachineHTTPFixture(t)
 	for _, path := range []string{
@@ -313,6 +459,16 @@ func TestAuthorizationGuardUsesActualServeMuxPattern(t *testing.T) {
 	} {
 		request := fixture.request(t, "admin", http.MethodGet, path, "")
 		request.Header.Set("Authorization", "Bearer "+fixture.token.Plaintext)
+		response := fixture.serve(t, request)
+		assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
+	}
+	for _, path := range []string{
+		"/api/v1/projects/shop%2Fenvironments/production/config",
+		"/api/v1/projects/shop/environments/production%2Fconfig",
+	} {
+		request := httptest.NewRequest(http.MethodPatch, path, strings.NewReader(`{"base_revision":1,"operation":{"type":"unset","key":"PORT"}}`))
+		request.Header.Set("Authorization", "Bearer "+fixture.token.Plaintext)
+		request.Header.Set("Content-Type", "application/json")
 		response := fixture.serve(t, request)
 		assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
 	}
@@ -340,6 +496,9 @@ func TestAuthorizationGuardUsesActualServeMuxPattern(t *testing.T) {
 			mux.HandleFunc("GET /api/v1/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
 				writeJSON(w, 299, map[string]string{"status": "custom"})
 			})
+			mux.HandleFunc("PATCH /api/v1/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(w, 299, map[string]string{"status": "custom"})
+			})
 		},
 	})
 	if err != nil {
@@ -355,6 +514,12 @@ func TestAuthorizationGuardUsesActualServeMuxPattern(t *testing.T) {
 		custom.ServeHTTP(response, request)
 		assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
 	}
+	request = httptest.NewRequest(http.MethodPatch, "/api/v1/custom", strings.NewReader(`{"base_revision":1,"operation":{"type":"unset","key":"PORT"}}`))
+	request.Header.Set("Authorization", "Bearer "+fixture.token.Plaintext)
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	custom.ServeHTTP(response, request)
+	assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
 }
 
 func TestMachineHTTPReadOnlyRequestDoesNotBlockConfigWrite(t *testing.T) {
@@ -444,7 +609,7 @@ func TestBearerTokenStateScopeAndRouteBinding(t *testing.T) {
 	assertMachineHTTPError(t, response, http.StatusUnauthorized, "invalid_token")
 }
 
-func TestAuthorizationIsRejectedOnEveryNonMachineReadSurface(t *testing.T) {
+func TestAuthorizationIsRejectedOnEveryNonMachineConfigSurface(t *testing.T) {
 	fixture := newMachineHTTPFixture(t)
 	for _, test := range []struct{ method, path, body string }{
 		{method: http.MethodPut, path: machineConfigPath, body: `{"base_revision":1,"entries":[]}`},
@@ -590,6 +755,7 @@ func newMachineHTTPFixture(t *testing.T) *machineHTTPFixture {
 		t.Fatal(err)
 	}
 	machineService := machineaccess.NewService(store)
+	revisionService = revisions.NewService(store, revisions.WithMachineWriteAuthorizer(machineService))
 	identity, err := machineService.CreateIdentity(context.Background(), users["admin"], machineaccess.CreateIdentity{Name: "shop-ci", Enabled: true})
 	if err != nil {
 		t.Fatal(err)
@@ -655,6 +821,43 @@ func (f *machineHTTPFixture) bearerRead(t *testing.T, token, path string) *httpt
 	request := httptest.NewRequest(http.MethodGet, path, nil)
 	request.Header.Set("Authorization", "Bearer "+token)
 	return f.serve(t, request)
+}
+
+func (f *machineHTTPFixture) bearerMutation(t *testing.T, token, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPatch, path, strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	return f.serve(t, request)
+}
+
+func (f *machineHTTPFixture) replaceGrantPermission(t *testing.T, permission string) {
+	t.Helper()
+	err := f.service.ReplaceGrants(context.Background(), f.users["admin"], f.identity.ID, []machineaccess.EnvironmentGrant{{
+		ProjectID: "shop-project", EnvironmentID: "shop-production", Permission: permission,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *machineHTTPFixture) revisionCount(t *testing.T) int {
+	t.Helper()
+	var count int
+	if err := f.store.DB().QueryRow(`SELECT COUNT(*) FROM revisions WHERE environment_id = 'shop-production'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func assertMachineMutationError(t *testing.T, response *httptest.ResponseRecorder, wantStatus int, wantCode string) {
+	t.Helper()
+	var envelope errorEnvelope
+	err := json.Unmarshal(response.Body.Bytes(), &envelope)
+	requestIDMatches := envelope.Error.RequestID != "" && envelope.Error.RequestID == response.Header().Get("X-Request-ID")
+	if err != nil || response.Code != wantStatus || envelope.Error.Code != wantCode || !requestIDMatches || envelope.Error.Fields == nil {
+		t.Fatalf("mutation error status=%d code=%q response_bytes=%d decoded=%t request_id_matches=%t", response.Code, envelope.Error.Code, response.Body.Len(), err == nil, requestIDMatches)
+	}
 }
 
 func (f *machineHTTPFixture) issueToken(t *testing.T, name string) machineaccess.IssuedToken {

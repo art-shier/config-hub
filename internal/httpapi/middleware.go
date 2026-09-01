@@ -89,16 +89,19 @@ func securityMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-const currentConfigRoutePattern = "GET /api/v1/projects/{project}/environments/{environment}/config"
+const (
+	currentConfigGetRoutePattern   = "GET /api/v1/projects/{project}/environments/{environment}/config"
+	currentConfigPatchRoutePattern = "PATCH /api/v1/projects/{project}/environments/{environment}/config"
+)
 
-func authorizationSurfaceMiddleware(machineReadEnabled bool, mux *http.ServeMux) http.Handler {
+func authorizationSurfaceMiddleware(machineConfigEnabled bool, mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(r.Header.Values("Authorization")) == 0 {
 			mux.ServeHTTP(w, r)
 			return
 		}
 		_, pattern := mux.Handler(r)
-		if !machineReadEnabled || r.Method != http.MethodGet || pattern != currentConfigRoutePattern {
+		if !machineConfigEnabled || (pattern != currentConfigGetRoutePattern && pattern != currentConfigPatchRoutePattern) {
 			writeError(w, r, http.StatusUnauthorized, "invalid_token", "Machine tokens are not accepted on this route")
 			return
 		}

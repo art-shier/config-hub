@@ -399,6 +399,7 @@ func TestOptionalRevisionRoutesAndPreciseFallback(t *testing.T) {
 	}{
 		{method: http.MethodGet, path: revisionConfigPath},
 		{method: http.MethodPut, path: revisionConfigPath},
+		{method: http.MethodPatch, path: revisionConfigPath},
 		{method: http.MethodGet, path: revisionListPath},
 		{method: http.MethodPost, path: revisionListPath + "/1/rollback"},
 	} {
@@ -413,7 +414,7 @@ func TestOptionalRevisionRoutesAndPreciseFallback(t *testing.T) {
 	for _, test := range []struct {
 		method, path, allow string
 	}{
-		{method: http.MethodPost, path: revisionConfigPath, allow: "GET, PUT"},
+		{method: http.MethodPost, path: revisionConfigPath, allow: "GET, PATCH, PUT"},
 		{method: http.MethodPut, path: revisionListPath, allow: http.MethodGet},
 		{method: http.MethodPost, path: revisionListPath + "/1", allow: http.MethodGet},
 		{method: http.MethodPost, path: revisionListPath + "/1/diff", allow: http.MethodGet},
