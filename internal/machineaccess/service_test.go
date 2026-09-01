@@ -632,6 +632,8 @@ func TestReplaceGrantsRejectsMismatchAtomicallyAndDeduplicates(t *testing.T) {
 	identity := createMachineIdentity(t, fixture, "grant-ci")
 	original := EnvironmentGrant{ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID}
 	replaceMachineGrants(t, fixture, identity.ID, []EnvironmentGrant{original})
+	storedOriginal := original
+	storedOriginal.Permission = GrantRead
 
 	err := fixture.service.ReplaceGrants(context.Background(), fixture.admin, identity.ID, []EnvironmentGrant{
 		{ProjectID: fixture.deniedEnv.ProjectID, EnvironmentID: fixture.deniedEnv.ID},
@@ -644,7 +646,7 @@ func TestReplaceGrantsRejectsMismatchAtomicallyAndDeduplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(detail.Grants) != 1 || detail.Grants[0] != original {
+	if len(detail.Grants) != 1 || detail.Grants[0] != storedOriginal {
 		t.Fatalf("grants changed after failed replacement: %+v", detail.Grants)
 	}
 
@@ -659,6 +661,35 @@ func TestReplaceGrantsRejectsMismatchAtomicallyAndDeduplicates(t *testing.T) {
 	}
 	if err := fixture.service.ReplaceGrants(context.Background(), fixture.admin, identity.ID, tooMany); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("too many grants error=%v", err)
+	}
+}
+
+func TestMachineGrantPermissionsDefaultToReadAndValidateWrite(t *testing.T) {
+	fixture := newMachineServiceFixture(t)
+	identity := createMachineIdentity(t, fixture, "permission-ci")
+	grants := []EnvironmentGrant{
+		{ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID},
+		{ProjectID: fixture.deniedEnv.ProjectID, EnvironmentID: fixture.deniedEnv.ID, Permission: GrantWrite},
+	}
+	if err := fixture.service.ReplaceGrants(context.Background(), fixture.admin, identity.ID, grants); err != nil {
+		t.Fatal(err)
+	}
+	if grants[0].Permission != "" {
+		t.Fatalf("caller grant permission=%q", grants[0].Permission)
+	}
+	detail, err := fixture.service.GetIdentity(context.Background(), fixture.admin, identity.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Grants) != 2 || detail.Grants[0].Permission != GrantRead || detail.Grants[1].Permission != GrantWrite {
+		t.Fatalf("grant permissions=%q,%q count=%d", detail.Grants[0].Permission, detail.Grants[1].Permission, len(detail.Grants))
+	}
+	err = fixture.service.ReplaceGrants(context.Background(), fixture.admin, identity.ID, []EnvironmentGrant{
+		{ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID, Permission: "admin"},
+	})
+	var validation *ValidationError
+	if !errors.As(err, &validation) || validation.Fields["grants[0].permission"] == "" {
+		t.Fatalf("validation=%t permission_field=%t", errors.As(err, &validation), validation != nil && validation.Fields["grants[0].permission"] != "")
 	}
 }
 

@@ -77,7 +77,7 @@ func (r *repository) identity(ctx context.Context, q queryer, identityID string)
 }
 
 func (r *repository) grants(ctx context.Context, q queryer, identityID string) ([]EnvironmentGrant, error) {
-	rows, err := q.QueryContext(ctx, `SELECT project_id, environment_id FROM machine_grants
+	rows, err := q.QueryContext(ctx, `SELECT project_id, environment_id, permission FROM machine_grants
 		WHERE identity_id = ? ORDER BY project_id, environment_id`, identityID)
 	if err != nil {
 		return nil, database.ClassifyError(fmt.Errorf("list machine grants: %w", err))
@@ -86,7 +86,7 @@ func (r *repository) grants(ctx context.Context, q queryer, identityID string) (
 	grants := make([]EnvironmentGrant, 0)
 	for rows.Next() {
 		var grant EnvironmentGrant
-		if err := rows.Scan(&grant.ProjectID, &grant.EnvironmentID); err != nil {
+		if err := rows.Scan(&grant.ProjectID, &grant.EnvironmentID, &grant.Permission); err != nil {
 			return nil, database.ClassifyError(fmt.Errorf("scan machine grant: %w", err))
 		}
 		grants = append(grants, grant)

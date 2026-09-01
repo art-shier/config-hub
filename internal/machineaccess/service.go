@@ -31,6 +31,8 @@ const (
 	tokenPrefix         = "ch_"
 	tokenLength         = len(tokenPrefix) + 43
 	displayPrefixLength = 10
+	GrantRead           = "read"
+	GrantWrite          = "write"
 )
 
 var (
@@ -71,6 +73,7 @@ type UpdateIdentityInput struct {
 type EnvironmentGrant struct {
 	ProjectID     string `json:"project_id"`
 	EnvironmentID string `json:"environment_id"`
+	Permission    string `json:"permission"`
 }
 
 type TokenMetadata struct {
@@ -282,7 +285,7 @@ func (s *Service) ReplaceGrants(ctx context.Context, actor auth.User, identityID
 			return database.ClassifyError(err)
 		}
 		for _, grant := range normalized {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO machine_grants (identity_id, project_id, environment_id) VALUES (?, ?, ?)`, identityID, grant.ProjectID, grant.EnvironmentID); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO machine_grants (identity_id, project_id, environment_id, permission) VALUES (?, ?, ?, ?)`, identityID, grant.ProjectID, grant.EnvironmentID, grant.Permission); err != nil {
 				return database.ClassifyError(err)
 			}
 		}
@@ -484,11 +487,17 @@ func validateGrants(grants []EnvironmentGrant) ([]EnvironmentGrant, error) {
 	for index, grant := range grants {
 		grant.ProjectID = strings.TrimSpace(grant.ProjectID)
 		grant.EnvironmentID = strings.TrimSpace(grant.EnvironmentID)
+		if grant.Permission == "" {
+			grant.Permission = GrantRead
+		}
 		if validateIdentifier("project_id", grant.ProjectID) != nil {
 			fields[fmt.Sprintf("grants[%d].project_id", index)] = "must be a valid identifier"
 		}
 		if validateIdentifier("environment_id", grant.EnvironmentID) != nil {
 			fields[fmt.Sprintf("grants[%d].environment_id", index)] = "must be a valid identifier"
+		}
+		if grant.Permission != GrantRead && grant.Permission != GrantWrite {
+			fields[fmt.Sprintf("grants[%d].permission", index)] = "must be read or write"
 		}
 		unique[grant.ProjectID+"\x00"+grant.EnvironmentID] = grant
 	}

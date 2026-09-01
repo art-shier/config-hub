@@ -173,6 +173,53 @@ func TestMachineAdminLifecycleRequiresAdminSessionAndProtectsWrites(t *testing.T
 	}
 }
 
+func TestMachineGrantPermissionsHTTPDefaultRoundTripAndValidation(t *testing.T) {
+	fixture := newMachineHTTPFixture(t)
+	identityPath := "/api/v1/machine-identities/" + fixture.identity.ID
+
+	response := fixture.serve(t, fixture.request(t, "admin", http.MethodPut, identityPath+"/grants", `{"grants":[{"project_id":"shop-project","environment_id":"shop-production"}]}`))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("default grants status=%d", response.Code)
+	}
+	response = fixture.serve(t, fixture.request(t, "admin", http.MethodGet, identityPath, ""))
+	if response.Code != http.StatusOK {
+		t.Fatalf("default detail status=%d", response.Code)
+	}
+	var detail struct {
+		Identity machineaccess.IdentityDetail `json:"identity"`
+	}
+	decodeResponse(t, response, &detail)
+	if len(detail.Identity.Grants) != 1 || detail.Identity.Grants[0].Permission != machineaccess.GrantRead {
+		t.Fatalf("default grant count=%d permission=%q", len(detail.Identity.Grants), detail.Identity.Grants[0].Permission)
+	}
+
+	response = fixture.serve(t, fixture.request(t, "admin", http.MethodPut, identityPath+"/grants", `{"grants":[{"project_id":"shop-project","environment_id":"shop-production","permission":"write"}]}`))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("write grants status=%d", response.Code)
+	}
+	response = fixture.serve(t, fixture.request(t, "admin", http.MethodGet, identityPath, ""))
+	if response.Code != http.StatusOK {
+		t.Fatalf("write detail status=%d", response.Code)
+	}
+	decodeResponse(t, response, &detail)
+	if len(detail.Identity.Grants) != 1 || detail.Identity.Grants[0].Permission != machineaccess.GrantWrite {
+		t.Fatalf("write grant count=%d permission=%q", len(detail.Identity.Grants), detail.Identity.Grants[0].Permission)
+	}
+
+	response = fixture.serve(t, fixture.request(t, "admin", http.MethodPut, identityPath+"/grants", `{"grants":[{"project_id":"shop-project","environment_id":"shop-production","permission":"admin"}]}`))
+	if response.Code != http.StatusUnprocessableEntity || responseErrorCode(t, response) != "validation_failed" {
+		t.Fatalf("invalid permission status=%d code=%q", response.Code, responseErrorCode(t, response))
+	}
+	response = fixture.serve(t, fixture.request(t, "admin", http.MethodGet, identityPath, ""))
+	if response.Code != http.StatusOK {
+		t.Fatalf("preserved detail status=%d", response.Code)
+	}
+	decodeResponse(t, response, &detail)
+	if len(detail.Identity.Grants) != 1 || detail.Identity.Grants[0].Permission != machineaccess.GrantWrite {
+		t.Fatalf("preserved grant count=%d permission=%q", len(detail.Identity.Grants), detail.Identity.Grants[0].Permission)
+	}
+}
+
 func TestMachineAdminStrictInputsErrorsAndDatabaseBusy(t *testing.T) {
 	fixture := newMachineHTTPFixture(t)
 	for _, test := range []struct {
