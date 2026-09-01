@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"confighub.local/migrations"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -988,17 +990,33 @@ var migrationOneCoreTables = []string{
 
 func createVersionOneConfigHubFixture(t *testing.T, path string) {
 	t.Helper()
-	store, err := Open(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(driverName, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().Exec(`INSERT INTO machine_identities
-		(id, name, description, enabled, created_at, updated_at)
-		VALUES ('version-one-machine', 'Version One Machine', 'preserved', 1, 1, 1)`); err != nil {
-		_ = store.Close()
+	initial, err := migrations.FS.ReadFile("001_initial.sql")
+	if err != nil {
+		_ = db.Close()
 		t.Fatal(err)
 	}
-	if err := store.Close(); err != nil {
+	if _, err := db.Exec(string(initial)); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (1, 1)`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO machine_identities
+		(id, name, description, enabled, created_at, updated_at)
+		VALUES ('version-one-machine', 'Version One Machine', 'preserved', 1, 1, 1)`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
