@@ -229,6 +229,58 @@ func TestMachineMutationRejectsInvalidOperationsWithoutCreatingRevision(t *testi
 	}
 }
 
+func TestMachineMutationRejectsInvalidAbsentUnsetKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{name: "empty", key: ""},
+		{name: "malformed", key: "INVALID-KEY"},
+		{name: "oversized", key: strings.Repeat("K", MaxKeyBytes+1)},
+		{name: "invalid UTF-8", key: string([]byte{0xff})},
+	}
+	fixture, _ := newMachineMutationFixture(t, []Entry{{Key: "EXISTING", Value: "old"}})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := fixture.service.MutateForMachine(context.Background(), "credential-placeholder", "visible", "production", MachineMutationInput{
+				BaseRevision: 1,
+				Operation:    MutationOperation{Type: "unset", Key: test.key},
+			})
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatal("invalid absent unset key returned the wrong error class")
+			}
+		})
+	}
+	var revisionCount int
+	if err := fixture.store.DB().QueryRow(`SELECT count(*) FROM revisions WHERE environment_id = ?`, fixture.environmentID).Scan(&revisionCount); err != nil {
+		t.Fatal(err)
+	}
+	if revisionCount != 1 {
+		t.Fatalf("revision_count=%d", revisionCount)
+	}
+}
+
+func TestMachineMutationRejectsNegativeBaseAfterAuthorization(t *testing.T) {
+	fixture, authorizer := newMachineMutationFixture(t, []Entry{{Key: "EXISTING", Value: "old"}})
+	_, err := fixture.service.MutateForMachine(context.Background(), "credential-placeholder", "visible", "production", MachineMutationInput{
+		BaseRevision: -1,
+		Operation:    MutationOperation{Type: "unset", Key: "MISSING"},
+	})
+	if !errors.Is(err, ErrInvalid) || errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("negative base invalid=%t conflict=%t", errors.Is(err, ErrInvalid), errors.Is(err, ErrRevisionConflict))
+	}
+	if authorizer.calls != 1 || authorizer.tx == nil {
+		t.Fatalf("authorization calls=%d tx_present=%t", authorizer.calls, authorizer.tx != nil)
+	}
+	var revisionCount int
+	if err := fixture.store.DB().QueryRow(`SELECT count(*) FROM revisions WHERE environment_id = ?`, fixture.environmentID).Scan(&revisionCount); err != nil {
+		t.Fatal(err)
+	}
+	if revisionCount != 1 {
+		t.Fatalf("revision_count=%d", revisionCount)
+	}
+}
+
 func TestMachineMutationEnforcesEntryCountAndAggregateSnapshotLimits(t *testing.T) {
 	t.Run("entry count", func(t *testing.T) {
 		entries := make([]Entry, MaxEntryCount)

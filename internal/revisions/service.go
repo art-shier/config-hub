@@ -227,6 +227,9 @@ func (s *Service) MutateForMachine(ctx context.Context, plaintext, projectSlug, 
 		if err != nil {
 			return err
 		}
+		if input.BaseRevision < 0 {
+			return &ValidationError{Fields: map[string]string{"base_revision": "must be zero or a positive revision"}}
+		}
 		current, err := s.repository.currentRevision(ctx, tx, authorized.EnvironmentID, "")
 		if err != nil {
 			return err
@@ -486,6 +489,10 @@ func mergeMachineMutation(current []Entry, input MachineMutationInput) ([]Entry,
 		return nil, "", err
 	}
 	fields := make(map[string]string)
+	key := strings.TrimSpace(input.Operation.Key)
+	if !utf8.ValidString(key) || len(key) > MaxKeyBytes || !keyPattern.MatchString(key) {
+		fields["operation.key"] = fmt.Sprintf("must be a valid environment key of at most %d bytes", MaxKeyBytes)
+	}
 	switch input.Operation.Type {
 	case "set":
 		if input.Operation.Value == nil {
@@ -505,7 +512,6 @@ func mergeMachineMutation(current []Entry, input MachineMutationInput) ([]Entry,
 		return nil, "", &ValidationError{Fields: fields}
 	}
 
-	key := strings.TrimSpace(input.Operation.Key)
 	entries := append([]Entry(nil), current...)
 	index := -1
 	for entryIndex := range entries {
