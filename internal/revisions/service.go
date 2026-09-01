@@ -50,6 +50,7 @@ type Revision struct {
 	EnvironmentID string    `json:"environment_id"`
 	Message       string    `json:"message"`
 	CreatedBy     string    `json:"created_by"`
+	CreatedByType string    `json:"created_by_type"`
 	Version       int64     `json:"version"`
 	CreatedAt     time.Time `json:"created_at"`
 	Entries       []Entry   `json:"entries"`
@@ -60,6 +61,7 @@ type RevisionSummary struct {
 	EnvironmentID string    `json:"environment_id"`
 	Message       string    `json:"message"`
 	CreatedBy     string    `json:"created_by"`
+	CreatedByType string    `json:"created_by_type"`
 	Version       int64     `json:"version"`
 	CreatedAt     time.Time `json:"created_at"`
 }
@@ -304,7 +306,7 @@ func (s *Service) createSnapshotTx(ctx context.Context, tx *sql.Tx, actor auth.U
 	now := s.now().UTC().Truncate(time.Second)
 	revision := Revision{
 		ID: uuid.NewString(), EnvironmentID: environment.ID, Version: current.Version + 1,
-		Message: message, CreatedBy: actor.ID, CreatedAt: now, Entries: append([]Entry(nil), entries...),
+		Message: message, CreatedBy: actor.ID, CreatedByType: "user", CreatedAt: now, Entries: append([]Entry(nil), entries...),
 	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO revisions (id, environment_id, version, message, created_by, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)`, revision.ID, revision.EnvironmentID, revision.Version, revision.Message, revision.CreatedBy, revision.CreatedAt.Unix())

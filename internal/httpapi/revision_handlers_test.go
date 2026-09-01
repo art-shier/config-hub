@@ -89,7 +89,7 @@ func TestRevisionHTTPConfigLifecycleValidationAndServiceFilter(t *testing.T) {
 		Revision revisions.Revision `json:"revision"`
 	}
 	decodeResponse(t, response, &created)
-	if created.Revision.Version != 1 || created.Revision.Message != "initial" || created.Revision.Entries[0].Key != "DATABASE_URL" || created.Revision.Entries[1].Value != " 8080\n" {
+	if created.Revision.Version != 1 || created.Revision.Message != "initial" || created.Revision.CreatedByType != "user" || created.Revision.Entries[0].Key != "DATABASE_URL" || created.Revision.Entries[1].Value != " 8080\n" {
 		t.Fatalf("created=%+v", created.Revision)
 	}
 
@@ -193,7 +193,7 @@ func TestRevisionHTTPListDetailDiffAndRollback(t *testing.T) {
 		Revisions []map[string]any `json:"revisions"`
 	}
 	decodeResponse(t, response, &list)
-	if response.Code != http.StatusOK || len(list.Revisions) != 2 || list.Revisions[0]["version"] != float64(2) || list.Revisions[0]["message"] != "second" || list.Revisions[0]["created_by"] != fixture.users["editor"].ID || list.Revisions[0]["created_at"] == nil {
+	if response.Code != http.StatusOK || len(list.Revisions) != 2 || list.Revisions[0]["version"] != float64(2) || list.Revisions[0]["message"] != "second" || list.Revisions[0]["created_by"] != fixture.users["editor"].ID || list.Revisions[0]["created_by_type"] != "user" || list.Revisions[0]["created_at"] == nil {
 		t.Fatalf("list status=%d revisions=%+v", response.Code, list.Revisions)
 	}
 	if _, includesEntries := list.Revisions[0]["entries"]; includesEntries {

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"confighub.local/migrations"
+
 	"golang.org/x/sys/unix"
 	"modernc.org/sqlite"
 )
@@ -170,9 +172,36 @@ func TestEmbeddedMigrationsAcceptsInitialMigrationName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 1 || migrations[0].name != "001_initial.sql" || migrations[0].version != 1 {
+	if len(migrations) != 2 || migrations[0].name != "001_initial.sql" || migrations[0].version != 1 || migrations[1].name != "002_machine_writes.sql" || migrations[1].version != 2 {
 		t.Fatalf("migrations = %#v", migrations)
 	}
+}
+
+func TestOpenMigratesVersionOneGrantAndRevisionAttribution(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database", "version-one.db")
+	seedVersionOneDatabase(t, path)
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var permission, createdBy string
+	var machineCreator sql.NullString
+	if err := store.DB().QueryRow(`SELECT permission FROM machine_grants
+		WHERE identity_id = 'm1' AND environment_id = 'e1'`).Scan(&permission); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRow(`SELECT created_by, created_by_machine_identity_id
+		FROM revisions WHERE id = 'r1'`).Scan(&createdBy, &machineCreator); err != nil {
+		t.Fatal(err)
+	}
+	if permission != "read" || createdBy != "u1" || machineCreator.Valid {
+		t.Fatalf("permission=%q created_by=%q machine_creator_valid=%t", permission, createdBy, machineCreator.Valid)
+	}
+	assertRowCount(t, store, `SELECT count(*) FROM revision_entries
+		WHERE revision_id = 'r1' AND key = 'VALUE' AND value = 'preserved'`, 1)
+	assertRowCount(t, store, `SELECT count(*) FROM schema_migrations WHERE version = 2`, 1)
 }
 
 func TestOpenIsIdempotent(t *testing.T) {
@@ -292,6 +321,18 @@ func TestSchemaGuardsRevisionAndMachineGrantRelationships(t *testing.T) {
 	}
 	if _, err := db.Exec("UPDATE machine_grants SET project_id = 'p2' WHERE identity_id = 'm1' AND project_id = 'p1' AND environment_id = 'e1'"); err == nil {
 		t.Fatal("cross-project machine grant update succeeded")
+	}
+	if _, err := db.Exec("INSERT INTO machine_grants (identity_id, project_id, environment_id, permission) VALUES ('m1', 'p1', 'e2', 'admin')"); err == nil {
+		t.Fatal("machine grant with invalid permission succeeded")
+	}
+	if _, err := db.Exec("INSERT INTO revisions (id, environment_id, version, created_at) VALUES ('no-creator', 'e2', 2, 1)"); err == nil {
+		t.Fatal("revision without creator succeeded")
+	}
+	if _, err := db.Exec("INSERT INTO revisions (id, environment_id, version, created_by, created_by_machine_identity_id, created_at) VALUES ('two-creators', 'e2', 2, 'u1', 'm1', 1)"); err == nil {
+		t.Fatal("revision with both creators succeeded")
+	}
+	if _, err := db.Exec("INSERT INTO revisions (id, environment_id, version, created_by_machine_identity_id, created_at) VALUES ('machine-creator', 'e2', 2, 'm1', 1)"); err != nil {
+		t.Fatalf("machine-owned revision failed: %v", err)
 	}
 }
 
@@ -979,6 +1020,48 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+func seedVersionOneDatabase(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open(driverName, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := migrations.FS.ReadFile("001_initial.sql")
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(initial)); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (1, 1)`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
+		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
+		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Environment One', 1, 1)",
+		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('r1', 'e1', 1, 'u1', 1)",
+		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r1', 'VALUE', 'preserved')",
+		"INSERT INTO machine_identities (id, name, enabled, created_at, updated_at) VALUES ('m1', 'machine-one', 1, 1, 1)",
+		"INSERT INTO machine_grants (identity_id, project_id, environment_id) VALUES ('m1', 'p1', 'e1')",
+		"INSERT INTO access_tokens (id, identity_id, name, prefix, token_hash, expires_at, created_at) VALUES ('t1', 'm1', 'token-one', 'prefix', x'01', 2, 1)",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			_ = db.Close()
+			t.Fatalf("seed %q: %v", statement, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertRowCount(t *testing.T, store *Store, query string, want int) {

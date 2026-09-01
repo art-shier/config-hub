@@ -29,7 +29,7 @@ func TestReplaceCreatesAtomicSnapshotAndRejectsStaleBase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Version != 1 || first.Message != "initial snapshot" || first.CreatedBy != fixture.editor.ID {
+	if first.Version != 1 || first.Message != "initial snapshot" || first.CreatedBy != fixture.editor.ID || first.CreatedByType != "user" {
 		t.Fatalf("revision=%+v", first)
 	}
 	if len(first.Entries) != 2 || first.Entries[0].Key != "DATABASE_URL" || first.Entries[0].Service != "api" || first.Entries[0].Value != "postgres://db\nnext" || first.Entries[1].Key != "PORT" || first.Entries[1].Value != " 8080\n" {

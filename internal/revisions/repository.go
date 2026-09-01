@@ -119,9 +119,11 @@ func (r *repository) revisionByVersion(ctx context.Context, q queryer, environme
 func (r *repository) revisionByID(ctx context.Context, q queryer, revisionID, environmentID, service string) (Revision, error) {
 	var revision Revision
 	var createdAt int64
-	err := q.QueryRowContext(ctx, `SELECT id, environment_id, version, message, created_by, created_at
+	err := q.QueryRowContext(ctx, `SELECT id, environment_id, version, message,
+		COALESCE(created_by, created_by_machine_identity_id),
+		CASE WHEN created_by IS NOT NULL THEN 'user' ELSE 'machine' END, created_at
 		FROM revisions WHERE id = ? AND environment_id = ?`, revisionID, environmentID).
-		Scan(&revision.ID, &revision.EnvironmentID, &revision.Version, &revision.Message, &revision.CreatedBy, &createdAt)
+		Scan(&revision.ID, &revision.EnvironmentID, &revision.Version, &revision.Message, &revision.CreatedBy, &revision.CreatedByType, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Revision{}, ErrNotFound
 	}
@@ -167,7 +169,9 @@ func (r *repository) entries(ctx context.Context, q queryer, revisionID, environ
 }
 
 func (r *repository) list(ctx context.Context, q queryer, environmentID string) ([]RevisionSummary, error) {
-	rows, err := q.QueryContext(ctx, `SELECT id, environment_id, version, message, created_by, created_at
+	rows, err := q.QueryContext(ctx, `SELECT id, environment_id, version, message,
+		COALESCE(created_by, created_by_machine_identity_id),
+		CASE WHEN created_by IS NOT NULL THEN 'user' ELSE 'machine' END, created_at
 		FROM revisions WHERE environment_id = ? ORDER BY version DESC`, environmentID)
 	if err != nil {
 		return nil, database.ClassifyError(fmt.Errorf("list revisions: %w", err))
@@ -177,7 +181,7 @@ func (r *repository) list(ctx context.Context, q queryer, environmentID string) 
 	for rows.Next() {
 		var revision RevisionSummary
 		var createdAt int64
-		if err := rows.Scan(&revision.ID, &revision.EnvironmentID, &revision.Version, &revision.Message, &revision.CreatedBy, &createdAt); err != nil {
+		if err := rows.Scan(&revision.ID, &revision.EnvironmentID, &revision.Version, &revision.Message, &revision.CreatedBy, &revision.CreatedByType, &createdAt); err != nil {
 			return nil, database.ClassifyError(fmt.Errorf("scan revision summary: %w", err))
 		}
 		revision.CreatedAt = time.Unix(createdAt, 0).UTC()
