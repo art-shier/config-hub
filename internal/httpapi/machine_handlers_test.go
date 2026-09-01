@@ -422,6 +422,42 @@ func TestMachineMutationRejectsMalformedBodiesQueriesAndInvalidOperations(t *tes
 	}
 }
 
+func TestMachineMutationRejectsExplicitNullFieldsWithoutMutation(t *testing.T) {
+	const submittedSentinel = "explicit-null-sentinel"
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "base revision", body: `{"base_revision":null,"message":"explicit-null-sentinel","operation":{"type":"unset","key":"MISSING"}}`},
+		{name: "message", body: `{"base_revision":1,"message":null,"operation":{"type":"unset","key":"MISSING"}}`},
+		{name: "operation type", body: `{"base_revision":1,"message":"explicit-null-sentinel","operation":{"type":null,"key":"PORT"}}`},
+		{name: "operation key", body: `{"base_revision":1,"message":"explicit-null-sentinel","operation":{"type":"unset","key":null}}`},
+		{name: "set value", body: `{"base_revision":1,"message":"explicit-null-sentinel","operation":{"type":"set","key":"PORT","value":null}}`},
+		{name: "set service", body: `{"base_revision":1,"operation":{"type":"set","key":"PORT","value":"explicit-null-sentinel","service":null}}`},
+		{name: "unset value", body: `{"base_revision":1,"message":"explicit-null-sentinel","operation":{"type":"unset","key":"PORT","value":null}}`},
+		{name: "unset service", body: `{"base_revision":1,"message":"explicit-null-sentinel","operation":{"type":"unset","key":"PORT","service":null}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newMachineHTTPFixture(t)
+			fixture.replaceGrantPermission(t, machineaccess.GrantWrite)
+
+			response := fixture.bearerMutation(t, fixture.token.Plaintext, machineConfigPath, test.body)
+			assertMachineMutationError(t, response, http.StatusBadRequest, "malformed_request")
+			if count := fixture.revisionCount(t); count != 1 {
+				t.Fatalf("explicit null created revisions=%d", count)
+			}
+			current, err := revisions.NewService(fixture.store).CurrentForProject(context.Background(), fixture.users["admin"], "shop", "production", "")
+			if err != nil || current.Version != 1 {
+				t.Fatalf("explicit null advanced current: read_failed=%t revision=%d", err != nil, current.Version)
+			}
+			if strings.Contains(response.Body.String(), submittedSentinel) || strings.Contains(fixture.logs.String(), submittedSentinel) || strings.Contains(fixture.logs.String(), fixture.token.Plaintext) {
+				t.Fatal("explicit null rejection exposed submitted data or credentials")
+			}
+		})
+	}
+}
+
 func TestMachineMutationErrorPrecedenceAndBearerOnlyAuthentication(t *testing.T) {
 	tests := []struct {
 		name       string

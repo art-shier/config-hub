@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -42,10 +44,37 @@ type rollbackRevisionRequest struct {
 	Message string `json:"message"`
 }
 
+type nonNullJSONField[T any] struct {
+	value   T
+	present bool
+}
+
+func (f *nonNullJSONField[T]) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errInvalidJSON
+	}
+	f.present = true
+	return json.Unmarshal(data, &f.value)
+}
+
+func (f *nonNullJSONField[T]) pointer() *T {
+	if !f.present {
+		return nil
+	}
+	return &f.value
+}
+
 type machineMutationRequest struct {
-	BaseRevision int64                        `json:"base_revision"`
-	Message      string                       `json:"message"`
-	Operation    *revisions.MutationOperation `json:"operation"`
+	BaseRevision nonNullJSONField[int64]          `json:"base_revision"`
+	Message      nonNullJSONField[string]         `json:"message"`
+	Operation    *machineMutationOperationRequest `json:"operation"`
+}
+
+type machineMutationOperationRequest struct {
+	Type    nonNullJSONField[string] `json:"type"`
+	Key     nonNullJSONField[string] `json:"key"`
+	Value   nonNullJSONField[string] `json:"value"`
+	Service nonNullJSONField[string] `json:"service"`
 }
 
 func (h *revisionHandlers) current(w http.ResponseWriter, r *http.Request) {
@@ -123,9 +152,14 @@ func (h *revisionHandlers) mutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	input := revisions.MachineMutationInput{
-		BaseRevision: request.BaseRevision,
-		Message:      request.Message,
-		Operation:    *request.Operation,
+		BaseRevision: request.BaseRevision.value,
+		Message:      request.Message.value,
+		Operation: revisions.MutationOperation{
+			Type:    request.Operation.Type.value,
+			Key:     request.Operation.Key.value,
+			Value:   request.Operation.Value.pointer(),
+			Service: request.Operation.Service.pointer(),
+		},
 	}
 	result, err := h.service.MutateForMachine(r.Context(), token, r.PathValue("project"), r.PathValue("environment"), input)
 	if err != nil {
