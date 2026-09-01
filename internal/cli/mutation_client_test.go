@@ -200,30 +200,85 @@ func TestClientMutateConfigDoesNotFollowRedirectsAndDecodesAPIErrors(t *testing.
 	assertMutationErrorOmits(t, err, "MUTATION_TOKEN_SENTINEL", "MUTATION_VALUE_SENTINEL")
 }
 
+func TestClientMutateConfigScrubsEchoedAPIErrorData(t *testing.T) {
+	const token = "MUTATION_TOKEN_SENTINEL"
+	const value = "MUTATION_VALUE_SENTINEL"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"revision_conflict","message":"MUTATION_TOKEN_SENTINEL MUTATION_VALUE_SENTINEL","request_id":"req_42","fields":{"operation.value":"MUTATION_VALUE_SENTINEL","authorization":"MUTATION_TOKEN_SENTINEL"}}}`)
+	}))
+	defer server.Close()
+	client := newMutationClient(t, server.URL, token)
+	_, err := client.MutateConfig(context.Background(), "shop", "production", MutationRequest{
+		BaseRevision: 7,
+		Operation:    MutationOperation{Type: "set", Key: "FEATURE", Value: mutationStringPointer(value)},
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || apiErr.Code != "revision_conflict" || apiErr.RequestID != "req_42" || apiErr.Message != "" || len(apiErr.Fields) != 0 {
+		t.Fatal("echoed API error was not safely reduced")
+	}
+	assertMutationErrorOmits(t, err, token, value)
+}
+
 func TestClientMutateConfigRejectsInvalidInputBeforeRequest(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { attempts.Add(1) }))
 	defer server.Close()
 	client := newMutationClient(t, server.URL, "token")
 	value := "value"
-	tests := []MutationRequest{
-		{BaseRevision: -1, Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: &value}},
-		{BaseRevision: math.MaxInt64, Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: &value}},
-		{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "bad-key", Value: &value}},
-		{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "FEATURE"}},
-		{BaseRevision: 7, Operation: MutationOperation{Type: "unset", Key: "FEATURE", Value: &value}},
-		{BaseRevision: 7, Operation: MutationOperation{Type: "replace", Key: "FEATURE", Value: &value}},
-		{BaseRevision: 7, Message: string([]byte{0xff}), Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: &value}},
-		{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: mutationStringPointer(string([]byte{0xff}))}},
-		{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "FEATURE", Service: mutationStringPointer(strings.Repeat("s", maxServiceBytes+1)), Value: &value}},
+	tests := []struct {
+		client      *Client
+		project     string
+		environment string
+		request     MutationRequest
+	}{
+		{client: nil, project: "shop", environment: "production", request: validMutationRequestFixture()},
+		{client: &Client{}, project: "shop", environment: "production", request: validMutationRequestFixture()},
+		{client: client, project: "shop/api", environment: "production", request: validMutationRequestFixture()},
+		{client: client, project: "shop", environment: "../production", request: validMutationRequestFixture()},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: -1, Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: &value}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: math.MaxInt64, Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: &value}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "bad-key", Value: &value}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: strings.Repeat("K", 129), Value: &value}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Message: strings.Repeat("m", 1025), Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: &value}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: mutationStringPointer(strings.Repeat("v", 1<<20+1))}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "FEATURE"}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "unset", Key: "FEATURE", Value: &value}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "unset", Key: "FEATURE", Service: mutationStringPointer("")}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "replace", Key: "FEATURE", Value: &value}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Message: string([]byte{0xff}), Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: &value}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "FEATURE", Value: mutationStringPointer(string([]byte{0xff}))}}},
+		{client: client, project: "shop", environment: "production", request: MutationRequest{BaseRevision: 7, Operation: MutationOperation{Type: "set", Key: "FEATURE", Service: mutationStringPointer(strings.Repeat("s", maxServiceBytes+1)), Value: &value}}},
 	}
-	for _, request := range tests {
-		if _, err := client.MutateConfig(context.Background(), "shop", "production", request); err == nil {
+	for _, test := range tests {
+		if _, err := test.client.MutateConfig(context.Background(), test.project, test.environment, test.request); err == nil {
 			t.Fatal("invalid mutation input was accepted")
 		}
 	}
 	if attempts.Load() != 0 {
 		t.Fatal("invalid mutation input made a request")
+	}
+}
+
+func TestClientMutateConfigAcceptsBoundaryInputSizes(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		_, _ = io.WriteString(w, `{"project":"shop","environment":"production","revision":7,"created":false}`)
+	}))
+	defer server.Close()
+	client := newMutationClient(t, server.URL, "token")
+	_, err := client.MutateConfig(context.Background(), "shop", "production", MutationRequest{
+		BaseRevision: 7,
+		Message:      strings.Repeat("m", 1024),
+		Operation: MutationOperation{
+			Type:  "set",
+			Key:   strings.Repeat("K", 128),
+			Value: mutationStringPointer(strings.Repeat("v", 1<<20)),
+		},
+	})
+	if err != nil || attempts.Load() != 1 {
+		t.Fatal("boundary mutation input was not sent exactly once")
 	}
 }
 

@@ -99,7 +99,7 @@ func (c *Client) MutateConfig(ctx context.Context, project, environment string, 
 		return MutationResponse{}, errResponseTooLarge
 	}
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
-		return MutationResponse{}, decodeAPIError(response.StatusCode, responseBody)
+		return MutationResponse{}, decodeMutationAPIError(response.StatusCode, responseBody)
 	}
 
 	payload, err := decodeMutationResponse(responseBody)
@@ -113,6 +113,14 @@ func (c *Client) MutateConfig(ctx context.Context, project, environment string, 
 		return MutationResponse{}, errInvalidResponse
 	}
 	return payload, nil
+}
+
+func decodeMutationAPIError(status int, body []byte) error {
+	decoded, ok := decodeAPIError(status, body).(*APIError)
+	if !ok {
+		return &APIError{Status: status}
+	}
+	return &APIError{Status: decoded.Status, Code: decoded.Code, RequestID: decoded.RequestID}
 }
 
 func validMutationRequest(mutation MutationRequest) bool {
