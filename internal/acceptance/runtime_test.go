@@ -34,6 +34,7 @@ const (
 	featureValue            = "runtime-feature-revision-one"
 	revisionTwoValue        = "postgres://runtime-revision-two"
 	revisionTwoFeatureValue = "runtime-feature-revision-two"
+	cliOnlyValue            = "runtime-cli-only-value"
 	runtimeSessionKey       = "runtime-session-key-012345678901234567890123456789"
 )
 
@@ -52,6 +53,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 		"revision two value":         revisionTwoValue,
 		"feature value":              featureValue,
 		"revision two feature value": revisionTwoFeatureValue,
+		"CLI-only value":             cliOnlyValue,
 		"admin password":             adminPassword,
 		"developer password":         developerPassword,
 		"session signing key":        runtimeSessionKey,
@@ -95,7 +97,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 	}
 	decodeJSON(t, identityBody, &identity)
 	fixture.writeJSON(t, session, http.MethodPut, "/api/v1/machine-identities/"+identity.Identity.ID+"/grants", map[string]any{
-		"grants": []machineaccess.EnvironmentGrant{{ProjectID: createdProject.Project.ID, EnvironmentID: production.ID}},
+		"grants": []machineaccess.EnvironmentGrant{{ProjectID: createdProject.Project.ID, EnvironmentID: production.ID, Permission: machineaccess.GrantWrite}},
 	}, http.StatusNoContent)
 	issuedBody := fixture.writeJSON(t, session, http.MethodPost, "/api/v1/machine-identities/"+identity.Identity.ID+"/tokens", map[string]any{
 		"name": "runtime", "expires_at": time.Now().UTC().Add(time.Hour).Truncate(time.Second),
@@ -164,6 +166,63 @@ func TestRuntimeWorkflow(t *testing.T) {
 		t.Fatal("post-rollback export did not match revision 3")
 	}
 
+	var mutationOutput bytes.Buffer
+	setArg := "CLI_ONLY=" + cliOnlyValue
+	code := executeCLI(cli.Execute, ctx, []string{
+		"set", "--project", "shop", "--env", "production", "--service", "worker", setArg,
+	}, getenv, &mutationOutput, &cliDiagnostics)
+	if code != 0 {
+		t.Fatalf("set exit=%d", code)
+	}
+	if mutationOutput.String() != "revision 4\n" {
+		t.Fatalf("set output did not match revision 4, length=%d", mutationOutput.Len())
+	}
+
+	jsonOutput.Reset()
+	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--service", "worker", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
+		t.Fatalf("post-set export exit=%d", code)
+	}
+	var postSetExport cli.ConfigResponse
+	decodeJSON(t, jsonOutput.Bytes(), &postSetExport)
+	if postSetExport.Revision != 4 || len(postSetExport.Values) != 1 || postSetExport.Values["CLI_ONLY"] != cliOnlyValue {
+		t.Fatalf("post-set export revision=%d value_count=%d CLI_ONLY_matches=%t", postSetExport.Revision, len(postSetExport.Values), postSetExport.Values["CLI_ONLY"] == cliOnlyValue)
+	}
+
+	mutationOutput.Reset()
+	if code := executeCLI(cli.Execute, ctx, []string{
+		"unset", "--project", "shop", "--env", "production", "CLI_ONLY",
+	}, getenv, &mutationOutput, &cliDiagnostics); code != 0 {
+		t.Fatalf("unset exit=%d", code)
+	}
+	if mutationOutput.String() != "revision 5\n" {
+		t.Fatalf("unset output did not match revision 5, length=%d", mutationOutput.Len())
+	}
+
+	jsonOutput.Reset()
+	if code := executeCLI(cli.Execute, ctx, []string{"export", "--project", "shop", "--env", "production", "--service", "worker", "--format", "json"}, getenv, &jsonOutput, &cliDiagnostics); code != 0 {
+		t.Fatalf("post-unset export exit=%d", code)
+	}
+	var postUnsetExport cli.ConfigResponse
+	decodeJSON(t, jsonOutput.Bytes(), &postUnsetExport)
+	if _, found := postUnsetExport.Values["CLI_ONLY"]; postUnsetExport.Revision != 5 || found {
+		t.Fatal("post-unset export did not prove CLI_ONLY absent at revision 5")
+	}
+
+	historyBody := fixture.writeJSON(t, session, http.MethodGet, "/api/v1/projects/shop/environments/production/revisions", nil, http.StatusOK)
+	var history struct {
+		Revisions []revisions.RevisionSummary `json:"revisions"`
+	}
+	decodeJSON(t, historyBody, &history)
+	machineVersions := map[int64]bool{4: false, 5: false}
+	for _, revision := range history.Revisions {
+		if _, required := machineVersions[revision.Version]; required && revision.CreatedByType == "machine" && revision.CreatedBy == identity.Identity.ID {
+			machineVersions[revision.Version] = true
+		}
+	}
+	if !machineVersions[4] || !machineVersions[5] {
+		t.Fatal("revision history did not attribute CLI revisions 4 and 5 to the machine identity")
+	}
+
 	backupPath := filepath.Join(fixture.runtimeDir, "backups", "runtime.db")
 	backupCommand := exec.CommandContext(ctx, fixture.serverBinary, "backup", "--config", fixture.configPath, "--output", backupPath)
 	backupCommand.Dir = acceptanceRepositoryRoot(t)
@@ -182,7 +241,7 @@ func TestRuntimeWorkflow(t *testing.T) {
 		t.Fatalf("backup integrity=%q err=%v", integrity, err)
 	}
 	var version int64
-	if err := backup.QueryRowContext(ctx, `SELECT MAX(version) FROM revisions WHERE environment_id = ?`, production.ID).Scan(&version); err != nil || version != 3 {
+	if err := backup.QueryRowContext(ctx, `SELECT MAX(version) FROM revisions WHERE environment_id = ?`, production.ID).Scan(&version); err != nil || version != 5 {
 		t.Fatalf("backup revision=%d err=%v", version, err)
 	}
 	for label, path := range map[string]string{

@@ -1,11 +1,11 @@
 # ConfigHub
 
-ConfigHub 是面向单个内部研发团队的轻量配置中心。管理员和成员通过 Web 管理项目、环境与不可变配置版本，CI、构建脚本和开发者通过限定到“项目 + 环境”的机器 Token 使用 HTTP API 或 `confighub` CLI 读取当前配置。
+ConfigHub 是面向单个内部研发团队的轻量配置中心。管理员和成员通过 Web 管理项目、环境与不可变配置版本，CI、构建脚本和开发者通过限定到“项目 + 环境”的机器 Token 使用 HTTP API 或 `confighub` CLI 读取当前配置，并按授权写入单个配置项。
 
 项目采用 Go、React/Vite 和单机 SQLite，原生构建后只产生两个二进制：
 
 - `dist/confighub-server`：Web、HTTP API、账号同步、SQLite 与在线备份；
-- `dist/confighub`：只读 CLI，不直接访问 SQLite。
+- `dist/confighub`：读取配置并执行单键 `set`/`unset`，不直接访问 SQLite。
 
 仓库通过 GitHub Release 提供 Linux Server+Web 和跨平台 CLI，并分别提供命令行安装/部署脚本；不提供 Docker、Caddy 或外部数据库。
 
@@ -272,7 +272,7 @@ curl -fsS http://127.0.0.1:8080/api/v1/health/ready
 
 ## CLI
 
-CLI 只读取机器身份当前被授权的配置。Token 明文仅在 Web 签发时展示一次。连接信息可以保存在全局配置和当前项目目录配置中；配置文件只接受 `server`、`token` 两个字段，项目、环境和服务仍在每次命令中显式传入。
+CLI 使用机器身份读取当前被授权的配置，并可通过 `set`/`unset` 写入单个配置项。读取需要环境的 `read` 或 `write` grant；写入必须明确授予 `write`，`read` grant 不能写入。升级前已有的 grant 在迁移后保持 `read`，不会因为 Server 升级自动获得写权限。Token 明文仅在 Web 签发时展示一次。连接信息可以保存在全局配置和当前项目目录配置中；配置文件只接受 `server`、`token` 两个字段，项目、环境和服务仍在每次命令中显式传入。
 
 全局配置路径遵循操作系统用户配置目录：
 
@@ -336,6 +336,20 @@ export CONFIGHUB_TOKEN='ch_一次性签发的机器Token'
 ```
 
 `export` 只写标准输出，不会自行创建 `.env` 文件。`run` 中远端同名键覆盖父进程环境，且只注入子进程；拉取失败时不会启动子进程。
+
+持有 `write` grant 的机器身份可以执行单键写入：
+
+```bash
+./dist/confighub set --project shop --env production DATABASE_URL=postgres://db.internal/app
+./dist/confighub set --project shop --env production --service api PORT=8080
+./dist/confighub unset --project shop --env production LEGACY_FLAG
+```
+
+`set KEY=VALUE` 会把配置值放入命令行；shell history 和同机进程检查可能看到该值。不要把这种输入方式视为秘密安全通道。
+
+`set` 在第一个 `=` 处分隔键和值；省略 `--service` 会为已有键保留当前 service，新键则使用全局 service。`unset` 按键删除，不接受 `--service`。内容发生变化时，每条命令只创建一个新的不可变 revision；内容相同的 `set` 或删除不存在键的 `unset` 是成功的 no-op，不创建 revision，并报告当前 revision。发生 revision conflict 时 CLI 返回失败且不自动重试，避免覆盖并发变更。
+
+成功时标准输出严格为 `revision <number>` 加换行，不会输出提交的配置值。用法或本地校验错误退出码为 `2`；网络、Server、权限或 conflict 错误退出码为 `1`；成功退出码为 `0`。
 
 若不希望 Token 常驻环境变量，可使用受限文件。CLI 故意不接受明文 Token 命令行参数，以免进入 shell history 或进程列表：
 
@@ -469,7 +483,7 @@ config-hub-server_VERSION_linux_arm64.tar.gz
 - 配置值遮罩或二次验证查看；
 - 独立审计事件表和机器读取审计；
 - 草稿、审批、发布和版本固定；
-- 机器写入配置；
+- CLI 批量文件导入或多键变更；
 - 运行时 Sidecar、配置推送、热刷新或动态凭据；
 - 多实例部署、水平扩容和分布式锁；
 - 网页修改账号或密码；
