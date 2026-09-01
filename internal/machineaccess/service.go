@@ -19,6 +19,7 @@ import (
 
 	"confighub.local/internal/auth"
 	"confighub.local/internal/database"
+	"confighub.local/internal/revisions"
 )
 
 const (
@@ -406,7 +407,7 @@ func (s *Service) ReadCurrentForProject(ctx context.Context, plaintext, projectS
 		if s.afterReadTxBegin != nil {
 			s.afterReadTxBegin()
 		}
-		_, environmentID, err := s.repository.authenticateForProjectEnvironment(ctx, tx, hash[:], projectSlug, environmentSlug, s.now().UTC().Unix())
+		_, environmentID, err := s.repository.authenticateForProjectEnvironment(ctx, tx, hash[:], projectSlug, environmentSlug, s.now().UTC().Unix(), GrantRead)
 		if err != nil {
 			return err
 		}
@@ -423,6 +424,22 @@ func (s *Service) ReadCurrentForProject(ctx context.Context, plaintext, projectS
 		return CurrentConfig{}, fmt.Errorf("read machine current config: %w", err)
 	}
 	return config, nil
+}
+
+func (s *Service) AuthorizeMachineWrite(ctx context.Context, tx *sql.Tx, plaintext, projectSlug, environmentSlug string) (revisions.MachineWriteActor, error) {
+	if err := s.ready(); err != nil || tx == nil {
+		return revisions.MachineWriteActor{}, errors.New("machine write authorizer is unavailable")
+	}
+	hash, err := parseToken(plaintext)
+	if err != nil {
+		return revisions.MachineWriteActor{}, ErrInvalidToken
+	}
+	identity, environmentID, err := s.repository.authenticateForProjectEnvironment(
+		ctx, tx, hash[:], projectSlug, environmentSlug, s.now().UTC().Unix(), GrantWrite)
+	if err != nil {
+		return revisions.MachineWriteActor{}, err
+	}
+	return revisions.MachineWriteActor{IdentityID: identity.ID, EnvironmentID: environmentID}, nil
 }
 
 func (s *Service) ready() error {

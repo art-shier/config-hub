@@ -169,8 +169,8 @@ func serve(parent context.Context, configPath string, stderr io.Writer) error {
 	credentials := auth.NewCredentialService(store)
 	sessions := auth.NewSessionManager(store, sessionKey, cfg.Auth.SessionTTL)
 	projectService := projects.NewService(store)
-	revisionService := revisions.NewService(store)
 	machineService := machineaccess.NewService(store)
+	revisionService := revisions.NewService(store, revisions.WithMachineWriteAuthorizer(machineService))
 	assets, err := webui.Assets()
 	if err != nil {
 		_ = store.Close()

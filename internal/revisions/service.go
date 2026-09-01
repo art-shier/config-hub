@@ -72,6 +72,41 @@ type ReplaceInput struct {
 	Entries      []Entry
 }
 
+type MachineWriteActor struct {
+	IdentityID    string
+	EnvironmentID string
+}
+
+type MachineWriteAuthorizer interface {
+	AuthorizeMachineWrite(context.Context, *sql.Tx, string, string, string) (MachineWriteActor, error)
+}
+
+type ServiceOption func(*Service)
+
+func WithMachineWriteAuthorizer(authorizer MachineWriteAuthorizer) ServiceOption {
+	return func(service *Service) { service.machineWriteAuthorizer = authorizer }
+}
+
+type MutationOperation struct {
+	Type    string  `json:"type"`
+	Key     string  `json:"key"`
+	Value   *string `json:"value,omitempty"`
+	Service *string `json:"service,omitempty"`
+}
+
+type MachineMutationInput struct {
+	BaseRevision int64             `json:"base_revision"`
+	Message      string            `json:"message"`
+	Operation    MutationOperation `json:"operation"`
+}
+
+type MutationResult struct {
+	Project     string `json:"project"`
+	Environment string `json:"environment"`
+	Revision    int64  `json:"revision"`
+	Created     bool   `json:"created"`
+}
+
 type Change struct {
 	Key           string `json:"key"`
 	Kind          string `json:"kind"`
@@ -95,16 +130,27 @@ func (e *ValidationError) Error() string { return ErrInvalid.Error() }
 func (e *ValidationError) Unwrap() error { return ErrInvalid }
 
 type Service struct {
-	repository *repository
-	now        func() time.Time
+	repository             *repository
+	now                    func() time.Time
+	machineWriteAuthorizer MachineWriteAuthorizer
+}
+
+type revisionCreator struct {
+	userID, machineIdentityID string
 }
 
 type environmentLocator struct {
 	id, projectSlug, environmentSlug string
 }
 
-func NewService(store *database.Store) *Service {
-	return &Service{repository: newRepository(store), now: time.Now}
+func NewService(store *database.Store, options ...ServiceOption) *Service {
+	service := &Service{repository: newRepository(store), now: time.Now}
+	for _, option := range options {
+		if option != nil {
+			option(service)
+		}
+	}
+	return service
 }
 
 func (s *Service) Current(ctx context.Context, actor auth.User, environmentID, service string) (Revision, error) {
@@ -162,13 +208,52 @@ func (s *Service) replace(ctx context.Context, actor auth.User, locator environm
 		if current.Version != normalized.BaseRevision {
 			return ErrRevisionConflict
 		}
-		created, err = s.createSnapshotTx(ctx, tx, currentActor, environment, current, normalized.Message, normalized.Entries)
+		created, err = s.createSnapshotTx(ctx, tx, revisionCreator{userID: currentActor.ID}, environment, current, normalized.Message, normalized.Entries)
 		return err
 	})
 	if err != nil {
 		return Revision{}, fmt.Errorf("replace revision: %w", err)
 	}
 	return created, nil
+}
+
+func (s *Service) MutateForMachine(ctx context.Context, plaintext, projectSlug, environmentSlug string, input MachineMutationInput) (MutationResult, error) {
+	if s == nil || s.repository == nil || s.repository.store == nil || s.now == nil || s.machineWriteAuthorizer == nil {
+		return MutationResult{}, errors.New("revision service has no machine write authorizer")
+	}
+	result := MutationResult{Project: projectSlug, Environment: environmentSlug}
+	err := s.repository.store.InTx(ctx, func(tx *sql.Tx) error {
+		authorized, err := s.machineWriteAuthorizer.AuthorizeMachineWrite(ctx, tx, plaintext, projectSlug, environmentSlug)
+		if err != nil {
+			return err
+		}
+		current, err := s.repository.currentRevision(ctx, tx, authorized.EnvironmentID, "")
+		if err != nil {
+			return err
+		}
+		if current.Version != input.BaseRevision {
+			return ErrRevisionConflict
+		}
+		entries, message, err := mergeMachineMutation(current.Entries, input)
+		if err != nil {
+			return err
+		}
+		if entriesEqual(current.Entries, entries) {
+			result.Revision = current.Version
+			return nil
+		}
+		created, err := s.createSnapshotTx(ctx, tx, revisionCreator{machineIdentityID: authorized.IdentityID}, environmentRecord{ID: authorized.EnvironmentID}, current, message, entries)
+		if err != nil {
+			return err
+		}
+		result.Revision = created.Version
+		result.Created = true
+		return nil
+	})
+	if err != nil {
+		return MutationResult{}, fmt.Errorf("mutate machine revision: %w", err)
+	}
+	return result, nil
 }
 
 func (s *Service) List(ctx context.Context, actor auth.User, environmentID string) ([]RevisionSummary, error) {
@@ -289,7 +374,7 @@ func (s *Service) rollback(ctx context.Context, actor auth.User, locator environ
 		if err != nil {
 			return err
 		}
-		created, err = s.createSnapshotTx(ctx, tx, currentActor, environment, current, normalizedMessage, target.Entries)
+		created, err = s.createSnapshotTx(ctx, tx, revisionCreator{userID: currentActor.ID}, environment, current, normalizedMessage, target.Entries)
 		return err
 	})
 	if err != nil {
@@ -298,18 +383,32 @@ func (s *Service) rollback(ctx context.Context, actor auth.User, locator environ
 	return created, nil
 }
 
-func (s *Service) createSnapshotTx(ctx context.Context, tx *sql.Tx, actor auth.User, environment environmentRecord, current Revision, message string, entries []Entry) (Revision, error) {
+func (s *Service) createSnapshotTx(ctx context.Context, tx *sql.Tx, creator revisionCreator, environment environmentRecord, current Revision, message string, entries []Entry) (Revision, error) {
 	if (current.ID == "" && current.Version != 0) ||
 		(current.ID != "" && (current.Version <= 0 || current.Version == math.MaxInt64)) {
+		return Revision{}, ErrDataIntegrity
+	}
+	if (creator.userID == "") == (creator.machineIdentityID == "") {
 		return Revision{}, ErrDataIntegrity
 	}
 	now := s.now().UTC().Truncate(time.Second)
 	revision := Revision{
 		ID: uuid.NewString(), EnvironmentID: environment.ID, Version: current.Version + 1,
-		Message: message, CreatedBy: actor.ID, CreatedByType: "user", CreatedAt: now, Entries: append([]Entry(nil), entries...),
+		Message: message, CreatedAt: now, Entries: append([]Entry(nil), entries...),
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO revisions (id, environment_id, version, message, created_by, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, revision.ID, revision.EnvironmentID, revision.Version, revision.Message, revision.CreatedBy, revision.CreatedAt.Unix())
+	var userID, machineIdentityID any
+	if creator.userID != "" {
+		userID = creator.userID
+		revision.CreatedBy = creator.userID
+		revision.CreatedByType = "user"
+	} else {
+		machineIdentityID = creator.machineIdentityID
+		revision.CreatedBy = creator.machineIdentityID
+		revision.CreatedByType = "machine"
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO revisions
+		(id, environment_id, version, message, created_by, created_by_machine_identity_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, revision.ID, revision.EnvironmentID, revision.Version, revision.Message, userID, machineIdentityID, revision.CreatedAt.Unix())
 	if err != nil {
 		return Revision{}, database.ClassifyError(fmt.Errorf("insert revision: %w", err))
 	}
@@ -380,6 +479,78 @@ func (s *Service) readyActor(actor auth.User) error {
 		return ErrForbidden
 	}
 	return nil
+}
+
+func mergeMachineMutation(current []Entry, input MachineMutationInput) ([]Entry, string, error) {
+	if err := ValidateStoredEntries(current); err != nil {
+		return nil, "", err
+	}
+	fields := make(map[string]string)
+	switch input.Operation.Type {
+	case "set":
+		if input.Operation.Value == nil {
+			fields["operation.value"] = "is required for set"
+		}
+	case "unset":
+		if input.Operation.Value != nil {
+			fields["operation.value"] = "must be omitted for unset"
+		}
+		if input.Operation.Service != nil {
+			fields["operation.service"] = "must be omitted for unset"
+		}
+	default:
+		fields["operation.type"] = "must be set or unset"
+	}
+	if len(fields) > 0 {
+		return nil, "", &ValidationError{Fields: fields}
+	}
+
+	key := strings.TrimSpace(input.Operation.Key)
+	entries := append([]Entry(nil), current...)
+	index := -1
+	for entryIndex := range entries {
+		if entries[entryIndex].Key == key {
+			index = entryIndex
+			break
+		}
+	}
+	if input.Operation.Type == "unset" {
+		if index >= 0 {
+			entries = append(entries[:index], entries[index+1:]...)
+		}
+	} else {
+		service := ""
+		if index >= 0 {
+			service = entries[index].Service
+		}
+		if input.Operation.Service != nil {
+			service = strings.TrimSpace(*input.Operation.Service)
+		}
+		entry := Entry{Key: key, Value: *input.Operation.Value, Service: service}
+		if index >= 0 {
+			entries[index] = entry
+		} else {
+			entries = append(entries, entry)
+		}
+	}
+
+	normalized, err := validateReplaceInput(ReplaceInput{BaseRevision: input.BaseRevision, Message: input.Message, Entries: entries})
+	if err != nil {
+		return nil, "", err
+	}
+	return normalized.Entries, normalized.Message, nil
+}
+
+func entriesEqual(left, right []Entry) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateReplaceInput(input ReplaceInput) (ReplaceInput, error) {

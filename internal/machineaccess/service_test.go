@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -693,6 +694,90 @@ func TestMachineGrantPermissionsDefaultToReadAndValidateWrite(t *testing.T) {
 	}
 }
 
+func TestAuthorizeMachineWriteEnforcesGrantPermissionAndPreservesReadAccess(t *testing.T) {
+	fixture := newMachineServiceFixture(t)
+	identity := createMachineIdentity(t, fixture, "writer-ci")
+	replaceMachineGrants(t, fixture, identity.ID, []EnvironmentGrant{{
+		ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID, Permission: GrantRead,
+	}})
+	issued := issueMachineToken(t, fixture, identity.ID, "primary", machineTestNow.Add(time.Hour))
+
+	if _, err := authorizeMachineWrite(fixture, issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug); !errors.Is(err, ErrScopeDenied) {
+		t.Fatal("read grant returned the wrong machine-write error class")
+	}
+	if _, err := fixture.service.ReadCurrentForProject(context.Background(), issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, ""); err != nil {
+		t.Fatal("read grant could not read current configuration")
+	}
+
+	replaceMachineGrants(t, fixture, identity.ID, []EnvironmentGrant{{
+		ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID, Permission: GrantWrite,
+	}})
+	actor, err := authorizeMachineWrite(fixture, issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug)
+	if err != nil {
+		t.Fatal("write grant could not authorize a machine write")
+	}
+	if actor.IdentityID != identity.ID || actor.EnvironmentID != fixture.allowedEnv.ID {
+		t.Fatalf("write actor identity_matches=%t environment_matches=%t", actor.IdentityID == identity.ID, actor.EnvironmentID == fixture.allowedEnv.ID)
+	}
+	if _, err := fixture.service.ReadCurrentForProject(context.Background(), issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug, ""); err != nil {
+		t.Fatal("write grant could not read current configuration")
+	}
+}
+
+func TestAuthorizeMachineWritePreservesInvalidTokenErrorClasses(t *testing.T) {
+	t.Run("malformed", func(t *testing.T) {
+		fixture := newMachineServiceFixture(t)
+		if _, err := authorizeMachineWrite(fixture, "malformed", fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug); !errors.Is(err, ErrInvalidToken) {
+			t.Fatal("malformed credential returned the wrong error class")
+		}
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		fixture := newMachineServiceFixture(t)
+		identity := createMachineIdentity(t, fixture, "expired-writer")
+		replaceMachineGrants(t, fixture, identity.ID, []EnvironmentGrant{{ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID, Permission: GrantWrite}})
+		issued := issueMachineToken(t, fixture, identity.ID, "primary", machineTestNow.Add(time.Second))
+		fixture.service.now = func() time.Time { return machineTestNow.Add(time.Second) }
+		if _, err := authorizeMachineWrite(fixture, issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug); !errors.Is(err, ErrInvalidToken) {
+			t.Fatal("expired credential returned the wrong error class")
+		}
+	})
+
+	t.Run("revoked", func(t *testing.T) {
+		fixture := newMachineServiceFixture(t)
+		identity := createMachineIdentity(t, fixture, "revoked-writer")
+		replaceMachineGrants(t, fixture, identity.ID, []EnvironmentGrant{{ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID, Permission: GrantWrite}})
+		issued := issueMachineToken(t, fixture, identity.ID, "primary", machineTestNow.Add(time.Hour))
+		if err := fixture.service.RevokeToken(context.Background(), fixture.admin, identity.ID, issued.ID); err != nil {
+			t.Fatal("token revoke setup failed")
+		}
+		if _, err := authorizeMachineWrite(fixture, issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug); !errors.Is(err, ErrInvalidToken) {
+			t.Fatal("revoked credential returned the wrong error class")
+		}
+	})
+
+	t.Run("disabled identity", func(t *testing.T) {
+		fixture := newMachineServiceFixture(t)
+		identity := createMachineIdentity(t, fixture, "disabled-writer")
+		replaceMachineGrants(t, fixture, identity.ID, []EnvironmentGrant{{ProjectID: fixture.allowedEnv.ProjectID, EnvironmentID: fixture.allowedEnv.ID, Permission: GrantWrite}})
+		issued := issueMachineToken(t, fixture, identity.ID, "primary", machineTestNow.Add(time.Hour))
+		if _, err := fixture.service.UpdateIdentity(context.Background(), fixture.admin, identity.ID, UpdateIdentityInput{Enabled: false}); err != nil {
+			t.Fatal("identity disable setup failed")
+		}
+		if _, err := authorizeMachineWrite(fixture, issued.Plaintext, fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug); !errors.Is(err, ErrInvalidToken) {
+			t.Fatal("disabled identity credential returned the wrong error class")
+		}
+	})
+}
+
+func TestAuthorizeMachineWriteRejectsNilTransaction(t *testing.T) {
+	fixture := newMachineServiceFixture(t)
+	actor, err := fixture.service.AuthorizeMachineWrite(context.Background(), nil, "malformed", fixture.allowedEnv.ProjectSlug, fixture.allowedEnv.Slug)
+	if err == nil || actor != (revisions.MachineWriteActor{}) {
+		t.Fatalf("nil transaction error_present=%t actor_empty=%t", err != nil, actor == (revisions.MachineWriteActor{}))
+	}
+}
+
 func TestIdentityManagementValidatesAndRereadsAdminState(t *testing.T) {
 	fixture := newMachineServiceFixture(t)
 	identity, err := fixture.service.CreateIdentity(context.Background(), fixture.admin, CreateIdentity{Name: " build-ci ", Description: " deploys ", Enabled: true})
@@ -865,4 +950,14 @@ func issueMachineToken(t *testing.T, fixture *machineServiceFixture, identityID,
 		t.Fatal(err)
 	}
 	return issued
+}
+
+func authorizeMachineWrite(fixture *machineServiceFixture, plaintext, projectSlug, environmentSlug string) (revisions.MachineWriteActor, error) {
+	var actor revisions.MachineWriteActor
+	err := fixture.store.InTx(context.Background(), func(tx *sql.Tx) error {
+		var err error
+		actor, err = fixture.service.AuthorizeMachineWrite(context.Background(), tx, plaintext, projectSlug, environmentSlug)
+		return err
+	})
+	return actor, err
 }

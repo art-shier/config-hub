@@ -153,7 +153,7 @@ func (r *repository) authenticateForEnvironment(ctx context.Context, q queryer, 
 	return identity, allowed == 1, nil
 }
 
-func (r *repository) authenticateForProjectEnvironment(ctx context.Context, q queryer, tokenHash []byte, projectSlug, environmentSlug string, now int64) (Identity, string, error) {
+func (r *repository) authenticateForProjectEnvironment(ctx context.Context, q queryer, tokenHash []byte, projectSlug, environmentSlug string, now int64, requiredPermission string) (Identity, string, error) {
 	var identity Identity
 	var environmentID sql.NullString
 	var enabled int
@@ -164,12 +164,13 @@ func (r *repository) authenticateForProjectEnvironment(ctx context.Context, q qu
 			JOIN environments e ON e.id = mg.environment_id AND e.project_id = mg.project_id
 			JOIN projects p ON p.id = e.project_id
 			WHERE mg.identity_id = mi.id AND p.slug = ? AND e.slug = ?
+				AND (mg.permission = ? OR (? = 'read' AND mg.permission = 'write'))
 			LIMIT 1
 		)
 		FROM access_tokens at
 		JOIN machine_identities mi ON mi.id = at.identity_id
 		WHERE at.token_hash = ? AND at.revoked_at IS NULL AND at.expires_at > ? AND mi.enabled = 1`,
-		projectSlug, environmentSlug, tokenHash, now).
+		projectSlug, environmentSlug, requiredPermission, requiredPermission, tokenHash, now).
 		Scan(&identity.ID, &identity.Name, &identity.Description, &enabled, &createdAt, &updatedAt, &environmentID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Identity{}, "", ErrInvalidToken

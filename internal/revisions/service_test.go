@@ -2,6 +2,7 @@ package revisions
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -92,6 +93,175 @@ func TestMachineOwnedRevisionUsesMachineActorAcrossDetailAndList(t *testing.T) {
 	}
 	if list[0].CreatedBy != machineID || list[0].CreatedByType != "machine" {
 		t.Fatalf("list actor_id=%q actor_type=%q", list[0].CreatedBy, list[0].CreatedByType)
+	}
+}
+
+func TestMachineMutationAppliesSingleKeyOperationsAndMachineAttribution(t *testing.T) {
+	tests := []struct {
+		name              string
+		operation         MutationOperation
+		created           bool
+		wantEntryCount    int
+		wantExisting      bool
+		wantExistingValue string
+		wantService       string
+		wantNew           bool
+	}{
+		{name: "new global", operation: MutationOperation{Type: "set", Key: "NEW", Value: stringPointer("value")}, created: true, wantEntryCount: 3, wantExisting: true, wantExistingValue: "old", wantService: "api", wantNew: true},
+		{name: "preserve service", operation: MutationOperation{Type: "set", Key: "EXISTING", Value: stringPointer("new")}, created: true, wantEntryCount: 2, wantExisting: true, wantExistingValue: "new", wantService: "api"},
+		{name: "explicit global", operation: MutationOperation{Type: "set", Key: "EXISTING", Value: stringPointer("new"), Service: stringPointer("")}, created: true, wantEntryCount: 2, wantExisting: true, wantExistingValue: "new"},
+		{name: "unset", operation: MutationOperation{Type: "unset", Key: "EXISTING"}, created: true, wantEntryCount: 1},
+		{name: "identical set", operation: MutationOperation{Type: "set", Key: "EXISTING", Value: stringPointer("old")}, created: false, wantEntryCount: 2, wantExisting: true, wantExistingValue: "old", wantService: "api"},
+		{name: "missing unset", operation: MutationOperation{Type: "unset", Key: "MISSING"}, created: false, wantEntryCount: 2, wantExisting: true, wantExistingValue: "old", wantService: "api"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, authorizer := newMachineMutationFixture(t, []Entry{
+				{Key: "EXISTING", Value: "old", Service: "api"},
+				{Key: "KEEP", Value: "kept", Service: "worker"},
+			})
+			result, err := fixture.service.MutateForMachine(context.Background(), "credential-placeholder", "visible", "production", MachineMutationInput{
+				BaseRevision: 1,
+				Message:      "  machine update  ",
+				Operation:    test.operation,
+			})
+			if err != nil {
+				t.Fatal("machine mutation returned an unexpected error")
+			}
+			wantRevision := int64(1)
+			if test.created {
+				wantRevision = 2
+			}
+			if result.Project != "visible" || result.Environment != "production" || result.Revision != wantRevision || result.Created != test.created {
+				t.Fatalf("result metadata project_matches=%t environment_matches=%t revision=%d created=%t", result.Project == "visible", result.Environment == "production", result.Revision, result.Created)
+			}
+			if authorizer.calls != 1 || authorizer.tx == nil || !authorizer.credentialMatches || !authorizer.routeMatches {
+				t.Fatalf("authorization calls=%d tx_present=%t credential_matches=%t route_matches=%t", authorizer.calls, authorizer.tx != nil, authorizer.credentialMatches, authorizer.routeMatches)
+			}
+			if err := authorizer.tx.QueryRowContext(context.Background(), `SELECT 1`).Scan(new(int)); !errors.Is(err, sql.ErrTxDone) {
+				t.Fatalf("authorizer transaction remained usable after mutation: tx_done=%t", errors.Is(err, sql.ErrTxDone))
+			}
+			current, err := fixture.service.Current(context.Background(), fixture.viewer, fixture.environmentID, "")
+			if err != nil {
+				t.Fatal("current revision could not be read")
+			}
+			existingMatches := hasExactEntry(current.Entries, "EXISTING", test.wantExistingValue, test.wantService)
+			newMatches := hasExactEntry(current.Entries, "NEW", "value", "")
+			if len(current.Entries) != test.wantEntryCount || existingMatches != test.wantExisting || newMatches != test.wantNew {
+				t.Fatalf("snapshot metadata entry_count=%d existing_matches=%t new_matches=%t", len(current.Entries), existingMatches, newMatches)
+			}
+			var revisionCount, machineRevisionCount int
+			if err := fixture.store.DB().QueryRow(`SELECT count(*) FROM revisions WHERE environment_id = ?`, fixture.environmentID).Scan(&revisionCount); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.store.DB().QueryRow(`SELECT count(*) FROM revisions
+				WHERE environment_id = ? AND created_by IS NULL AND created_by_machine_identity_id = 'machine-mutation-id'`, fixture.environmentID).Scan(&machineRevisionCount); err != nil {
+				t.Fatal(err)
+			}
+			wantRevisionCount, wantMachineRevisionCount := 1, 0
+			if test.created {
+				wantRevisionCount, wantMachineRevisionCount = 2, 1
+			}
+			if revisionCount != wantRevisionCount || machineRevisionCount != wantMachineRevisionCount {
+				t.Fatalf("revision_count=%d machine_revision_count=%d", revisionCount, machineRevisionCount)
+			}
+		})
+	}
+}
+
+func TestMachineMutationAuthorizesInsideTheRolledBackWriteTransactionBeforeConflictCheck(t *testing.T) {
+	fixture, authorizer := newMachineMutationFixture(t, []Entry{{Key: "EXISTING", Value: "old"}})
+	authorizer.onAuthorize = func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE projects SET description = 'authorization marker' WHERE id = 'project-id'`)
+		return err
+	}
+	_, err := fixture.service.MutateForMachine(context.Background(), "credential-placeholder", "visible", "production", MachineMutationInput{
+		BaseRevision: 0,
+		Operation:    MutationOperation{Type: "set", Key: "EXISTING", Value: stringPointer("new")},
+	})
+	if !errors.Is(err, ErrRevisionConflict) {
+		t.Fatal("stale machine mutation did not return a revision conflict")
+	}
+	var description string
+	if err := fixture.store.DB().QueryRow(`SELECT description FROM projects WHERE id = 'project-id'`).Scan(&description); err != nil {
+		t.Fatal(err)
+	}
+	if authorizer.calls != 1 || authorizer.tx == nil || description != "" {
+		t.Fatalf("authorization calls=%d tx_present=%t side_effect_rolled_back=%t", authorizer.calls, authorizer.tx != nil, description == "")
+	}
+}
+
+func TestMachineMutationRejectsInvalidOperationsWithoutCreatingRevision(t *testing.T) {
+	value, service := "new", "api"
+	tests := []struct {
+		name      string
+		operation MutationOperation
+		message   string
+	}{
+		{name: "set missing value", operation: MutationOperation{Type: "set", Key: "EXISTING"}},
+		{name: "unset with value", operation: MutationOperation{Type: "unset", Key: "EXISTING", Value: &value}},
+		{name: "unset with service", operation: MutationOperation{Type: "unset", Key: "EXISTING", Service: &service}},
+		{name: "unknown operation", operation: MutationOperation{Type: "delete", Key: "EXISTING"}},
+		{name: "invalid key", operation: MutationOperation{Type: "set", Key: "INVALID-KEY", Value: &value}},
+		{name: "oversized value", operation: MutationOperation{Type: "set", Key: "EXISTING", Value: stringPointer(strings.Repeat("x", MaxValueBytes+1))}},
+		{name: "oversized service", operation: MutationOperation{Type: "set", Key: "EXISTING", Value: &value, Service: stringPointer(strings.Repeat("s", MaxServiceBytes+1))}},
+		{name: "oversized message", operation: MutationOperation{Type: "set", Key: "EXISTING", Value: &value}, message: strings.Repeat("m", MaxMessageBytes+1)},
+	}
+	fixture, _ := newMachineMutationFixture(t, []Entry{{Key: "EXISTING", Value: "old", Service: "api"}})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := fixture.service.MutateForMachine(context.Background(), "credential-placeholder", "visible", "production", MachineMutationInput{
+				BaseRevision: 1,
+				Message:      test.message,
+				Operation:    test.operation,
+			})
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatal("invalid machine mutation returned the wrong error class")
+			}
+		})
+	}
+	var revisionCount int
+	if err := fixture.store.DB().QueryRow(`SELECT count(*) FROM revisions WHERE environment_id = ?`, fixture.environmentID).Scan(&revisionCount); err != nil {
+		t.Fatal(err)
+	}
+	if revisionCount != 1 {
+		t.Fatalf("revision_count=%d", revisionCount)
+	}
+}
+
+func TestMachineMutationEnforcesEntryCountAndAggregateSnapshotLimits(t *testing.T) {
+	t.Run("entry count", func(t *testing.T) {
+		entries := make([]Entry, MaxEntryCount)
+		for index := range entries {
+			entries[index] = Entry{Key: fmt.Sprintf("KEY_%04d", index)}
+		}
+		fixture, _ := newMachineMutationFixture(t, entries)
+		_, err := fixture.service.MutateForMachine(context.Background(), "credential-placeholder", "visible", "production", MachineMutationInput{
+			BaseRevision: 1,
+			Operation:    MutationOperation{Type: "set", Key: "OVER_LIMIT", Value: stringPointer("")},
+		})
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatal("entry-count overflow returned the wrong error class")
+		}
+	})
+
+	t.Run("aggregate bytes", func(t *testing.T) {
+		fixture, _ := newMachineMutationFixture(t, []Entry{{Key: "EXISTING", Value: strings.Repeat("x", MaxSnapshotBytes-len("EXISTING"))}})
+		_, err := fixture.service.MutateForMachine(context.Background(), "credential-placeholder", "visible", "production", MachineMutationInput{
+			BaseRevision: 1,
+			Operation:    MutationOperation{Type: "set", Key: "NEW", Value: stringPointer("")},
+		})
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatal("aggregate snapshot overflow returned the wrong error class")
+		}
+	})
+}
+
+func TestMachineMutationRequiresConfiguredAuthorizer(t *testing.T) {
+	fixture := newRevisionFixture(t)
+	_, err := fixture.service.MutateForMachine(context.Background(), "credential-placeholder", "visible", "production", MachineMutationInput{})
+	if err == nil {
+		t.Fatal("machine mutation succeeded without an authorizer")
 	}
 }
 
@@ -607,6 +777,54 @@ type revisionFixture struct {
 	store                                      *database.Store
 	admin, editor, editorTwo, viewer, disabled auth.User
 	environmentID, hiddenEnvironmentID         string
+}
+
+type recordingMachineWriteAuthorizer struct {
+	actor             MachineWriteActor
+	tx                *sql.Tx
+	calls             int
+	credentialMatches bool
+	routeMatches      bool
+	onAuthorize       func(context.Context, *sql.Tx) error
+}
+
+func (a *recordingMachineWriteAuthorizer) AuthorizeMachineWrite(ctx context.Context, tx *sql.Tx, plaintext, projectSlug, environmentSlug string) (MachineWriteActor, error) {
+	a.calls++
+	a.tx = tx
+	a.credentialMatches = plaintext == "credential-placeholder"
+	a.routeMatches = projectSlug == "visible" && environmentSlug == "production"
+	if a.onAuthorize != nil {
+		if err := a.onAuthorize(ctx, tx); err != nil {
+			return MachineWriteActor{}, err
+		}
+	}
+	return a.actor, nil
+}
+
+func newMachineMutationFixture(t *testing.T, entries []Entry) (*revisionFixture, *recordingMachineWriteAuthorizer) {
+	t.Helper()
+	fixture := newRevisionFixture(t)
+	if _, err := fixture.service.Replace(context.Background(), fixture.editor, fixture.environmentID, ReplaceInput{Entries: entries}); err != nil {
+		t.Fatal("seed revision failed")
+	}
+	if _, err := fixture.store.DB().Exec(`INSERT INTO machine_identities (id, name, enabled, created_at, updated_at)
+		VALUES ('machine-mutation-id', 'machine mutation', 1, 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	authorizer := &recordingMachineWriteAuthorizer{actor: MachineWriteActor{IdentityID: "machine-mutation-id", EnvironmentID: fixture.environmentID}}
+	fixture.service = NewService(fixture.store, WithMachineWriteAuthorizer(authorizer))
+	return fixture, authorizer
+}
+
+func stringPointer(value string) *string { return &value }
+
+func hasExactEntry(entries []Entry, key, value, service string) bool {
+	for _, entry := range entries {
+		if entry.Key == key {
+			return entry.Value == value && entry.Service == service
+		}
+	}
+	return false
 }
 
 func newRevisionFixture(t *testing.T) *revisionFixture {
