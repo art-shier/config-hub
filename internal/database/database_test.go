@@ -200,7 +200,7 @@ func TestOpenMigratesVersionOneGrantAndRevisionAttribution(t *testing.T) {
 		t.Fatalf("permission=%q created_by=%q machine_creator_valid=%t", permission, createdBy, machineCreator.Valid)
 	}
 	assertRowCount(t, store, `SELECT count(*) FROM revision_entries
-		WHERE revision_id = 'r1' AND key = 'VALUE' AND value = 'preserved'`, 1)
+		WHERE revision_id = 'r1' AND key = 'VALUE' AND value = 'task1-migration-sentinel'`, 1)
 	assertRowCount(t, store, `SELECT count(*) FROM schema_migrations WHERE version = 2`, 1)
 }
 
@@ -1044,19 +1044,19 @@ func seedVersionOneDatabase(t *testing.T, path string) {
 		_ = db.Close()
 		t.Fatal(err)
 	}
-	for _, statement := range []string{
+	for step, statement := range []string{
 		"INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at, updated_at) VALUES ('u1', 'u1', 'User One', 'hash', 'admin', 1, 1, 1)",
 		"INSERT INTO projects (id, slug, name, created_by, created_at, updated_at) VALUES ('p1', 'p1', 'Project One', 'u1', 1, 1)",
 		"INSERT INTO environments (id, project_id, slug, name, created_at, updated_at) VALUES ('e1', 'p1', 'e1', 'Environment One', 1, 1)",
 		"INSERT INTO revisions (id, environment_id, version, created_by, created_at) VALUES ('r1', 'e1', 1, 'u1', 1)",
-		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r1', 'VALUE', 'preserved')",
+		"INSERT INTO revision_entries (revision_id, key, value) VALUES ('r1', 'VALUE', 'task1-migration-sentinel')",
 		"INSERT INTO machine_identities (id, name, enabled, created_at, updated_at) VALUES ('m1', 'machine-one', 1, 1, 1)",
 		"INSERT INTO machine_grants (identity_id, project_id, environment_id) VALUES ('m1', 'p1', 'e1')",
 		"INSERT INTO access_tokens (id, identity_id, name, prefix, token_hash, expires_at, created_at) VALUES ('t1', 'm1', 'token-one', 'prefix', x'01', 2, 1)",
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			_ = db.Close()
-			t.Fatalf("seed %q: %v", statement, err)
+			t.Fatalf("seed step %d: %v", step, err)
 		}
 	}
 	if err := db.Close(); err != nil {

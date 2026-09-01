@@ -67,30 +67,30 @@ func TestRevisionHTTPConfigLifecycleValidationAndServiceFilter(t *testing.T) {
 
 	response := fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, revisionConfigPath, ""))
 	if response.Code != http.StatusOK {
-		t.Fatalf("empty config status=%d body=%s", response.Code, response.Body.String())
+		t.Fatalf("empty config status=%d", response.Code)
 	}
 	var empty struct {
 		Revision revisions.Revision `json:"revision"`
 	}
 	decodeResponse(t, response, &empty)
 	if empty.Revision.Version != 0 || empty.Revision.Entries == nil || len(empty.Revision.Entries) != 0 {
-		t.Fatalf("empty revision=%+v", empty.Revision)
+		t.Fatalf("empty revision version=%d entry_count=%d", empty.Revision.Version, len(empty.Revision.Entries))
 	}
 
 	response = fixture.serve(t, fixture.request(t, "editor", http.MethodPut, revisionConfigPath, `{
 		"base_revision":0,
 		"message":" initial ",
-		"entries":[{"key":" PORT ","value":" 8080\n"},{"key":"DATABASE_URL","value":"postgres://secret\nnext","service":" api "}]
+		"entries":[{"key":" PORT ","value":" 8080\n"},{"key":"DATABASE_URL","value":"task1-http-sentinel","service":" api "}]
 	}`))
 	if response.Code != http.StatusCreated {
-		t.Fatalf("replace status=%d body=%s", response.Code, response.Body.String())
+		t.Fatalf("replace status=%d", response.Code)
 	}
 	var created struct {
 		Revision revisions.Revision `json:"revision"`
 	}
 	decodeResponse(t, response, &created)
 	if created.Revision.Version != 1 || created.Revision.Message != "initial" || created.Revision.CreatedByType != "user" || created.Revision.Entries[0].Key != "DATABASE_URL" || created.Revision.Entries[1].Value != " 8080\n" {
-		t.Fatalf("created=%+v", created.Revision)
+		t.Fatalf("created revision version=%d message_matches=%t actor_type=%q entry_count=%d", created.Revision.Version, created.Revision.Message == "initial", created.Revision.CreatedByType, len(created.Revision.Entries))
 	}
 
 	response = fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, revisionConfigPath+"?service=api", ""))
@@ -99,12 +99,12 @@ func TestRevisionHTTPConfigLifecycleValidationAndServiceFilter(t *testing.T) {
 	}
 	decodeResponse(t, response, &filtered)
 	if response.Code != http.StatusOK || len(filtered.Revision.Entries) != 1 || filtered.Revision.Entries[0].Key != "DATABASE_URL" {
-		t.Fatalf("filtered status=%d revision=%+v", response.Code, filtered.Revision)
+		t.Fatalf("filtered status=%d entry_count=%d", response.Code, len(filtered.Revision.Entries))
 	}
 	response = fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, revisionConfigPath+"?service=%20api%20", ""))
 	decodeResponse(t, response, &filtered)
 	if response.Code != http.StatusOK || len(filtered.Revision.Entries) != 1 || filtered.Revision.Entries[0].Key != "DATABASE_URL" {
-		t.Fatalf("trimmed filter status=%d revision=%+v", response.Code, filtered.Revision)
+		t.Fatalf("trimmed filter status=%d entry_count=%d", response.Code, len(filtered.Revision.Entries))
 	}
 	response = fixture.serve(t, fixture.request(t, "viewer", http.MethodGet, revisionConfigPath, ""))
 	var unfiltered struct {
@@ -112,7 +112,7 @@ func TestRevisionHTTPConfigLifecycleValidationAndServiceFilter(t *testing.T) {
 	}
 	decodeResponse(t, response, &unfiltered)
 	if response.Code != http.StatusOK || len(unfiltered.Revision.Entries) != 2 {
-		t.Fatalf("unfiltered status=%d revision=%+v", response.Code, unfiltered.Revision)
+		t.Fatalf("unfiltered status=%d entry_count=%d", response.Code, len(unfiltered.Revision.Entries))
 	}
 
 	response = fixture.serve(t, fixture.request(t, "viewer", http.MethodPut, revisionConfigPath, `{"base_revision":1,"entries":[]}`))

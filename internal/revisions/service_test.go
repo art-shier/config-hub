@@ -30,10 +30,10 @@ func TestReplaceCreatesAtomicSnapshotAndRejectsStaleBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.Version != 1 || first.Message != "initial snapshot" || first.CreatedBy != fixture.editor.ID || first.CreatedByType != "user" {
-		t.Fatalf("revision=%+v", first)
+		t.Fatalf("created snapshot metadata version=%d message_matches=%t actor_matches=%t actor_type=%q", first.Version, first.Message == "initial snapshot", first.CreatedBy == fixture.editor.ID, first.CreatedByType)
 	}
 	if len(first.Entries) != 2 || first.Entries[0].Key != "DATABASE_URL" || first.Entries[0].Service != "api" || first.Entries[0].Value != "postgres://db\nnext" || first.Entries[1].Key != "PORT" || first.Entries[1].Value != " 8080\n" {
-		t.Fatalf("entries=%+v", first.Entries)
+		t.Fatalf("created snapshot entries did not retain expected metadata and values")
 	}
 
 	_, err = fixture.service.Replace(ctx, fixture.editor, fixture.environmentID, ReplaceInput{
@@ -45,16 +45,53 @@ func TestReplaceCreatesAtomicSnapshotAndRejectsStaleBase(t *testing.T) {
 	}
 	current, err := fixture.service.Current(ctx, fixture.editor, fixture.environmentID, "")
 	if err != nil || current.Version != 1 || len(current.Entries) != 2 || current.Entries[1].Value != " 8080\n" {
-		t.Fatalf("current=%+v err=%v", current, err)
+		t.Fatalf("current snapshot version=%d entry_count=%d err=%v", current.Version, len(current.Entries), err)
 	}
 
 	filtered, err := fixture.service.Current(ctx, fixture.viewer, fixture.environmentID, "api")
 	if err != nil || filtered.Version != 1 || len(filtered.Entries) != 1 || filtered.Entries[0].Key != "DATABASE_URL" {
-		t.Fatalf("filtered=%+v err=%v", filtered, err)
+		t.Fatalf("filtered snapshot version=%d entry_count=%d err=%v", filtered.Version, len(filtered.Entries), err)
 	}
 	none, err := fixture.service.Current(ctx, fixture.viewer, fixture.environmentID, " api ")
 	if err != nil || len(none.Entries) != 0 {
-		t.Fatalf("exact service filter=%+v err=%v", none, err)
+		t.Fatalf("exact service filter entry_count=%d err=%v", len(none.Entries), err)
+	}
+}
+
+func TestMachineOwnedRevisionUsesMachineActorAcrossDetailAndList(t *testing.T) {
+	fixture := newRevisionFixture(t)
+	const machineID = "m1"
+	const sentinelValue = "task1-machine-read-sentinel"
+	if _, err := fixture.store.DB().Exec(`INSERT INTO machine_identities (id, name, enabled, created_at, updated_at)
+		VALUES (?, 'machine-one', 1, 1, 1)`, machineID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`INSERT INTO revisions
+		(id, environment_id, version, created_by_machine_identity_id, created_at)
+		VALUES ('machine-revision', ?, 1, ?, 1)`, fixture.environmentID, machineID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DB().Exec(`INSERT INTO revision_entries (revision_id, key, value)
+		VALUES ('machine-revision', 'SENTINEL', ?)`, sentinelValue); err != nil {
+		t.Fatal(err)
+	}
+
+	detail, err := fixture.service.Get(context.Background(), fixture.viewer, fixture.environmentID, 1)
+	if err != nil {
+		t.Fatalf("get machine revision: %v", err)
+	}
+	if detail.CreatedBy != machineID || detail.CreatedByType != "machine" {
+		t.Fatalf("detail actor_id=%q actor_type=%q", detail.CreatedBy, detail.CreatedByType)
+	}
+	list, err := fixture.service.List(context.Background(), fixture.viewer, fixture.environmentID)
+	if err != nil {
+		t.Fatalf("list machine revision: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("machine revision list count=%d", len(list))
+	}
+	if list[0].CreatedBy != machineID || list[0].CreatedByType != "machine" {
+		t.Fatalf("list actor_id=%q actor_type=%q", list[0].CreatedBy, list[0].CreatedByType)
 	}
 }
 
