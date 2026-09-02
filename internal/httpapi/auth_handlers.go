@@ -170,7 +170,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, destination any) error {
 	if err != nil || mediaType != "application/json" {
 		return errors.New("invalid content type")
 	}
-	body, err := readStrictJSONBody(r.Body)
+	body, err := readStrictJSONBody(r.Body, requestBodyLimit(r.Pattern))
 	if err != nil {
 		return err
 	}

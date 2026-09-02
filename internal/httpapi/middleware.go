@@ -18,7 +18,10 @@ import (
 	"confighub.local/internal/auth"
 )
 
-const maxRequestBodyBytes int64 = 1 << 20
+const (
+	maxRequestBodyBytes       int64 = 1 << 20
+	maxConfigRequestBodyBytes int64 = 8 << 20
+)
 
 type requestIDKey struct{}
 
@@ -58,20 +61,22 @@ func recoveryMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-func securityMiddleware(next http.Handler) http.Handler {
+func securityMiddleware(mux *http.ServeMux, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		if r.ContentLength > maxRequestBodyBytes {
+		_, pattern := mux.Handler(r)
+		bodyLimit := requestBodyLimit(pattern)
+		if r.ContentLength > bodyLimit {
 			writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "Request body is too large")
 			return
 		}
 		if r.Body != nil && r.Body != http.NoBody {
 			original := r.Body
-			limited := http.MaxBytesReader(w, original, maxRequestBodyBytes)
+			limited := http.MaxBytesReader(w, original, bodyLimit)
 			body, err := io.ReadAll(limited)
 			_ = original.Close()
 			if err != nil {
@@ -92,7 +97,15 @@ func securityMiddleware(next http.Handler) http.Handler {
 const (
 	currentConfigGetRoutePattern   = "GET /api/v1/projects/{project}/environments/{environment}/config"
 	currentConfigPatchRoutePattern = "PATCH /api/v1/projects/{project}/environments/{environment}/config"
+	currentConfigPutRoutePattern   = "PUT /api/v1/projects/{project}/environments/{environment}/config"
 )
+
+func requestBodyLimit(pattern string) int64 {
+	if pattern == currentConfigPatchRoutePattern || pattern == currentConfigPutRoutePattern {
+		return maxConfigRequestBodyBytes
+	}
+	return maxRequestBodyBytes
+}
 
 func authorizationSurfaceMiddleware(machineConfigEnabled bool, mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

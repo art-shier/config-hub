@@ -367,6 +367,36 @@ func TestMachineMutationLifecycleAndMinimalResponse(t *testing.T) {
 	})
 }
 
+func TestMachineMutationAcceptsMaximumSnapshotThroughRouter(t *testing.T) {
+	fixture := newMachineHTTPFixture(t)
+	fixture.replaceGrantPermissionForEnvironment(t, machineaccess.GrantWrite, "shop-staging")
+
+	body, err := json.Marshal(map[string]any{
+		"base_revision": 0,
+		"operation": map[string]any{
+			"type":  "set",
+			"key":   "A",
+			"value": strings.Repeat("x", revisions.MaxSnapshotBytes-1),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) <= int(maxRequestBodyBytes) {
+		t.Fatalf("request_bytes=%d want greater than %d", len(body), maxRequestBodyBytes)
+	}
+
+	response := fixture.bearerMutation(t, fixture.token.Plaintext,
+		"/api/v1/projects/shop/environments/staging/config", string(body))
+	wantBody := "{\"project\":\"shop\",\"environment\":\"staging\",\"revision\":1,\"created\":true}\n"
+	if response.Code != http.StatusCreated || response.Body.String() != wantBody {
+		t.Fatalf("mutation status=%d response_bytes=%d exact_response=%t", response.Code, response.Body.Len(), response.Body.String() == wantBody)
+	}
+	if count := fixture.revisionCount(t); count != 2 {
+		t.Fatalf("mutation revision_count=%d want=2", count)
+	}
+}
+
 func TestMachineMutationRejectsMalformedBodiesQueriesAndInvalidOperations(t *testing.T) {
 	tests := []struct {
 		name, path, body, code string

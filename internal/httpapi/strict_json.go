@@ -14,14 +14,14 @@ const maxJSONNestingDepth = 256
 
 var errInvalidJSON = errors.New("invalid JSON request")
 
-func readStrictJSONBody(reader io.Reader) ([]byte, error) {
-	limited := &io.LimitedReader{R: reader, N: maxRequestBodyBytes + 1}
+func readStrictJSONBody(reader io.Reader, maxBytes int64) ([]byte, error) {
+	limited := &io.LimitedReader{R: reader, N: maxBytes + 1}
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(body)) > maxRequestBodyBytes {
-		return nil, &http.MaxBytesError{Limit: maxRequestBodyBytes}
+	if int64(len(body)) > maxBytes {
+		return nil, &http.MaxBytesError{Limit: maxBytes}
 	}
 	return body, nil
 }
