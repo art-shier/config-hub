@@ -1,5 +1,9 @@
 .worktrees/
 
+# Local workspace tooling and generated review artifacts
+/.coder-studio/
+/artifacts/
+
 # Go
 /bin/
 /dist/
