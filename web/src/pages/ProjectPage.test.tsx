@@ -318,9 +318,15 @@ describe("ProjectPage", () => {
       renderAppAt("/projects/shop");
 
       expect(await screen.findByText("API_URL")).toBeInTheDocument();
-      const edit = screen.queryByRole("button", { name: "Edit configuration" });
-      if (canWrite) expect(edit).toBeInTheDocument();
-      else expect(edit).not.toBeInTheDocument();
+      const add = screen.queryByRole("button", { name: "Add configuration" });
+      const edit = screen.queryByRole("button", { name: "Edit API_URL" });
+      if (canWrite) {
+        expect(add).toBeInTheDocument();
+        expect(edit).toBeInTheDocument();
+      } else {
+        expect(add).not.toBeInTheDocument();
+        expect(edit).not.toBeInTheDocument();
+      }
     },
   );
 
@@ -329,28 +335,28 @@ describe("ProjectPage", () => {
     renderAppAt("/projects/shop?environment=prod");
     const user = userEvent.setup();
     await user.click(
-      await screen.findByRole("button", { name: "Edit configuration" }),
+      await screen.findByRole("button", { name: "Edit API_URL" }),
     );
-    await user.type(screen.getByLabelText("Value for API_URL"), " draft");
+    await user.type(screen.getByLabelText("Value"), " draft");
 
     await user.selectOptions(
       screen.getByLabelText("Active environment"),
       "stage",
     );
     expect(
-      screen.getByRole("dialog", { name: "Leave without saving?" }),
+      screen.getByRole("dialog", { name: "Discard unsaved entry changes?" }),
     ).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Stay" }));
+    await user.click(screen.getByRole("button", { name: "Keep editing" }));
     expect(window.location.search).toBe("?environment=prod");
-    expect(screen.getByLabelText("Value for API_URL")).toHaveValue(
+    expect(screen.getByLabelText("Value")).toHaveValue(
       "https://example.test draft",
     );
 
     await user.click(screen.getByRole("tab", { name: "Versions" }));
     expect(
-      screen.getByRole("dialog", { name: "Leave without saving?" }),
+      screen.getByRole("dialog", { name: "Discard unsaved entry changes?" }),
     ).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Discard and leave" }));
+    await user.click(screen.getByRole("button", { name: "Discard changes" }));
     expect(
       await screen.findByRole("heading", { name: "No versions yet" }),
     ).toBeInTheDocument();
@@ -409,11 +415,11 @@ describe("ProjectPage", () => {
     renderAppAt("/projects/shop");
     const user = userEvent.setup();
     await user.click(
-      await screen.findByRole("button", { name: "Edit configuration" }),
+      await screen.findByRole("button", { name: "Edit API_URL" }),
     );
-    await user.clear(screen.getByLabelText("Value for API_URL"));
+    await user.clear(screen.getByLabelText("Value"));
     await user.type(
-      screen.getByLabelText("Value for API_URL"),
+      screen.getByLabelText("Value"),
       "https://next.test",
     );
     await user.type(screen.getByLabelText("Change message"), "update URL");

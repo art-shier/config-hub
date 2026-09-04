@@ -105,19 +105,22 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
   await createEnvironment(page, "production", "Production");
   await page.getByLabel("Active environment").selectOption("production");
 
-  await page.getByRole("button", { name: "Edit configuration" }).click();
-  await page.getByRole("button", { name: "Add entry" }).click();
-  await page.getByRole("button", { name: "Add entry" }).click();
-  const firstDraft = page.getByRole("group", { name: "Configuration entries" }).locator("fieldset").nth(0);
-  const secondDraft = page.getByRole("group", { name: "Configuration entries" }).locator("fieldset").nth(1);
-  await firstDraft.getByLabel(/^Key for /).fill("DATABASE_URL");
-  await firstDraft.getByLabel(/^Value for /).fill(originalDatabaseValue);
-  await firstDraft.getByLabel(/^Service for /).fill("api");
-  await secondDraft.getByLabel(/^Key for /).fill("FEATURE_FLAG");
-  await secondDraft.getByLabel(/^Value for /).fill(originalFeatureValue);
-  await page.getByLabel("Change message").fill("browser revision one");
-  await page.getByRole("button", { name: "Save changes" }).click();
+  await page.getByRole("button", { name: "Add configuration" }).click();
+  let entryDialog = page.getByRole("dialog", { name: "Add configuration entry" });
+  await entryDialog.getByLabel("Key").fill("DATABASE_URL");
+  await entryDialog.getByLabel("Value").fill(originalDatabaseValue);
+  await entryDialog.getByLabel("Service").fill("api");
+  await entryDialog.getByLabel("Change message").fill("browser revision one");
+  await entryDialog.getByRole("button", { name: "Save changes" }).click();
   await expect(page.getByRole("status")).toContainText("Revision 1 saved");
+
+  await page.getByRole("button", { name: "Add configuration" }).click();
+  entryDialog = page.getByRole("dialog", { name: "Add configuration entry" });
+  await entryDialog.getByLabel("Key").fill("FEATURE_FLAG");
+  await entryDialog.getByLabel("Value").fill(originalFeatureValue);
+  await entryDialog.getByLabel("Change message").fill("browser revision two");
+  await entryDialog.getByRole("button", { name: "Save changes" }).click();
+  await expect(page.getByRole("status")).toContainText("Revision 2 saved");
   await expect(page.getByTestId("configuration-value-DATABASE_URL")).toHaveText(originalDatabaseValue);
 
   const secondContext = await browser.newContext({
@@ -129,22 +132,22 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
     await login(secondPage);
     await secondPage.goto(`${runtimeServer.origin}/projects/shop?environment=production&tab=configuration`);
     await expect(secondPage.getByRole("heading", { name: "Configuration", exact: true })).toBeVisible();
-    await secondPage.getByRole("button", { name: "Edit configuration" }).click();
-    await secondPage.getByLabel("Value for DATABASE_URL").fill("postgres://second-context-draft");
+    await secondPage.getByRole("button", { name: "Edit DATABASE_URL" }).click();
+    await secondPage.getByLabel("Value").fill("postgres://second-context-draft");
     await secondPage.getByLabel("Change message").fill("second context draft");
 
-    await page.getByRole("button", { name: "Edit configuration" }).click();
-    await page.getByLabel("Value for DATABASE_URL").fill(revisionTwoDatabaseValue);
+    await page.getByRole("button", { name: "Edit DATABASE_URL" }).click();
+    await page.getByLabel("Value").fill(revisionTwoDatabaseValue);
     await page.getByLabel("Change message").fill("browser revision two");
     await page.getByRole("button", { name: "Save changes" }).click();
-    await expect(page.getByRole("status")).toContainText("Revision 2 saved");
+    await expect(page.getByRole("status")).toContainText("Revision 3 saved");
 
     await secondPage.getByRole("button", { name: "Save changes" }).click();
-    await expect(secondPage.getByRole("alert")).toHaveText("Configuration changed since you loaded it");
+    await expect(secondPage.getByRole("alert")).toHaveText("Configuration changed since you opened this entry.");
     await secondPage.getByRole("button", { name: "Refresh and compare" }).click();
-    await expect(secondPage.getByRole("heading", { name: "Latest server compared with your draft" })).toBeVisible();
-    await expect(secondPage.getByTestId("conflict-server-DATABASE_URL")).toHaveText(revisionTwoDatabaseValue);
-    await expect(secondPage.getByTestId("conflict-local-DATABASE_URL")).toHaveText("postgres://second-context-draft");
+    await expect(secondPage.getByRole("heading", { name: "Latest server entry compared with your draft" })).toBeVisible();
+    await expect(secondPage.getByText(revisionTwoDatabaseValue, { exact: true })).toBeVisible();
+    await expect(secondPage.getByText("postgres://second-context-draft", { exact: true })).toBeVisible();
   } finally {
     await secondContext.close();
   }
@@ -152,7 +155,7 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
   await page.getByRole("tab", { name: "Versions" }).click();
   await expect(page.getByRole("heading", { name: "Versions", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "View version 1" }).click();
-  await expect(page.getByRole("heading", { name: "Version 1 to current version 2" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Version 1 to current version 3" })).toBeVisible();
   await expect(page.getByText(originalDatabaseValue, { exact: true })).toBeVisible();
   await expect(page.getByText(revisionTwoDatabaseValue, { exact: true })).toBeVisible();
 
@@ -162,7 +165,7 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
   await page.getByRole("button", { name: "Create rollback version" }).click();
   await expect(page.getByRole("heading", { name: "Versions", exact: true })).toBeVisible();
   await page.getByRole("tab", { name: "Configuration" }).click();
-  await expect(page.getByText("Current register / Version 3")).toBeVisible();
+  await expect(page.getByText("Current register / Version 4")).toBeVisible();
   await expect(page.getByTestId("configuration-value-DATABASE_URL")).toHaveText(originalDatabaseValue);
 
   await page.getByRole("link", { name: "Machine Access" }).click();
@@ -462,16 +465,12 @@ test("200 percent reflow keeps every localized admin surface usable and preserve
     await expect(page.getByRole("option", { name: "Production 生产环境" })).toBeAttached();
 
     await expect(page.getByRole("heading", { name: "配置", level: 2 })).toBeVisible();
-    await page.getByRole("button", { name: "编辑配置" }).click();
-    await page.getByRole("button", { name: "添加条目" }).click();
-    const draftList = page.locator(".configuration-draft-list");
-    await expect(draftList).toHaveAccessibleName("配置条目");
-    const draftRow = draftList.locator("fieldset").last();
-    const draftInputs = draftRow.locator("input");
-    const draftKey = draftInputs.nth(0);
-    const draftValue = draftRow.locator("textarea");
-    const draftService = draftInputs.nth(1);
-    const changeMessage = page.locator("#configuration-message");
+    await page.getByRole("button", { name: "新增配置" }).click();
+    const configurationDialog = page.getByRole("dialog", { name: "新增配置条目" });
+    const draftKey = configurationDialog.getByLabel("键");
+    const draftValue = configurationDialog.getByLabel("值");
+    const draftService = configurationDialog.getByLabel("服务");
+    const changeMessage = configurationDialog.getByLabel("变更说明");
     await expect(changeMessage).toHaveAccessibleName("变更说明");
     await draftKey.fill("MATRIX_EXACT_VALUE");
     await draftValue.fill(matrixConfigurationValue);
@@ -484,29 +483,44 @@ test("200 percent reflow keeps every localized admin surface usable and preserve
     await expect(headerLanguage).toHaveValue("en-US");
     await expect(headerLanguage).toBeFocused();
     await expect(page).toHaveURL(configurationURL);
-    await expect(page.getByRole("heading", { name: "Edit configuration", level: 2 })).toBeVisible();
-    await expect(draftList).toHaveAccessibleName("Configuration entries");
+    await expect(page.getByRole("dialog", { name: "Add configuration entry" })).toBeVisible();
     await expect(draftKey).toHaveValue("MATRIX_EXACT_VALUE");
     await expect(draftValue).toHaveValue(matrixConfigurationValue.replaceAll("\r\n", "\n").replaceAll("\r", "\n"));
     await expect(draftService).toHaveValue("api-服务");
     await expect(changeMessage).toHaveValue(matrixChangeMessage);
     await expect(changeMessage).toHaveAccessibleName("Change message");
-    await expect(draftValue).toHaveAccessibleName("Value for MATRIX_EXACT_VALUE");
+    await expect(draftValue).toHaveAccessibleName("Value");
 
     await headerLanguage.press("ArrowDown");
     await expect(headerLanguage).toHaveValue("zh-CN");
     await expect(headerLanguage).toBeFocused();
     await expect(page).toHaveURL(configurationURL);
-    await expect(page.getByRole("heading", { name: "编辑配置", level: 2 })).toBeVisible();
-    await expect(draftList).toHaveAccessibleName("配置条目");
-    await expect(draftValue).toHaveAccessibleName("MATRIX_EXACT_VALUE 的值");
+    await expect(page.getByRole("dialog", { name: "新增配置条目" })).toBeVisible();
+    await expect(draftValue).toHaveAccessibleName("值");
     await expect(draftValue).toHaveValue(matrixConfigurationValue.replaceAll("\r\n", "\n").replaceAll("\r", "\n"));
     await expect(changeMessage).toHaveValue(matrixChangeMessage);
     await expect(changeMessage).toHaveAccessibleName("变更说明");
 
     await page.getByRole("button", { name: "保存更改" }).click();
     await expect(page.getByText("版本 1 已保存。")).toBeVisible();
-    await expect(page.getByTestId("configuration-value-MATRIX_EXACT_VALUE")).toHaveText(matrixConfigurationValue);
+    const storedMatrixValue = page.getByTestId("configuration-value-MATRIX_EXACT_VALUE");
+    await expect(storedMatrixValue).toHaveText(matrixConfigurationValue);
+    await expect(page.getByTestId("configuration-service-MATRIX_EXACT_VALUE")).toHaveText("api-服务");
+    await expect(page.getByRole("button", { name: "编辑 MATRIX_EXACT_VALUE" })).toBeVisible();
+    await expect(page.getByRole("columnheader")).toHaveCount(4);
+    await expect.poll(() => page.locator(".configuration-table tbody tr").evaluate(
+      (row) => row.getBoundingClientRect().height,
+    )).toBeGreaterThanOrEqual(44);
+    await expect.poll(() => page.locator(".configuration-table tbody tr").evaluate(
+      (row) => row.getBoundingClientRect().height,
+    )).toBeLessThanOrEqual(50);
+    await expect(storedMatrixValue).toHaveCSS("text-overflow", "ellipsis");
+    await expect(storedMatrixValue).toHaveCSS("white-space", "nowrap");
+    await storedMatrixValue.hover();
+    await expect(page.getByRole("tooltip")).toHaveText(matrixConfigurationValue);
+    await storedMatrixValue.focus();
+    await storedMatrixValue.press("Escape");
+    await expect(page.getByRole("tooltip")).toBeHidden();
     const search = page.locator("#configuration-search");
     await expect(search).toHaveAccessibleName("搜索配置");
     await search.fill("NO_MATCH_MATRIX_QUERY");
@@ -581,6 +595,9 @@ test("200 percent reflow keeps every localized admin surface usable and preserve
       { name: "versions tab", locator: page.getByRole("tab", { name: "Versions" }) },
       { name: "members tab", locator: page.getByRole("tab", { name: "Members" }) },
     ], 720);
+    await expect.poll(() => page.locator(".data-table-wrap").evaluate(
+      (wrapper) => wrapper.scrollWidth > wrapper.clientWidth,
+    )).toBe(true);
     await expectNoRootHorizontalOverflow(page);
     await page.getByRole("tab", { name: "Versions" }).click();
     await expect(page.getByRole("heading", { name: "Versions", level: 2 })).toBeVisible();

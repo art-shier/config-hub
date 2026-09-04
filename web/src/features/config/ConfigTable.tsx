@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { APIClientContract, Revision } from "../../api/types";
-import { ExactValue } from "../../components/ExactValue";
-import { ConfigEditor } from "./ConfigEditor";
+import { OverflowText } from "../../components/OverflowText";
+import { ConfigEntryDialog } from "./ConfigEntryDialog";
 
 interface CurrentRevisionResponse {
   revision: Revision;
@@ -28,16 +28,15 @@ export function ConfigTable({
   const { t } = useTranslation(["config", "common"]);
   const [revision, setRevision] = useState<Revision | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
-  const [editing, setEditing] = useState(false);
+  const [creatingEntry, setCreatingEntry] = useState(false);
+  const [editingEntryKey, setEditingEntryKey] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [savedVersion, setSavedVersion] = useState<number | null>(null);
-  const requiresDesktop = useMediaQuery("(max-width: 759px)");
   const generationRef = useRef(0);
   const skipOwnRefreshRef = useRef(false);
-  const editButtonRef = useRef<HTMLButtonElement>(null);
   const configurationHeadingRef = useRef<HTMLHeadingElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const focusTargetRef = useRef<"editor" | "edit" | "saved" | null>(null);
+  const focusTargetRef = useRef<"saved" | null>(null);
 
   const loadCurrent = useCallback(async () => {
     setSavedVersion(null);
@@ -47,7 +46,8 @@ export function ConfigTable({
       return;
     }
     const generation = ++generationRef.current;
-    setEditing(false);
+    setCreatingEntry(false);
+    setEditingEntryKey(null);
     setRevision(null);
     setLoadState("loading");
     try {
@@ -82,16 +82,11 @@ export function ConfigTable({
       return;
     }
     const frame = requestAnimationFrame(() => {
-      const focusTarget = target === "editor"
-        ? document.getElementById("configuration-editor-title")
-        : target === "edit"
-          ? editButtonRef.current
-          : configurationHeadingRef.current;
-      focusTarget?.focus();
+      configurationHeadingRef.current?.focus();
       focusTargetRef.current = null;
     });
     return () => cancelAnimationFrame(frame);
-  }, [editing, revision]);
+  }, [revision]);
 
   const visibleEntries = useMemo(() => {
     const query = search.toLocaleLowerCase();
@@ -104,7 +99,7 @@ export function ConfigTable({
         entry.service.toLocaleLowerCase().includes(query),
     );
   }, [revision, search]);
-  const canEdit = canWrite && !requiresDesktop;
+  const canEdit = canWrite;
 
   if (!environmentSlug) {
     return (
@@ -131,28 +126,6 @@ export function ConfigTable({
     );
   }
 
-  const editor = editing ? (
-      <ConfigEditor
-        client={client}
-        projectSlug={projectSlug}
-        environmentSlug={environmentSlug}
-        revision={revision}
-        editingUnavailable={requiresDesktop}
-        onCancel={() => {
-          focusTargetRef.current = "edit";
-          setEditing(false);
-        }}
-        onSaved={(saved) => {
-          skipOwnRefreshRef.current = true;
-          focusTargetRef.current = "saved";
-          setRevision(saved);
-          setEditing(false);
-          setSavedVersion(saved.version);
-          onRevisionChanged(saved);
-        }}
-      />
-  ) : null;
-
   const register = (
     <section className="configuration-register" aria-labelledby="configuration-title">
       <header className="section-heading configuration-heading">
@@ -164,25 +137,17 @@ export function ConfigTable({
         </div>
         {canEdit ? (
           <button
-            ref={editButtonRef}
-            className="secondary-button"
+            className="primary-button"
             type="button"
             onClick={() => {
-              focusTargetRef.current = "editor";
               setSavedVersion(null);
-              setEditing(true);
+              setCreatingEntry(true);
             }}
           >
-            {t("table.edit")}
+            {t("table.add")}
           </button>
         ) : null}
       </header>
-
-      {canWrite && requiresDesktop ? (
-        <p className="desktop-edit-note">
-          {t(editing ? "table.desktopOnlyDraft" : "table.desktopOnly")}
-        </p>
-      ) : null}
 
       {revision.entries.length === 0 ? (
         <div className="empty-state compact-empty">
@@ -224,20 +189,48 @@ export function ConfigTable({
                     <th scope="col">{t("table.key")}</th>
                     <th scope="col">{t("table.value")}</th>
                     <th scope="col">{t("table.service")}</th>
+                    {canEdit ? <th scope="col">{t("table.actions")}</th> : null}
                   </tr>
                 </thead>
                 <tbody>
                   {visibleEntries.map((entry) => (
                     <tr key={entry.key}>
-                      <th scope="row" data-label={t("table.key")}><span className="code-label">{entry.key}</span></th>
+                      <th scope="row" data-label={t("table.key")}>
+                        <OverflowText
+                          emptyLabel={t("common:exactValue.emptyString")}
+                          mono
+                          testId={`configuration-key-${entry.key}`}
+                          value={entry.key}
+                        />
+                      </th>
                       <td data-label={t("table.value")}>
-                        <ExactValue
-                          label={t("table.storedValue", { key: entry.key })}
+                        <OverflowText
+                          emptyLabel={t("common:exactValue.emptyString")}
+                          mono
                           testId={`configuration-value-${entry.key}`}
                           value={entry.value}
                         />
                       </td>
-                      <td data-label={t("table.service")}><span className="code-label">{entry.service}</span></td>
+                      <td data-label={t("table.service")}>
+                        <OverflowText
+                          emptyLabel={t("common:exactValue.emptyString")}
+                          mono
+                          testId={`configuration-service-${entry.key}`}
+                          value={entry.service}
+                        />
+                      </td>
+                      {canEdit ? (
+                        <td data-label={t("table.actions")}>
+                          <button
+                            className="text-button configuration-row-action"
+                            type="button"
+                            aria-label={t("table.editEntry", { key: entry.key })}
+                            onClick={() => setEditingEntryKey(entry.key)}
+                          >
+                            {t("table.editAction")}
+                          </button>
+                        </td>
+                      ) : null}
                     </tr>
                   ))}
                 </tbody>
@@ -249,37 +242,45 @@ export function ConfigTable({
     </section>
   );
 
-  if (editing) {
-    return (
-      <>
-        {editor}
-        {requiresDesktop ? register : null}
-      </>
-    );
-  }
-
-  return register;
+  const editingEntry = revision.entries.find((entry) => entry.key === editingEntryKey);
+  const handleEntrySaved = (saved: Revision) => {
+    skipOwnRefreshRef.current = true;
+    focusTargetRef.current = "saved";
+    setRevision(saved);
+    setEditingEntryKey(null);
+    setCreatingEntry(false);
+    setSavedVersion(saved.version);
+    onRevisionChanged(saved);
+  };
+  return (
+    <>
+      {register}
+      {editingEntry ? (
+        <ConfigEntryDialog
+          client={client}
+          entry={editingEntry}
+          environmentSlug={environmentSlug}
+          projectSlug={projectSlug}
+          revision={revision}
+          onCancel={() => setEditingEntryKey(null)}
+          onSaved={handleEntrySaved}
+        />
+      ) : null}
+      {creatingEntry ? (
+        <ConfigEntryDialog
+          client={client}
+          entry={null}
+          environmentSlug={environmentSlug}
+          projectSlug={projectSlug}
+          revision={revision}
+          onCancel={() => setCreatingEntry(false)}
+          onSaved={handleEntrySaved}
+        />
+      ) : null}
+    </>
+  );
 }
 
 function configPath(projectSlug: string, environmentSlug: string): string {
   return `/projects/${encodeURIComponent(projectSlug)}/environments/${encodeURIComponent(environmentSlug)}/config`;
-}
-
-function useMediaQuery(query: string): boolean {
-  const [matches, setMatches] = useState(() =>
-    typeof window.matchMedia === "function" && window.matchMedia(query).matches,
-  );
-
-  useEffect(() => {
-    if (typeof window.matchMedia !== "function") {
-      return;
-    }
-    const media = window.matchMedia(query);
-    const update = () => setMatches(media.matches);
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, [query]);
-
-  return matches;
 }

@@ -24,6 +24,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     test: {
+      execArgv: ["--no-experimental-webstorage"],
       include: ["src/**/*.{test,spec}.{ts,tsx}"],
       environment: "jsdom",
       environmentOptions: {

@@ -15,7 +15,7 @@ afterEach(async () => {
   server.resetHandlers();
   window.history.replaceState(null, "", "/");
   await changeLocale("en-US");
-  localStorage.removeItem("confighub.locale");
+  window.localStorage.removeItem("confighub.locale");
   document.documentElement.lang = "en-US";
 });
 

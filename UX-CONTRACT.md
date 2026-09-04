@@ -53,7 +53,7 @@
 | Secret input | Masked native password input on login. | Same as input. | Same as input. | Native behavior. | Disabled during sign-in. | Password value clears after attempt in current login flow. | Inline alert communicates recovery. |
 | Search | Feature-local search controls; no shared cross-screen search primitive. | Current component behavior. | Native focus treatment. | Native behavior. | Feature-specific. | Feature-specific. | Feature-specific recovery text. |
 | Textarea | Native field using the shared `resize-none` class with an adequate default or component-specific minimum height. | Stronger border. | Same as input. | Native editing and scrolling; manual resizing is disabled. | Reduced opacity and `not-allowed`. | Feature-specific. | Inline field message where implemented. |
-| Table/list | Ruled semantic records with explicit loading/empty/error treatments. | Linked/actionable cells use their control behavior. | Native link/button focus. | Native behavior. | Not applicable to static rows. | Loading text preserves the register context. | Inline alert/retry state where implemented. |
+| Table/list | Ruled semantic records with explicit loading/empty/error treatments; configuration uses fixed Key / Value / Service / Actions columns and three-rem rows. | Overflowing configuration text exposes an app-owned tooltip after `300ms`. | Only overflowing text joins the tab order and exposes the same full-content tooltip. | Escape dismisses the tooltip; row Edit opens the shared entry dialog. | Not applicable to static rows. | Loading text preserves the register context. | Inline alert/retry state where implemented. |
 
 ## Dataset navigation
 
@@ -69,9 +69,9 @@
 
 | Operation | Trigger | Pending | Success destination | Success feedback | Failure recovery | Focus outcome | Source ref |
 |---|---|---|---|---|---|---|---|
-| Create | Existing page/feature create actions. | Existing submitting guard and disabled action. | Existing owning route behavior. | Existing route-local status. | Preserve entered values and current inline/dialog error behavior. | Existing component-specific outcome. | Existing page/feature tests; no change in i18n foundation. |
-| Edit | Existing configuration/member/environment actions. | Existing pending state. | Existing route/feature behavior. | Existing status behavior. | Existing draft/error preservation. | Existing component-specific outcome. | Existing page/feature tests; no change in i18n foundation. |
-| Delete | Existing remove/revoke actions. | Existing dialog/action guard. | Existing route/feature behavior. | Existing route-local status. | Existing confirmation dialog keeps recovery context. | Existing dialog focus restoration. | `ModalDialog.tsx` and relevant feature tests. |
+| Create | `Add configuration` above the configuration register opens the shared blank entry dialog. | Save is disabled and guarded against duplicate submission while the full snapshot PUT is pending. | Configuration register with the saved revision applied. | Polite revision-saved status. | Local and `422` field validation stay in the dialog; generic failure retains every field. `409` offers refresh, comparison, and rebase. | Key receives initial focus; success moves focus to the configuration heading. | `ConfigTable.tsx`, `ConfigEntryDialog.tsx`, and component tests. |
+| Edit | The localized per-row Edit action opens the shared entry dialog prefilled with Key, exact Value, Service, and a blank change message. | Same pessimistic full-snapshot PUT and duplicate-submit guard as create. | Configuration register with the saved revision applied. | Polite revision-saved status. | Drafts survive validation, network failure, locale changes, and conflict comparison; mixed newline sequences outside the edited range remain exact. | Key receives initial focus; discard restores the row Edit opener; success moves focus to the configuration heading. | `ConfigTable.tsx`, `ConfigEntryDialog.tsx`, `configValueEditing.ts`, and component tests. |
+| Delete | Edit dialog's destructive action opens an app-owned confirmation naming the Key. | Confirm action is disabled and guarded while the removal snapshot is published. | Configuration register with the saved revision applied. | Polite revision-saved status. | Failure stays inside the confirmation with safe retry copy; previous revisions remain available. | Cancel returns to the edit dialog; success moves focus to the configuration heading. | `ConfigEntryDialog.tsx`, `ModalDialog.tsx`, and component tests. |
 | Search | Existing local feature controls where present. | Existing behavior. | Same route. | Current rendered results. | Current feature behavior. | Current input behavior. | Existing feature components; no i18n change. |
 | Bulk action | No generic bulk action is currently defined. | Not applicable. | Not applicable. | Not applicable. | Not applicable. | Not applicable. | Scope record. |
 | Upload/background job | No upload or background-job UI is currently defined. | Not applicable. | Not applicable. | Not applicable. | Not applicable. | Not applicable. | Scope record. |
@@ -85,8 +85,8 @@
 - Route error / 403 page behavior: Current app-owned not-found page remains under the authenticated shell. Non-admin access redirects to `/projects` via `RequireAdmin`; this redirect is canonical for the current routes and is not changed by localization.
 - Breadcrumb/tab/route-state policy: Project environment and tab state remain in search parameters; no breadcrumb primitive exists.
 - Sidebar/drawer/bottom-sheet transformation: Header navigation toggles the existing primary navigation region; no sidebar/drawer/bottom-sheet contract exists.
-- Responsive table strategy: Existing table wrappers retain their current overflow behavior; do not remove actions or values at narrow widths.
-- Truncation/full-value access: Current wrapping/overflow behavior remains canonical; workflow-critical actions must not be clipped.
+- Responsive table strategy: The configuration table retains its four conventional columns and a minimum width on narrow screens; its owned wrapper scrolls horizontally with a visible scrollbar. It must not transform into stacked cards or remove Service or Actions.
+- Truncation/full-value access: Configuration Key, Value, and Service cells use single-line ellipsis. Actual overflow is measured; only overflowing text exposes the exact full content through an app-owned hover/focus tooltip. Workflow-critical actions are never clipped.
 - Focus restoration and sticky-obstruction policy: `ModalDialog` restores opener focus, menu Escape restores the navigation trigger, and language changes must not move focus or rebuild state.
 
 ## Overlays and feedback
@@ -95,31 +95,31 @@
 - Destructive confirmation levels: Existing destructive dialogs name the local action; no new confirmation policy is created in this task.
 - Toast placement/duration/deduplication: No shared toast system is implemented.
 - Alert/banner scope and persistence: Current inline alerts/status text stay scoped to their route or component.
-- Tooltip delay/dismissal: No tooltip primitive is implemented.
-- Unsaved-changes behavior: Existing configuration-editor behavior remains unchanged; locale switching must preserve its state.
-- Layer/z-index contract (dialog > drawer > popover > toast stacking order): Current dialog backdrop uses `z-index: 20`; no drawer/popover/toast layer is implemented, so no unstated order is claimed.
+- Tooltip delay/dismissal: Configuration overflow tooltips open after `300ms`, close after `100ms`, remain open while hovered, dismiss on Escape, and reposition on owned scroll or viewport resize.
+- Unsaved-changes behavior: Dirty configuration entry dialogs confirm before Cancel, Escape, or route navigation and register browser-unload protection. Choosing to keep editing preserves exact field/error state; locale switching changes UI copy without rebuilding the draft.
+- Layer/z-index contract (dialog > drawer > popover > toast stacking order): Runtime tokens establish dialog `600`, backdrop `500`, and popover `300`. No drawer or toast layer is currently implemented.
 
 ## Async and resilience
 
-- Mutation default (pessimistic/optimistic/queued): Preserve each existing flow’s behavior; this foundation performs no data mutation.
+- Mutation default (pessimistic/optimistic/queued): Configuration entry create, edit, and delete are pessimistic full-snapshot PUTs based on the displayed revision. Pending operations do not alter the table until the server returns the new revision.
 - Idempotency and duplicate-submit policy: Existing UI guards prevent repeated submit where implemented; this i18n change has no mutation side effect.
 - Auto-save/draft recovery: Existing configuration-editor draft behavior is preserved; no generic autosave is introduced.
 - Offline/read-stale/write behavior: No product-wide offline contract is defined.
 - Retry/backoff/timeout behavior: Existing retry controls remain route/feature-specific; the new common namespace supplies a generic Retry label only.
-- Version conflict and multi-tab behavior: Existing configuration/revision handling remains unchanged.
+- Version conflict and multi-tab behavior: Configuration entry save detects `409` / `revision_conflict`, retains the local entry, loads the newest full snapshot on request, compares the server entry with the draft, and lets the user explicitly adopt that version as the new base before retrying.
 - Session expiry/re-authentication: Existing `RequireSession` redirects to `/login` and preserves destination state; language preference is browser-local, not session-bound.
 - Long-running progress and return path: No new long-running workflow is added.
 - Stale-request cancellation/invalidation and pending-state ownership: Preserve existing feature-local guards and generation checks.
-- Dialog/form preservation and retry after mutation failure: Preserve current dialog/form state; locale change only updates i18n/document language.
+- Dialog/form preservation and retry after mutation failure: Configuration entry drafts and safe localized errors remain visible after recoverable save/delete failure; locale changes update copy without resetting fields or operation context.
 
 ## Validation
 
 - Schema/validation layer: Existing route/feature-local validation remains canonical.
 - Trigger timing: Existing input/submit behavior remains canonical.
 - Error summary/inline policy: Existing inline messages and dialog content remain canonical.
-- Server error mapping: Later localization may map stable API codes/field keys only; this foundation does not expose server messages as translated copy.
+- Server error mapping: Configuration maps stable `422` field paths to localized Key, Value, Service, change-message, or entries errors and never renders server-provided field messages.
 - Sensitive-value handling: Existing password and issued-token handling remain unchanged; locale storage holds only a locale choice.
-- `noValidate`, first-invalid focus, duplicate-submit prevention, unsaved changes, and submit recovery: Preserve current component behavior; no form behavior is altered in this task.
+- `noValidate`, first-invalid focus, duplicate-submit prevention, unsaved changes, and submit recovery: The configuration entry form uses `noValidate`, focuses the first invalid owned field, guards with a synchronous submission ref, confirms dirty exits, and retains the draft after failure.
 - Textarea sizing: Product textareas use the shared `resize-none` runtime owner in `web/src/styles.css`, retain adequate visible height (`7rem` for canonical form fields or an established component-specific equivalent), and remain internally scrollable for longer values.
 
 ## Permission and clipboard

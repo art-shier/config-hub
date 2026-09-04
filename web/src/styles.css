@@ -33,6 +33,9 @@
   --scrollbar-thumb: var(--line-strong);
   --scrollbar-thumb-hover: var(--copper);
   --scrollbar-thumb-active: var(--copper-dark);
+  --z-popover: 300;
+  --z-backdrop: 500;
+  --z-dialog: 600;
 }
 
 * {
@@ -825,7 +828,7 @@ a {
 
 .dialog-backdrop {
   position: fixed;
-  z-index: 20;
+  z-index: var(--z-backdrop);
   inset: 0;
   display: grid;
   align-items: center;
@@ -835,7 +838,49 @@ a {
   background: color-mix(in oklch, var(--ink) 52%, transparent);
 }
 
+.overflow-text {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overflow-text-mono {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.76rem;
+}
+
+.overflow-text-empty {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-style: italic;
+}
+
+.overflow-tooltip {
+  position: fixed;
+  z-index: var(--z-popover);
+  display: block;
+  width: max-content;
+  max-width: min(36rem, calc(100vw - (2 * var(--space-4))));
+  max-height: min(18rem, calc(100vh - (2 * var(--space-4))));
+  padding: var(--space-2) var(--space-3);
+  overflow: auto;
+  color: var(--surface);
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .dialog-panel {
+  position: relative;
+  z-index: var(--z-dialog);
   width: min(100%, 36rem);
   max-height: calc(100svh - (2 * var(--space-4)));
   overflow-y: auto;
@@ -1324,6 +1369,12 @@ a {
   border-top: 1px solid var(--line-strong);
 }
 
+.configuration-register .data-table-wrap {
+  overscroll-behavior-inline: contain;
+  scrollbar-gutter: stable;
+  border-bottom: 1px solid var(--line-strong);
+}
+
 .data-table {
   width: 100%;
   border-collapse: collapse;
@@ -1348,12 +1399,134 @@ a {
   text-transform: uppercase;
 }
 
-.configuration-table th:first-child {
-  width: 27%;
+.configuration-table {
+  min-width: 44rem;
 }
 
-.configuration-table th:last-child {
-  width: 22%;
+.configuration-table th,
+.configuration-table td {
+  height: 3rem;
+  padding: 0.125rem var(--space-3);
+  overflow: hidden;
+  overflow-wrap: normal;
+  vertical-align: middle;
+}
+
+.configuration-table th:nth-child(1) {
+  width: 26%;
+}
+
+.configuration-table th:nth-child(2) {
+  width: 49%;
+}
+
+.configuration-table th:nth-child(3) {
+  width: 18%;
+}
+
+.configuration-table th:nth-child(4) {
+  width: 6.5rem;
+}
+
+.configuration-row-action {
+  display: inline-flex;
+  width: 100%;
+  align-items: center;
+  justify-content: flex-start;
+  white-space: nowrap;
+}
+
+.configuration-entry-form {
+  gap: var(--space-4);
+}
+
+.configuration-entry-form .form-field textarea {
+  min-height: 9rem;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+
+.configuration-entry-actions {
+  align-items: center;
+}
+
+.configuration-entry-delete {
+  margin-inline-end: auto;
+}
+
+.configuration-entry-conflict {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-block: 1px solid var(--line-strong);
+  background: var(--surface-quiet);
+}
+
+.configuration-entry-conflict h3,
+.configuration-entry-conflict p {
+  margin: 0;
+}
+
+.configuration-entry-comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.configuration-entry-comparison > div {
+  min-width: 0;
+}
+
+.configuration-entry-comparison strong {
+  display: block;
+  margin-bottom: var(--space-2);
+  color: var(--ink-soft);
+  font-size: 0.7rem;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+.configuration-entry-comparison pre {
+  max-height: 9rem;
+  margin: 0;
+  padding: var(--space-3);
+  overflow: auto;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.configuration-entry-snapshot {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.configuration-entry-snapshot > div {
+  min-width: 0;
+}
+
+.configuration-entry-snapshot dt {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.configuration-entry-snapshot dd {
+  min-width: 0;
+  margin: var(--space-1) 0 0;
+}
+
+.configuration-entry-snapshot code {
+  display: block;
+  padding: var(--space-2) var(--space-3);
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 0.76rem;
+  white-space: pre;
 }
 
 .configuration-value {
@@ -1970,45 +2143,6 @@ a {
   text-transform: uppercase;
 }
 
-@container (max-width: 34rem) {
-  .configuration-table,
-  .configuration-table tbody,
-  .configuration-table tr,
-  .configuration-table th,
-  .configuration-table td {
-    display: block;
-    width: 100%;
-  }
-
-  .configuration-table thead {
-    display: none;
-  }
-
-  .configuration-table tr {
-    padding: var(--space-3) 0;
-    border-bottom: 1px solid var(--line-strong);
-  }
-
-  .configuration-table th,
-  .configuration-table td {
-    display: grid;
-    grid-template-columns: minmax(5rem, 0.35fr) minmax(0, 1fr);
-    gap: var(--space-3);
-    padding: var(--space-2) 0;
-    border: 0;
-  }
-
-  .configuration-table th::before,
-  .configuration-table td::before {
-    color: var(--muted);
-    content: attr(data-label);
-    font-size: 0.68rem;
-    font-weight: 750;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-}
-
 @container (min-width: 36rem) {
   .configuration-draft-row {
     grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.4fr);
@@ -2126,6 +2260,10 @@ a {
 }
 
 @media (max-width: 47.499rem) {
+  .configuration-entry-comparison {
+    grid-template-columns: 1fr;
+  }
+
   .language-switcher {
     inline-size: 100%;
     justify-content: space-between;
