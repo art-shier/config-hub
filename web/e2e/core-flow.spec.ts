@@ -72,6 +72,19 @@ test.afterAll(async () => {
   }
 });
 
+test("skill is publicly served as Markdown by the built server", async ({ request }) => {
+  const response = await request.get(`${runtimeServer.origin}/skills/confighub/SKILL.md`);
+  expect(response.status()).toBe(200);
+  expect(response.headers()["content-type"]).toBe("text/markdown; charset=utf-8");
+  expect(response.headers()["cache-control"]).toBe("no-cache");
+  const markdown = await response.text();
+  expect(markdown).toMatch(/^---\r?\nname: confighub\r?\n/u);
+  expect(markdown).toContain("scripts/install-cli.sh");
+  expect(markdown).toContain("scripts/install-cli.ps1");
+  const missing = await request.get(`${runtimeServer.origin}/skills/missing/SKILL.md`);
+  expect(missing.status()).toBe(404);
+});
+
 test("machine-token assertion failures omit the token value", () => {
   const syntheticToken = "synthetic-machine-token-secret";
   const failingChecks: Array<readonly [boolean, MachineTokenCheck]> = [
@@ -146,8 +159,9 @@ test("admin completes configuration, conflict, Token, diff, and rollback workflo
     await expect(secondPage.getByRole("alert")).toHaveText("Configuration changed since you opened this entry.");
     await secondPage.getByRole("button", { name: "Refresh and compare" }).click();
     await expect(secondPage.getByRole("heading", { name: "Latest server entry compared with your draft" })).toBeVisible();
-    await expect(secondPage.getByText(revisionTwoDatabaseValue, { exact: true })).toBeVisible();
-    await expect(secondPage.getByText("postgres://second-context-draft", { exact: true })).toBeVisible();
+    const comparison = secondPage.getByRole("region", { name: "Latest server entry compared with your draft" });
+    await expect(comparison.getByText(revisionTwoDatabaseValue, { exact: true })).toBeVisible();
+    await expect(comparison.getByText("postgres://second-context-draft", { exact: true })).toBeVisible();
   } finally {
     await secondContext.close();
   }
@@ -466,11 +480,15 @@ test("200 percent reflow keeps every localized admin surface usable and preserve
 
     await expect(page.getByRole("heading", { name: "配置", level: 2 })).toBeVisible();
     await page.getByRole("button", { name: "新增配置" }).click();
-    const configurationDialog = page.getByRole("dialog", { name: "新增配置条目" });
-    const draftKey = configurationDialog.getByLabel("键");
-    const draftValue = configurationDialog.getByLabel("值");
-    const draftService = configurationDialog.getByLabel("服务");
-    const changeMessage = configurationDialog.getByLabel("变更说明");
+    const configurationDialog = page.getByRole("dialog");
+    await expect(configurationDialog).toHaveAccessibleName("新增配置条目");
+    const draftKey = configurationDialog.locator("#configuration-entry-key");
+    const draftValue = configurationDialog.locator("#configuration-entry-value");
+    const draftService = configurationDialog.locator("#configuration-entry-service");
+    const changeMessage = configurationDialog.locator("#configuration-entry-message");
+    await expect(draftKey).toHaveAccessibleName("键");
+    await expect(draftValue).toHaveAccessibleName("值");
+    await expect(draftService).toHaveAccessibleName("服务");
     await expect(changeMessage).toHaveAccessibleName("变更说明");
     await draftKey.fill("MATRIX_EXACT_VALUE");
     await draftValue.fill(matrixConfigurationValue);
@@ -490,6 +508,8 @@ test("200 percent reflow keeps every localized admin surface usable and preserve
     await expect(changeMessage).toHaveValue(matrixChangeMessage);
     await expect(changeMessage).toHaveAccessibleName("Change message");
     await expect(draftValue).toHaveAccessibleName("Value");
+    await expect(draftKey).toHaveAccessibleName("Key");
+    await expect(draftService).toHaveAccessibleName("Service");
 
     await headerLanguage.press("ArrowDown");
     await expect(headerLanguage).toHaveValue("zh-CN");
