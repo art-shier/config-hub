@@ -4,10 +4,7 @@ import { useTranslation } from "react-i18next";
 import { useAuth } from "../auth/AuthProvider";
 import { LanguageSwitcher } from "../components/LanguageSwitcher";
 
-const memberNavigation = [
-  { to: "/projects", key: "projects" },
-  { to: "/agent-access", key: "agentAccess" },
-];
+const memberNavigation = [{ to: "/projects", key: "projects" }];
 const adminNavigation = [
   { to: "/machine-access", key: "machineAccess" },
   { to: "/members", key: "members" },
@@ -63,10 +60,11 @@ export function AppShell() {
     return null;
   }
 
-  const navigation =
-    user.role === "admin"
-      ? [...memberNavigation, ...adminNavigation]
-      : memberNavigation;
+  const navigation = [
+    ...memberNavigation,
+    ...(user.role === "admin" ? adminNavigation : []),
+    { to: "/agent-access", key: "agentAccess" },
+  ];
 
   async function handleLogout() {
     if (loggingOut) {

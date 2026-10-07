@@ -21,6 +21,19 @@ function mockAdminShell() {
 }
 
 describe("AppShell responsive navigation", () => {
+  it("keeps existing admin keyboard navigation before the agent setup link", async () => {
+    mockAdminShell();
+    window.history.pushState({}, "", "/projects");
+    render(<App />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Open navigation" }));
+    expect(screen.getByRole("link", { name: "Projects" })).toHaveFocus();
+    for (const name of ["Machine Access", "Members", "System", "Agent Setup"]) {
+      await user.tab();
+      expect(screen.getByRole("link", { name })).toHaveFocus();
+    }
+  });
+
   // Break caught: leaving authenticated navigation labels and the route title in the previous locale.
   it("localizes shared navigation and the current route title", async () => {
     mockAdminShell();
