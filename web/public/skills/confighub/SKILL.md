@@ -24,6 +24,10 @@ If the command is missing, check PATH and the usual user installation first:
 
 If an existing executable works by absolute path, use it or add its directory to the current process PATH. Install only if it is absent; upgrade if the required command is unavailable. Keep any version explicitly pinned by the user or project; report incompatible pins instead of silently overriding them.
 
+For an existing CLI, inspect `confighub --help` for the `upgrade` command. If available, use `confighub upgrade --check`, then `confighub upgrade` when updating is part of the task. Use `confighub upgrade --version vMAJOR.MINOR.PATCH` with the actual release to honor an explicit version. It downloads and validates the official release, updates the current executable in place, and preserves connection configuration. It needs write access to the installation directory but no ConfigHub token. Default updates do not downgrade a newer stable release; an explicit version can downgrade. On Windows, a locked previous executable may remain at the backup path printed by the command; remove it only after the command has exited. This updates the CLI only, not Server + Web.
+
+Older releases, including v0.3.0, lack `upgrade`. Use the installer below once to bootstrap a release that supports self-update. If that release has not been published yet, report the limitation instead of repeatedly reinstalling the same older version.
+
 ## Install a missing CLI
 
 Official repository: https://github.com/art-shier/config-hub

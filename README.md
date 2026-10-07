@@ -119,6 +119,20 @@ confighub version
 
 ### 升级与卸载 CLI
 
+支持自更新的 CLI 可以直接执行：
+
+```bash
+confighub upgrade --check
+confighub upgrade
+confighub upgrade --version vMAJOR.MINOR.PATCH
+```
+
+`upgrade` 默认选择 GitHub 最新正式版，保留当前可执行文件的安装目录、CLI 配置和 Token，无需连接 ConfigHub Server。`--check` 仅检查，不写入文件；`--version` 应替换成实际发布版本，也可用于显式降级。默认不会将较新的正式版降级；相同版本不重复安装。开发构建会被视为可替换为正式版。
+
+更新前验证 SHA-256、归档结构与新程序报告的版本，校验失败时保留旧程序。Unix 原子替换可执行文件；Windows 先将运行中的旧程序改名，再安装新版，替换失败时尝试恢复旧文件。若 Windows 仍锁定旧程序，命令会输出保留的备份路径，可在命令退出后删除该文件。安装目录需要可写权限，例如安装在 `/usr/local/bin` 时通常使用 `sudo confighub upgrade`。命令不会自动提权，也不会升级 Server + Web。
+
+旧版 CLI（包括 `v0.3.0`）尚无 `upgrade` 命令，需要先用下述安装脚本更新到包含自更新功能的正式版；该版本发布前，脚本不会安装尚未发布的源码功能。
+
 重新运行当前平台的安装脚本即可原子升级；固定版本时继续传入同一个版本参数。Linux/macOS 卸载只删除实际安装位置的 `confighub`，例如：
 
 ```bash

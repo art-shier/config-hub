@@ -146,6 +146,7 @@ func newRootCommandWithLoader(
 	_ = export.MarkFlagRequired("format")
 	root.AddCommand(export)
 	root.AddCommand(newPullCommand(resolveConfig, stdout))
+	root.AddCommand(newUpgradeCommand(stdout, defaultCLIUpgrader()))
 
 	var runProject, runEnvironment, runService string
 	run := &cobra.Command{
@@ -247,6 +248,10 @@ func markMutationRuntime(operation string, cause error) error {
 }
 
 func runtimeDiagnostic(err error) string {
+	var upgradeErr *upgradeFailure
+	if errors.As(err, &upgradeErr) {
+		return "confighub: upgrade failed: " + upgradeErr.cause.Error()
+	}
 	var runFailure *runExecutionFailure
 	if errors.As(err, &runFailure) {
 		switch {
