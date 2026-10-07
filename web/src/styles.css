@@ -1565,6 +1565,26 @@ a {
   container-type: inline-size;
 }
 
+.agent-access-content {
+  display: grid;
+  gap: var(--space-6);
+  max-width: 52rem;
+  margin-top: var(--space-8);
+}
+
+.agent-copy-field {
+  justify-items: start;
+}
+
+.agent-copy-field textarea {
+  resize: vertical;
+}
+
+.agent-access-notes {
+  border-top: 1px solid var(--line-strong);
+  padding-top: var(--space-5);
+}
+
 .administration-section-heading,
 .machine-detail-heading {
   padding-bottom: var(--space-5);

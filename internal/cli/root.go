@@ -145,6 +145,7 @@ func newRootCommandWithLoader(
 	_ = export.MarkFlagRequired("env")
 	_ = export.MarkFlagRequired("format")
 	root.AddCommand(export)
+	root.AddCommand(newPullCommand(resolveConfig, stdout))
 
 	var runProject, runEnvironment, runService string
 	run := &cobra.Command{
@@ -284,13 +285,15 @@ func runtimeDiagnostic(err error) string {
 		return "confighub: export encoding failed"
 	case errors.Is(err, errOutputWrite):
 		return "confighub: stdout write failed"
+	case errors.Is(err, errPullFileExists):
+		return "confighub: destination file already exists; use --force to replace it"
 	default:
 		var failure *runtimeFailure
 		if errors.As(err, &failure) {
 			switch failure.operation {
 			case "run":
 				return "confighub: run failed"
-			case "set", "unset":
+			case "set", "unset", "pull":
 				return "confighub: " + failure.operation + " failed"
 			}
 		}

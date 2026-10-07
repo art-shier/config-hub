@@ -96,12 +96,14 @@ func NewHandler(assets fs.FS) http.Handler {
 			}
 		}
 
-		if name == "index.html" {
+		if name == "index.html" || strings.HasPrefix(name, "skills/") {
 			w.Header().Set("Cache-Control", "no-cache")
 		} else if hashedAssetName.MatchString(name) {
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		}
-		if contentType := mime.TypeByExtension(path.Ext(name)); contentType != "" {
+		if path.Ext(name) == ".md" {
+			w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		} else if contentType := mime.TypeByExtension(path.Ext(name)); contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}
 		http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(contents))

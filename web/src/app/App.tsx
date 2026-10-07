@@ -16,6 +16,7 @@ import { MembersPage } from "../pages/MembersPage";
 import { ProjectPage } from "../pages/ProjectPage";
 import { ProjectsPage } from "../pages/ProjectsPage";
 import { SystemPage } from "../pages/SystemPage";
+import { AgentAccessPage } from "../pages/AgentAccessPage";
 import { AppShell } from "./AppShell";
 
 export function App() {
@@ -54,6 +55,7 @@ function AppRoutes() {
             <Route index element={<Navigate to="/projects" replace />} />
             <Route path="/projects" element={<ProjectsPage />} />
             <Route path="/projects/:project" element={<ProjectPage />} />
+            <Route path="/agent-access" element={<AgentAccessPage />} />
             <Route element={<RequireAdmin />}>
               <Route
                 path="/machine-access"
@@ -144,6 +146,7 @@ function routeTitleKey(pathname: string) {
     return "routeTitles.projects";
   }
   if (pathname === "/machine-access") return "routeTitles.machineAccess";
+  if (pathname === "/agent-access") return "routeTitles.agentAccess";
   if (pathname === "/members") return "routeTitles.members";
   if (pathname === "/system") return "routeTitles.system";
   return "routeTitles.notFound";

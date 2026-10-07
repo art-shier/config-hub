@@ -4,7 +4,10 @@ import { useTranslation } from "react-i18next";
 import { useAuth } from "../auth/AuthProvider";
 import { LanguageSwitcher } from "../components/LanguageSwitcher";
 
-const memberNavigation = [{ to: "/projects", key: "projects" }];
+const memberNavigation = [
+  { to: "/projects", key: "projects" },
+  { to: "/agent-access", key: "agentAccess" },
+];
 const adminNavigation = [
   { to: "/machine-access", key: "machineAccess" },
   { to: "/members", key: "members" },

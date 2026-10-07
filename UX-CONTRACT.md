@@ -81,6 +81,8 @@
 
 ## Navigation and responsive behavior
 
+- Agent setup: All signed-in members can open `/agent-access` from the shared navigation and copy the site skill URL or localized prompt. The skill at `/skills/confighub/SKILL.md` is public Markdown without credentials or project data. Copy actions announce success or failure locally, and read-only text remains selectable for manual recovery. Machine token provisioning remains in the existing administrator workflow.
+
 - Route document title policy: One shared application-root owner sets `document.title` as `ConfigHub — {localized route title}` for login, projects, machine access, members, system, and the app-owned not-found route. `ConfigHub` remains verbatim; updates follow route changes and active UI locale changes without rebuilding route state.
 - Route error / 403 page behavior: Current app-owned not-found page remains under the authenticated shell. Non-admin access redirects to `/projects` via `RequireAdmin`; this redirect is canonical for the current routes and is not changed by localization.
 - Breadcrumb/tab/route-state policy: Project environment and tab state remain in search parameters; no breadcrumb primitive exists.

@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -92,4 +93,24 @@ func serveWeb(t *testing.T, handler http.Handler, path string) *httptest.Respons
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
 	return response
+}
+
+func TestSkillServedAsPublicMarkdown(t *testing.T) {
+	handler := NewHandler(os.DirFS("../../web/public"))
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(method, "/skills/confighub/SKILL.md", nil))
+		if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/markdown; charset=utf-8" || response.Header().Get("Cache-Control") != "no-cache" {
+			t.Fatalf("%s status=%d headers=%v", method, response.Code, response.Header())
+		}
+		if method == http.MethodGet && !strings.HasPrefix(strings.ReplaceAll(response.Body.String(), "\r\n", "\n"), "---\nname: confighub\n") {
+			t.Fatal("skill route did not return the Markdown source")
+		}
+		if method == http.MethodHead && response.Body.Len() != 0 {
+			t.Fatal("HEAD returned a body")
+		}
+	}
+	if response := serveWeb(t, handler, "/skills/missing/SKILL.md"); response.Code != http.StatusNotFound {
+		t.Fatalf("missing skill status=%d", response.Code)
+	}
 }

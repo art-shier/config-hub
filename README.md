@@ -337,6 +337,28 @@ export CONFIGHUB_TOKEN='ch_一次性签发的机器Token'
 
 `export` 只写标准输出，不会自行创建 `.env` 文件。`run` 中远端同名键覆盖父进程环境，且只注入子进程；拉取失败时不会启动子进程。
 
+### 拉取配置到本地文件
+
+`pull` 将指定项目、环境的配置保存到本地，供应用启动时读取；连接地址和 Token 复用现有 CLI 配置。
+
+```bash
+confighub pull --project shop --env production --dir ./config --format json
+confighub pull --project shop --env production --dir . --format env --filename .env.production
+confighub pull --project shop --env production --service api --dir ./config --format yaml --force
+
+# 拉取成功后再启动应用（应用需自行加载生成的配置文件）
+confighub pull --project shop --env production --dir . --format env --force && npm start
+```
+
+- 必填参数：`--project`、`--env`、`--dir`；目录不存在时自动创建。
+- `--format` 默认 `json`，支持 `json`、`jsonc`、`env` / `dotenv`、`yaml` / `yml`；默认文件名分别为 `config.json`、`config.jsonc`、`.env`、`config.yaml` / `config.yml`。
+- `--filename` 自定义文件名，不接受目录路径；`--service` 可筛选服务配置。
+- JSON、JSONC、YAML 仅包含平铺的配置键值，不包含项目、环境或 revision 包装。所有值保持字符串；JSONC 输出合法 JSON（JSONC 的子集），不额外插入注释。
+- ENV 使用按键排序、双引号包裹的 dotenv 格式，转义反斜杠、引号和换行。请使用支持该格式的 dotenv 加载器读取，不要当作 shell 脚本执行；不同加载器的变量展开规则可能不同。
+- 默认拒绝覆盖现有文件，传 `--force` 才替换。先完整拉取和编码，再使用同目录临时文件原子落盘；拉取或编码失败保留原文件。无覆盖模式使用硬链接保证并发时也不会覆盖，需要目标文件系统支持硬链接，不支持时安全失败。
+- Unix 下新目录权限为 `0700`，新文件权限为 `0600`；Windows 下访问权限由目录 ACL 决定。配置文件可能包含敏感值，请加入 `.gitignore` 并限制目录访问。
+- 成功仅输出文件路径和 revision，不打印配置值。成功退出码 `0`，用法错误 `2`，远端请求或文件写入失败 `1`。
+
 持有 `write` grant 的机器身份可以执行单键写入：
 
 ```bash
@@ -364,6 +386,16 @@ CONFIGHUB_URL=https://config.example.com \
 ```
 
 CLI 接受合法的 HTTP 和 HTTPS Server URL，包括带端口或路径前缀的地址。HTTP 不提供传输加密，Bearer Token 和响应内容会以明文经过网络，只应在操作者明确接受该风险的开发环境或受信网络中使用。生产 Server 的 `public_url`、外部反向代理和部署流程仍要求 HTTPS。
+
+## 通过 Skill 接入 Agent
+
+登录 Web 后，在导航栏打开“接入 Agent”，可复制 skill URL 或包含当前站点地址的完整提示词。将其交给能读取 URL、执行命令的 agent，再说明项目、环境和任务，例如“把 shop 的 production 配置拉取到 ./config，生成 JSON”。
+
+站点提供公开 Markdown 地址 `https://你的站点/skills/confighub/SKILL.md`，读取指南无需登录。指南包括 CLI 检测、Linux/macOS/Windows 安装步骤、PATH 修复、命令兼容性验证、机器凭证配置，以及 `pull`、`export`、`run`、`set`、`unset` 用法。CLI 缺失时 agent 可以按指南安装；已安装但缺少所需命令时应检查发布版本，不能假定最新 Release 已包含该命令。
+
+Skill 仅提供操作说明。机器 Token 仍需独立配置在 agent 所在环境，并授予对应项目/环境的读写权限；不要放入 URL 或聊天。阅读 URL 不会自动安装持久 skill，也不会授予访问权限。
+
+指南源码位于 `web/public/skills/confighub/SKILL.md`。Web 构建会将其复制进 Server 嵌入资源，随 Server+Web 版本发布；修改后需要重新构建并部署才会在线上生效。
 
 ## 备份与恢复
 
